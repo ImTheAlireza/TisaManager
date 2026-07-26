@@ -101,6 +101,7 @@ def settings_keyboard(is_sudo_user: bool = False) -> list[list[InlineKeyboardBut
     ]
     if is_sudo_user:
         buttons.append([InlineKeyboardButton("🗄️ پشتیبان‌گیری", callback_data="backup_project"), InlineKeyboardButton("♻️ بازیابی", callback_data="restore_project")])
+        buttons.append([InlineKeyboardButton("🔄 ری‌استارت ربات", callback_data="bot_restart")])
     buttons.append([InlineKeyboardButton("◀️ بازگشت", callback_data="back_main")])
     return buttons
 
