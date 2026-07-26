@@ -186,27 +186,40 @@ async def handle_bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    logger.info("Sudo user %s requested bot status", query.from_user.id)
+    logger.info("[STATUS] Sudo user %s requested bot status", query.from_user.id)
 
     if not await is_sudo(query.from_user.id):
-        logger.warning("Unauthorized status request by user %s", query.from_user.id)
+        logger.warning("[STATUS] Unauthorized status request by user %s", query.from_user.id)
         await query.answer("❌ فقط ادمین اصلی (Sudo) دسترسی دارد.", show_alert=True)
         return
 
     try:
         import subprocess
         import os
-        cmd = ["supervisorctl", "-c", os.path.expanduser("~/supervisord.conf"), "status", "tisa_manager"]
-        logger.info("Executing command: %s", " ".join(cmd))
+        config_path = os.path.expanduser("~/supervisord.conf")
+        cmd = ["supervisorctl", "-c", config_path, "status", "tisa_manager"]
+        logger.info("[STATUS] Attempting supervisorctl status with config: %s", config_path)
+        
         res = subprocess.run(
             cmd,
             capture_output=True, text=True, timeout=5
         )
         output = res.stdout.strip() or res.stderr.strip() or "بدون خروجی"
-        logger.info("Status result: stdout=%s stderr=%s", res.stdout, res.stderr)
+        logger.info("[STATUS] Success: stdout=%s | stderr=%s", res.stdout, res.stderr)
     except Exception as e:
-        logger.error("Exception in handle_bot_status: %s", e, exc_info=True)
-        output = f"خطا در اجرای دستور: {e}"
+        logger.error("[STATUS] Failed: %s", e, exc_info=True)
+        # Fallback without explicit config path if supervisord.conf is default or elsewhere
+        try:
+            logger.info("[STATUS] Trying fallback supervisorctl status without custom config")
+            res = subprocess.run(
+                ["supervisorctl", "status", "tisa_manager"],
+                capture_output=True, text=True, timeout=5
+            )
+            output = res.stdout.strip() or res.stderr.strip() or "بدون خروجی"
+            logger.info("[STATUS] Fallback success: stdout=%s | stderr=%s", res.stdout, res.stderr)
+        except Exception as e2:
+            logger.error("[STATUS] Fallback also failed: %s", e2, exc_info=True)
+            output = f"خطا در اجرای دستور: {e}"
 
     if len(output) > 200:
         output = output[:200] + "..."
@@ -217,15 +230,33 @@ async def handle_bot_restart(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
-    logger.info("Sudo user %s requested bot restart", query.from_user.id)
+    logger.info("[RESTART] Sudo user %s requested bot restart confirmation", query.from_user.id)
 
     if not await is_sudo(query.from_user.id):
-        logger.warning("Unauthorized restart request by user %s", query.from_user.id)
+        logger.warning("[RESTART] Unauthorized restart request by user %s", query.from_user.id)
         await query.answer("❌ فقط ادمین اصلی (Sudo) دسترسی دارد.", show_alert=True)
         return
 
-    # Acknowledge immediately before supervisor kills the process
-    await query.answer("🔄 دستور ری‌استارت ارسال شد...", show_alert=True)
+    from keyboards import restart_confirm_keyboard
+    await query.edit_message_text(
+        "⚠️ <b>تأیید ری‌استارت</b>\n\nآیا از ری‌استارت کردن ربات اطمینان دارید؟",
+        parse_mode=ParseMode.HTML,
+        reply_markup=restart_confirm_keyboard()
+    )
+
+
+async def handle_do_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    logger.info("[RESTART] Sudo user %s confirmed bot restart", query.from_user.id)
+
+    if not await is_sudo(query.from_user.id):
+        logger.warning("[RESTART] Unauthorized do_restart request by user %s", query.from_user.id)
+        await query.answer("❌ فقط ادمین اصلی (Sudo) دسترسی دارد.", show_alert=True)
+        return
+
+    await query.edit_message_text("🔄 <b>در حال ری‌استارت ربات...</b>\nلطفاً چند لحظه صبر کنید.", parse_mode=ParseMode.HTML)
 
     def _do_restart():
         import time
@@ -233,15 +264,25 @@ async def handle_bot_restart(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             import subprocess
             import os
-            cmd = ["supervisorctl", "-c", os.path.expanduser("~/supervisord.conf"), "restart", "tisa_manager"]
-            logger.info("Executing background command: %s", " ".join(cmd))
+            config_path = os.path.expanduser("~/supervisord.conf")
+            cmd = ["supervisorctl", "-c", config_path, "restart", "tisa_manager"]
+            logger.info("[RESTART] Starting supervisor restart with config: %s", config_path)
+            
             res = subprocess.run(
                 cmd,
                 capture_output=True, text=True, timeout=15
             )
-            logger.info("Restart background result: stdout=%s stderr=%s", res.stdout, res.stderr)
+            logger.info("[RESTART] Supervisor restart completed: stdout=%s | stderr=%s", res.stdout, res.stderr)
         except Exception as e:
-            logger.error("Exception in background restart: %s", e, exc_info=True)
+            logger.error("[RESTART] Supervisor restart failed with custom config: %s. Trying fallback...", e)
+            try:
+                res = subprocess.run(
+                    ["supervisorctl", "restart", "tisa_manager"],
+                    capture_output=True, text=True, timeout=15
+                )
+                logger.info("[RESTART] Fallback supervisor restart completed: stdout=%s | stderr=%s", res.stdout, res.stderr)
+            except Exception as e2:
+                logger.error("[RESTART] Fallback supervisor restart also failed: %s", e2, exc_info=True)
 
     import threading
     threading.Thread(target=_do_restart, daemon=True).start()

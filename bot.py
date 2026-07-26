@@ -89,6 +89,7 @@ from handlers.settings import (
     handle_back_main,
     handle_bot_status,
     handle_bot_restart,
+    handle_do_restart,
 )
 from handlers.history import (
     handle_history,
@@ -149,6 +150,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_remove_channel, pattern="^remove_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_bot_status, pattern="^bot_status$"))
     app.add_handler(CallbackQueryHandler(handle_bot_restart, pattern="^bot_restart$"))
+    app.add_handler(CallbackQueryHandler(handle_do_restart, pattern="^do_restart$"))
     app.add_handler(CallbackQueryHandler(handle_back_main, pattern="^back_main$"))
     # User management handlers
     app.add_handler(CallbackQueryHandler(handle_users_menu, pattern="^users_menu$"))

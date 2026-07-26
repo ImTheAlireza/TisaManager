@@ -13,12 +13,12 @@ def main_menu_keyboard(is_sudo: bool = False, is_owner: bool = False) -> InlineK
     return InlineKeyboardMarkup(buttons)
 
 
-def confirm_keyboard() -> InlineKeyboardMarkup:
+def restart_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ تأیید و ارسال", callback_data="confirm_post"),
-                InlineKeyboardButton("❌ لغو", callback_data="cancel_post"),
+                InlineKeyboardButton("✅ بله، ری‌استارت شود", callback_data="do_restart"),
+                InlineKeyboardButton("❌ انصراف", callback_data="settings"),
             ]
         ]
     )
