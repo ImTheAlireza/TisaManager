@@ -94,12 +94,15 @@ def restart_confirm_keyboard() -> InlineKeyboardMarkup:
 
 
 def settings_keyboard(is_sudo_user: bool = False) -> list[list[InlineKeyboardButton]]:
-    return [
+    buttons = [
         [InlineKeyboardButton("📢 مدیریت کانال‌ها", callback_data="manage_channels")],
         [InlineKeyboardButton("📑 افزودن قالب", callback_data="add_template")],
         [InlineKeyboardButton("🔐 تنظیم تأیید پست‌ها", callback_data="approval_settings")],
-        [InlineKeyboardButton("◀️ بازگشت", callback_data="back_main")],
     ]
+    if is_sudo_user:
+        buttons.append([InlineKeyboardButton("🗄️ پشتیبان‌گیری", callback_data="backup_project"), InlineKeyboardButton("♻️ بازیابی", callback_data="restore_project")])
+    buttons.append([InlineKeyboardButton("◀️ بازگشت", callback_data="back_main")])
+    return buttons
 
 
 def settings_main_markup(is_sudo_user: bool = False) -> InlineKeyboardMarkup:

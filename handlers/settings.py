@@ -32,7 +32,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         "⚙️ <b>تنظیمات ربات</b>\n\nیک بخش را انتخاب کنید:",
         parse_mode=ParseMode.HTML,
-        reply_markup=settings_main_markup(is_sudo_user=await is_owner(query.from_user.id)),
+        reply_markup=settings_main_markup(is_sudo_user=await is_sudo(query.from_user.id)),
     )
 
 

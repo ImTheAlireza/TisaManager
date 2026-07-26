@@ -2,6 +2,8 @@ import logging
 import os
 import sys
 import threading
+from datetime import time as dt_time
+from zoneinfo import ZoneInfo
 
 # --- Load env and bot token BEFORE anything else ---
 from dotenv import load_dotenv
@@ -129,6 +131,7 @@ from handlers.history import (
 )
 from handlers.admin import handle_stats, handle_health, handle_tools_menu, run_channel_health_checks, daily_report
 from handlers.help import handle_help, handle_help_section
+from backup import handle_backup, handle_restore, handle_restore_document, nightly_backup
 from handlers.users import (
     handle_users_menu,
     handle_add_user,
@@ -187,6 +190,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_settings, pattern="^settings$"))
     app.add_handler(CallbackQueryHandler(handle_manage_channels, pattern="^manage_channels$"))
     app.add_handler(CallbackQueryHandler(handle_add_template, pattern="^add_template$"))
+    app.add_handler(CallbackQueryHandler(handle_backup, pattern="^backup_project$"))
+    app.add_handler(CallbackQueryHandler(handle_restore, pattern="^restore_project$"))
     app.add_handler(CallbackQueryHandler(handle_confirm_post, pattern="^confirm_post$"))
     app.add_handler(CallbackQueryHandler(handle_cancel_post, pattern="^cancel_post$"))
     app.add_handler(CallbackQueryHandler(handle_choose_channels, pattern="^choose_channels$"))
@@ -230,6 +235,9 @@ def main():
     # Message handler for post content + channel input
     # Must be last so callbacks are matched first
     async def route_message(update, context):
+        # Restore uploads must be handled before normal workflow routing.
+        if await handle_restore_document(update, context):
+            return
         from handlers.users import handle_add_user_input
         # Try user input first
         if await handle_add_user_input(update, context):
@@ -254,6 +262,7 @@ def main():
     app.job_queue.run_repeating(process_scheduled_posts, interval=60, first=10, name="scheduled_posts")
     app.job_queue.run_repeating(run_channel_health_checks, interval=900, first=30, name="channel_health")
     app.job_queue.run_repeating(daily_report, interval=86400, first=86400, name="daily_report")
+    app.job_queue.run_daily(nightly_backup, time=dt_time(23, 59, tzinfo=ZoneInfo("Asia/Tehran")), name="nightly_backup")
 
     logger.info("Bot starting...")
     app.run_polling()

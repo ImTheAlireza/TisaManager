@@ -635,6 +635,8 @@ def cancel_all_workflows(user_id: int):
     _edit_states.pop(user_id, None)
     _settings_states.pop(user_id, None)
     _add_user_states.pop(user_id, None)
+    from backup import cancel_restore
+    cancel_restore(user_id)
 
 
 async def handle_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
