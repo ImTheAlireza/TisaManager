@@ -24,7 +24,7 @@ def confirm_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def settings_keyboard(channels: list[dict]) -> list[list[InlineKeyboardButton]]:
+def settings_keyboard(channels: list[dict], is_sudo_user: bool = False) -> list[list[InlineKeyboardButton]]:
     buttons = []
     for ch in channels:
         icon = "🔵" if ch.get("platform") == "bale" else "📣"
@@ -42,12 +42,19 @@ def settings_keyboard(channels: list[dict]) -> list[list[InlineKeyboardButton]]:
     buttons.append(
         [InlineKeyboardButton("➕ افزودن کانال بله", callback_data="add_bale_channel")]
     )
+    if is_sudo_user:
+        buttons.append(
+            [
+                InlineKeyboardButton("📊 وضعیت ربات", callback_data="bot_status"),
+                InlineKeyboardButton("🔄 ری‌استارت", callback_data="bot_restart"),
+            ]
+        )
     buttons.append([InlineKeyboardButton("◀️ بازگشت", callback_data="back_main")])
     return buttons
 
 
-def settings_markup(channels: list[dict]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(settings_keyboard(channels))
+def settings_markup(channels: list[dict], is_sudo_user: bool = False) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(settings_keyboard(channels, is_sudo_user=is_sudo_user))
 
 
 def users_menu_keyboard() -> InlineKeyboardMarkup:
@@ -95,7 +102,7 @@ def role_select_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def history_keyboard(posts: list[dict], is_admin: bool = False) -> InlineKeyboardMarkup:
+def history_keyboard(posts: list[dict], page: int = 1, total_pages: int = 1, is_admin: bool = False) -> InlineKeyboardMarkup:
     buttons = []
     for post in posts:
         type_icon = {"text": "📝", "photo": "🖼️", "video": "🎬", "document": "📎", "media_group": "📦"}.get(post["post_type"], "📝")
@@ -107,6 +114,15 @@ def history_keyboard(posts: list[dict], is_admin: bool = False) -> InlineKeyboar
         if is_admin and post.get("user_id"):
             label = f"{type_icon} {date} | {preview}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"post_{post['id']}")])
+
+    prev_page = max(1, page - 1)
+    next_page = min(total_pages, page + 1)
+    pag_row = [
+        InlineKeyboardButton("<", callback_data=f"history_page_{prev_page}"),
+        InlineKeyboardButton(f"{page}/{total_pages}", callback_data="history_noop"),
+        InlineKeyboardButton(">", callback_data=f"history_page_{next_page}"),
+    ]
+    buttons.append(pag_row)
     buttons.append([InlineKeyboardButton("◀️ بازگشت", callback_data="back_main")])
     return InlineKeyboardMarkup(buttons)
 

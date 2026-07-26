@@ -1,3 +1,4 @@
+import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
@@ -11,6 +12,8 @@ from database import (
 )
 from keyboards import main_menu_keyboard, settings_markup
 import bale_client
+
+logger = logging.getLogger(__name__)
 
 # Per-user state for channel input
 _settings_states: dict[int, dict] = {}
@@ -39,7 +42,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tg_channels and not bale_channels:
         text = "📢 <b>کانالی تنظیم نشده است.</b>\n\nبرای شروع ارسال، کانال اضافه کنید."
 
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=settings_markup(tg_channels + bale_channels))
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=settings_markup(tg_channels + bale_channels, is_sudo_user=await is_sudo(query.from_user.id)))
 
 
 async def handle_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -175,8 +178,73 @@ async def handle_remove_channel(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=settings_markup(tg_channels + bale_channels),
+        reply_markup=settings_markup(tg_channels + bale_channels, is_sudo_user=await is_sudo(query.from_user.id)),
     )
+
+
+async def handle_bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    logger.info("Sudo user %s requested bot status", query.from_user.id)
+
+    if not await is_sudo(query.from_user.id):
+        logger.warning("Unauthorized status request by user %s", query.from_user.id)
+        await query.answer("❌ فقط ادمین اصلی (Sudo) دسترسی دارد.", show_alert=True)
+        return
+
+    try:
+        import subprocess
+        import os
+        cmd = ["supervisorctl", "-c", os.path.expanduser("~/supervisord.conf"), "status", "tisa_manager"]
+        logger.info("Executing command: %s", " ".join(cmd))
+        res = subprocess.run(
+            cmd,
+            capture_output=True, text=True, timeout=5
+        )
+        output = res.stdout.strip() or res.stderr.strip() or "بدون خروجی"
+        logger.info("Status result: stdout=%s stderr=%s", res.stdout, res.stderr)
+    except Exception as e:
+        logger.error("Exception in handle_bot_status: %s", e, exc_info=True)
+        output = f"خطا در اجرای دستور: {e}"
+
+    if len(output) > 200:
+        output = output[:200] + "..."
+    await query.answer(f"📊 وضعیت:\n{output}", show_alert=True)
+
+
+async def handle_bot_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    logger.info("Sudo user %s requested bot restart", query.from_user.id)
+
+    if not await is_sudo(query.from_user.id):
+        logger.warning("Unauthorized restart request by user %s", query.from_user.id)
+        await query.answer("❌ فقط ادمین اصلی (Sudo) دسترسی دارد.", show_alert=True)
+        return
+
+    # Acknowledge immediately before supervisor kills the process
+    await query.answer("🔄 دستور ری‌استارت ارسال شد...", show_alert=True)
+
+    def _do_restart():
+        import time
+        time.sleep(1)
+        try:
+            import subprocess
+            import os
+            cmd = ["supervisorctl", "-c", os.path.expanduser("~/supervisord.conf"), "restart", "tisa_manager"]
+            logger.info("Executing background command: %s", " ".join(cmd))
+            res = subprocess.run(
+                cmd,
+                capture_output=True, text=True, timeout=15
+            )
+            logger.info("Restart background result: stdout=%s stderr=%s", res.stdout, res.stderr)
+        except Exception as e:
+            logger.error("Exception in background restart: %s", e, exc_info=True)
+
+    import threading
+    threading.Thread(target=_do_restart, daemon=True).start()
 
 
 async def handle_back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):

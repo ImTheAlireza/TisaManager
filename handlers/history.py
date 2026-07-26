@@ -1,13 +1,14 @@
 import json
 import logging
 
-from telegram import Update
+from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
 from database import (
-    get_user_posts, get_all_posts, get_post, update_post_text, update_post_caption,
+    get_user_posts, get_all_posts, get_user_posts_paginated, get_all_posts_paginated,
+    count_user_posts, count_all_posts, get_post, update_post_text, update_post_caption,
     delete_post, is_writer_or_above, is_owner, is_sudo, can_edit_post, can_delete_post,
     get_user_role,
 )
@@ -31,8 +32,9 @@ def _safe_parse_json(data):
         return []
 
 
-async def _try_edit_message(context, chat_id, message_id, platform, post_type, new_text):
+async def _try_edit_message(context, chat_id, message_id, platform, post, new_text):
     """Try to edit a single message. Returns True on success."""
+    post_type = post.get("post_type")
     try:
         if platform == "bale":
             import bale_client
@@ -44,9 +46,40 @@ async def _try_edit_message(context, chat_id, message_id, platform, post_type, n
         else:
             if post_type == "text":
                 await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=new_text)
-            else:
-                await context.bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=new_text)
-            return True
+                return True
+
+            # First try editing caption (works if caption already existed)
+            try:
+                await context.bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=new_text, parse_mode=ParseMode.HTML)
+                return True
+            except BadRequest:
+                # If editing caption fails (e.g., adding caption to captionless media or media group),
+                # fallback to edit_message_media
+                if post_type == "photo":
+                    media = InputMediaPhoto(media=post.get("file_id"), caption=new_text, parse_mode=ParseMode.HTML)
+                    await context.bot.edit_message_media(chat_id=chat_id, message_id=message_id, media=media)
+                    return True
+                elif post_type == "video":
+                    media = InputMediaVideo(media=post.get("file_id"), caption=new_text, parse_mode=ParseMode.HTML)
+                    await context.bot.edit_message_media(chat_id=chat_id, message_id=message_id, media=media)
+                    return True
+                elif post_type == "document":
+                    media = InputMediaDocument(media=post.get("file_id"), caption=new_text, parse_mode=ParseMode.HTML)
+                    await context.bot.edit_message_media(chat_id=chat_id, message_id=message_id, media=media)
+                    return True
+                elif post_type == "media_group":
+                    media_list = _safe_parse_json(post.get("media_json"))
+                    if media_list:
+                        first_media = media_list[0]
+                        m_type = first_media.get("type")
+                        m_file_id = first_media.get("file_id")
+                        if m_type == "video":
+                            media = InputMediaVideo(media=m_file_id, caption=new_text, parse_mode=ParseMode.HTML)
+                        else:
+                            media = InputMediaPhoto(media=m_file_id, caption=new_text, parse_mode=ParseMode.HTML)
+                        await context.bot.edit_message_media(chat_id=chat_id, message_id=message_id, media=media)
+                        return True
+                raise
     except BadRequest as e:
         if "not modified" in str(e).lower():
             return True
@@ -82,6 +115,11 @@ def _msg_text(text):
     pass
 
 
+async def handle_history_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+
 async def handle_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -94,12 +132,33 @@ async def handle_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = await get_user_role(user_id)
     is_admin = role in ("sudo", "owner")
 
-    if is_admin:
-        posts = await get_all_posts(limit=20)
-    else:
-        posts = await get_user_posts(user_id, limit=20)
+    page = 1
+    if query.data.startswith("history_page_"):
+        try:
+            page = int(query.data.removeprefix("history_page_"))
+        except ValueError:
+            page = 1
 
-    if not posts:
+    POSTS_PER_PAGE = 5
+    offset = (page - 1) * POSTS_PER_PAGE
+
+    if is_admin:
+        total_posts = await count_all_posts()
+        posts = await get_all_posts_paginated(limit=POSTS_PER_PAGE, offset=offset)
+    else:
+        total_posts = await count_user_posts(user_id)
+        posts = await get_user_posts_paginated(user_id, limit=POSTS_PER_PAGE, offset=offset)
+
+    total_pages = max(1, (total_posts + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE)
+    if page > total_pages:
+        page = total_pages
+        offset = (page - 1) * POSTS_PER_PAGE
+        if is_admin:
+            posts = await get_all_posts_paginated(limit=POSTS_PER_PAGE, offset=offset)
+        else:
+            posts = await get_user_posts_paginated(user_id, limit=POSTS_PER_PAGE, offset=offset)
+
+    if not posts and total_posts == 0:
         try:
             await query.edit_message_text("📋 تاریخچه پست‌ها خالی است.", reply_markup=await _menu_kb(user_id))
         except BadRequest:
@@ -108,7 +167,11 @@ async def handle_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "📋 <b>تاریخچه پست‌ها:</b>\n\nروی یک پست کلیک کنید:"
     try:
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=history_keyboard(posts, is_admin=is_admin))
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=history_keyboard(posts, page=page, total_pages=total_pages, is_admin=is_admin)
+        )
     except BadRequest:
         pass
 
@@ -239,7 +302,7 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         seen_channels.add(channel_key)
 
-        ok = await _try_edit_message(context, chat_id, message_id, platform, post["post_type"], new_text)
+        ok = await _try_edit_message(context, chat_id, message_id, platform, post, new_text)
         if ok:
             edited += 1
 
