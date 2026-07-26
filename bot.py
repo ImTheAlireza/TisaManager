@@ -62,6 +62,13 @@ sys.excepthook = handle_exception
 
 
 # --- Now import everything else (errors will be logged) ---
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 from telegram.constants import ParseMode
 
 from config import BOT_TOKEN as _CONFIRM_TOKEN  # noqa: F811
