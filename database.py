@@ -187,6 +187,11 @@ async def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """)
             await cur.execute("INSERT IGNORE INTO bot_settings (setting_key, setting_value, updated_by) VALUES ('approval_required', '0', %s)", (SUDO_USER_ID,))
+            await cur.execute("SELECT setting_value FROM bot_settings WHERE setting_key = 'legacy_delivery_migrated'")
+            if not await cur.fetchone():
+                # Older releases incorrectly labelled already-published rows as pending.
+                await cur.execute("UPDATE post_history SET delivery_status = 'completed', delivery_completed_at = COALESCE(delivery_completed_at, created_at) WHERE delivery_status IN ('pending', 'pending_approval')")
+                await cur.execute("INSERT INTO bot_settings (setting_key, setting_value, updated_by) VALUES ('legacy_delivery_migrated', '1', %s)", (SUDO_USER_ID,))
             await cur.execute("""
                 CREATE TABLE IF NOT EXISTS role_permissions (
                     role VARCHAR(20) NOT NULL,
@@ -486,7 +491,7 @@ async def get_channel_health():
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute("SELECT id, name, platform, is_active, last_health_status, last_health_error, last_health_check FROM channels ORDER BY platform, name")
+            await cur.execute("SELECT id, chat_id, name, platform, is_active, last_health_status, last_health_error, last_health_check FROM channels ORDER BY platform, name")
             return list(await cur.fetchall())
 
 
@@ -551,7 +556,7 @@ async def get_due_schedules():
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute("SELECT * FROM scheduled_posts WHERE status = 'scheduled' AND run_at <= NOW() ORDER BY run_at LIMIT 50")
+            await cur.execute("SELECT * FROM scheduled_posts WHERE status = 'scheduled' AND run_at <= UTC_TIMESTAMP() ORDER BY run_at LIMIT 50")
             return list(await cur.fetchall())
 
 

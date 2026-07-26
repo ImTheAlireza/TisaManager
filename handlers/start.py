@@ -3,10 +3,13 @@ from telegram.ext import ContextTypes
 
 from database import is_sudo, is_owner, is_writer_or_above
 from keyboards import main_menu_keyboard
+from handlers.post import cancel_all_workflows
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    # /start always returns the user to a clean workflow.
+    cancel_all_workflows(user_id)
 
     if not await is_writer_or_above(user_id):
         await update.message.reply_text("❌ شما مجاز به استفاده از این ربات نیستید.")

@@ -5,6 +5,7 @@ def main_menu_keyboard(is_sudo: bool = False, is_owner: bool = False) -> InlineK
     buttons = [
         [InlineKeyboardButton("📝 پست جدید", callback_data="new_post")],
         [InlineKeyboardButton("📋 تاریخچه پست‌ها", callback_data="history")],
+        [InlineKeyboardButton("🧰 ابزارها", callback_data="tools_menu")],
         [InlineKeyboardButton("❓ راهنمای استفاده", callback_data="help")],
     ]
     if is_sudo or is_owner:
@@ -42,6 +43,28 @@ def channel_selection_keyboard(channels: list[dict], selected: set[int]) -> Inli
     buttons.append([InlineKeyboardButton("✅ تأیید انتخاب", callback_data="channels_done")])
     buttons.append([InlineKeyboardButton("◀️ بازگشت", callback_data="channels_back")])
     return InlineKeyboardMarkup(buttons)
+
+
+def schedule_date_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("امروز", callback_data="schedule_date_today"), InlineKeyboardButton("فردا", callback_data="schedule_date_tomorrow")],
+        [InlineKeyboardButton("❌ لغو", callback_data="cancel_post")],
+    ])
+
+
+def schedule_hour_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for start in range(0, 24, 6):
+        rows.append([InlineKeyboardButton(f"{hour:02d}:00", callback_data=f"schedule_hour_{hour}") for hour in range(start, min(start + 6, 24))])
+    rows.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_post")])
+    return InlineKeyboardMarkup(rows)
+
+
+def schedule_minute_keyboard(hour: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{hour:02d}:{minute:02d}", callback_data=f"schedule_minute_{hour}_{minute}") for minute in (0, 15, 30, 45)],
+        [InlineKeyboardButton("❌ لغو", callback_data="cancel_post")],
+    ])
 
 
 def approval_settings_keyboard(enabled: bool) -> InlineKeyboardMarkup:
@@ -167,18 +190,15 @@ def history_keyboard(posts: list[dict], page: int = 1, total_pages: int = 1, is_
     return InlineKeyboardMarkup(buttons)
 
 
-def post_detail_keyboard(post_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✏️ ویرایش", callback_data=f"edit_{post_id}"),
-                InlineKeyboardButton("🗑️ حذف", callback_data=f"delete_{post_id}"),
-            ],
-            [
-                InlineKeyboardButton("📄 کپی", callback_data=f"duplicate_{post_id}"),
-                InlineKeyboardButton("🔁 ارسال مجدد", callback_data=f"retry_{post_id}"),
-            ],
-            [InlineKeyboardButton("✅ تأیید انتشار", callback_data=f"approve_{post_id}")],
-            [InlineKeyboardButton("◀️ بازگشت", callback_data="history")],
+def post_detail_keyboard(post_id: int, status: str = "completed") -> InlineKeyboardMarkup:
+    if status == "draft":
+        buttons = [[InlineKeyboardButton("✅ انتشار پیش‌نویس", callback_data=f"publish_draft_{post_id}")]]
+    elif status == "pending_approval":
+        buttons = [[InlineKeyboardButton("✅ تأیید انتشار", callback_data=f"approve_{post_id}")]]
+    else:
+        buttons = [
+            [InlineKeyboardButton("✏️ ویرایش", callback_data=f"edit_{post_id}"), InlineKeyboardButton("🗑️ حذف", callback_data=f"delete_{post_id}")],
+            [InlineKeyboardButton("📄 کپی", callback_data=f"duplicate_{post_id}"), InlineKeyboardButton("🔁 ارسال مجدد", callback_data=f"retry_{post_id}")],
         ]
-    )
+    buttons.append([InlineKeyboardButton("◀️ بازگشت", callback_data="history")])
+    return InlineKeyboardMarkup(buttons)

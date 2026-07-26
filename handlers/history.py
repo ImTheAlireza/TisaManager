@@ -11,7 +11,7 @@ from database import (
     get_user_posts, get_all_posts, get_user_posts_paginated, get_all_posts_paginated,
     count_user_posts, count_all_posts, get_post, update_post_text, update_post_caption,
     delete_post, is_writer_or_above, is_owner, is_sudo, can_edit_post, can_delete_post,
-    get_user_role, get_post, has_permission, update_post_status, save_post_version,
+    get_user_role, get_post, has_permission, update_post_status, save_post_version, save_post,
 )
 from keyboards import main_menu_keyboard, history_keyboard, post_detail_keyboard, confirm_keyboard
 from utils import html_text, state_is_expired
@@ -230,9 +230,9 @@ async def handle_post_detail(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     text = "\n".join(lines)
     try:
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=post_detail_keyboard(post_id))
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=post_detail_keyboard(post_id, post.get("delivery_status", "completed")))
     except BadRequest:
-        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=post_detail_keyboard(post_id))
+        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=post_detail_keyboard(post_id, post.get("delivery_status", "completed")))
 
 
 async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -253,6 +253,9 @@ async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     post = await get_post(post_id)
+    if post and post.get("delivery_status") == "draft":
+        await query.edit_message_text("❌ پیش‌نویس با این گزینه قابل ویرایش نیست. ابتدا آن را منتشر کنید.")
+        return
     if not post:
         try:
             await query.edit_message_text("❌ پست یافت نشد.", reply_markup=await _menu_kb(query.from_user.id))
@@ -333,6 +336,9 @@ async def handle_duplicate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         return
     post = await get_post(post_id)
+    if post and post.get("delivery_status") == "draft":
+        await query.edit_message_text("❌ پیش‌نویس قابل کپی نیست. ابتدا آن را منتشر کنید.")
+        return
     if not post or not await can_edit_post(query.from_user.id, post_id):
         await query.edit_message_text("❌ اجازه کپی این پست را ندارید.")
         return
@@ -341,6 +347,23 @@ async def handle_duplicate(update: Update, context: ContextTypes.DEFAULT_TYPE):
              "selected_channel_ids": _safe_parse_json(post.get("target_channels_json")), "created_at": time.monotonic()}
     user_states[query.from_user.id] = state
     await query.edit_message_text("📄 کپی پست آماده است. مقصدها و عملیات را انتخاب کنید.", reply_markup=confirm_keyboard())
+
+
+async def handle_publish_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    post_id = int(query.data.removeprefix("publish_draft_"))
+    post = await get_post(post_id)
+    if not post or post.get("delivery_status") != "draft":
+        await query.edit_message_text("❌ فقط پیش‌نویس‌ها قابل انتشار هستند.")
+        return
+    if not await can_edit_post(query.from_user.id, post_id):
+        await query.edit_message_text("❌ شما اجازه انتشار این پیش‌نویس را ندارید.")
+        return
+    await update_post_status(post_id, "pending")
+    await query.edit_message_text("⏳ در حال انتشار پیش‌نویس...")
+    sent, failed = await publish_existing_post(post, context.bot)
+    await query.message.reply_text(f"✅ انتشار انجام شد: {sent} موفق، {failed} ناموفق.", reply_markup=await _menu_kb(query.from_user.id))
 
 
 async def handle_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -377,9 +400,20 @@ async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not post:
         await query.edit_message_text("❌ پست یافت نشد.")
         return
+    if post.get("delivery_status") == "draft":
+        await query.edit_message_text("❌ پیش‌نویس را ابتدا با گزینه «انتشار پیش‌نویس» منتشر کنید.")
+        return
+    # A republish is a new history row, so it can be edited/deleted independently.
+    new_id = await save_post(
+        query.from_user.id, post["post_type"], text=post.get("text"), file_id=post.get("file_id"),
+        caption=post.get("caption"), media_json=post.get("media_json"),
+        target_channels_json=post.get("target_channels_json"), delivery_status="pending",
+    )
+    new_post = dict(post)
+    new_post["id"] = new_id
     await query.edit_message_text("⏳ در حال ارسال مجدد...")
-    sent, failed = await publish_existing_post(post, context.bot)
-    await query.message.reply_text(f"🔁 ارسال مجدد انجام شد: {sent} موفق، {failed} ناموفق.", reply_markup=await _menu_kb(query.from_user.id))
+    sent, failed = await publish_existing_post(new_post, context.bot)
+    await query.message.reply_text(f"🔁 ارسال مجدد انجام شد و در تاریخچه با شناسه #{new_id} ذخیره شد: {sent} موفق، {failed} ناموفق.", reply_markup=await _menu_kb(query.from_user.id))
 
 
 async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):

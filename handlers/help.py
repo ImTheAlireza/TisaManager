@@ -42,6 +42,8 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE, section=
 
 
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from handlers.post import cancel_all_workflows
+    cancel_all_workflows(update.effective_user.id)
     await show_help(update, context, "main")
 
 

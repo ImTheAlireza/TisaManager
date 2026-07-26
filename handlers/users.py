@@ -198,8 +198,8 @@ async def handle_promote_owner(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     user_id = query.from_user.id
-    if not await is_owner(user_id):
-        await query.edit_message_text("❌ غیرمجاز.")
+    if not await is_sudo(user_id):
+        await query.answer("❌ فقط sudo می‌تواند نویسنده را به owner ارتقا دهد.", show_alert=True)
         return
 
     try:

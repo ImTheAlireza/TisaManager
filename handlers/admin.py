@@ -5,7 +5,9 @@ from telegram.ext import ContextTypes
 
 from config import SUDO_USER_ID
 from database import get_analytics, get_channel_health, get_active_channels, update_channel_health, is_sudo, is_owner
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import bale_client
+from handlers.post import cancel_all_workflows
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +30,29 @@ def _analytics_text(data):
     )
 
 
+async def handle_tools_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🧰 ابزارها را انتخاب کنید:", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 آمار", callback_data="tools_stats"), InlineKeyboardButton("🩺 سلامت کانال‌ها", callback_data="tools_health")],
+        [InlineKeyboardButton("📑 قالب‌ها", callback_data="tools_templates"), InlineKeyboardButton("📋 گروه‌های کانال", callback_data="tools_groups")],
+        [InlineKeyboardButton("◀️ منوی اصلی", callback_data="back_main")],
+    ]))
+
+
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cancel_all_workflows(update.effective_user.id)
     if not await is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ غیرمجاز.")
+        if update.callback_query:
+            await update.callback_query.answer("❌ غیرمجاز.", show_alert=True)
+        else:
+            await update.message.reply_text("❌ غیرمجاز.")
         return
-    await update.message.reply_text(_analytics_text(await get_analytics()))
+    text = _analytics_text(await get_analytics())
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ ابزارها", callback_data="tools_menu")]]))
+    else:
+        await update.message.reply_text(text)
 
 
 async def run_channel_health_checks(context: ContextTypes.DEFAULT_TYPE):
@@ -54,19 +74,29 @@ async def run_channel_health_checks(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cancel_all_workflows(update.effective_user.id)
     if not await is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ غیرمجاز.")
+        if update.callback_query:
+            await update.callback_query.answer("❌ غیرمجاز.", show_alert=True)
+        else:
+            await update.message.reply_text("❌ غیرمجاز.")
         return
     await run_channel_health_checks(context)
     rows = await get_channel_health()
     if not rows:
-        await update.message.reply_text("📋 کانالی تنظیم نشده است.")
+        if update.callback_query:
+            await update.callback_query.edit_message_text("📋 کانالی تنظیم نشده است.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ ابزارها", callback_data="tools_menu")]]))
+        else:
+            await update.message.reply_text("📋 کانالی تنظیم نشده است.")
         return
     lines = ["🩺 وضعیت کانال‌ها:"]
     for row in rows:
         icon = "✅" if row["last_health_status"] == "healthy" else "❌"
         lines.append(f"{icon} {row['name']} ({row['platform']}) — {row['last_health_status'] or 'نامشخص'}")
-    await update.message.reply_text("\n".join(lines))
+    if update.callback_query:
+        await update.callback_query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ ابزارها", callback_data="tools_menu")]]))
+    else:
+        await update.message.reply_text("\n".join(lines))
 
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):

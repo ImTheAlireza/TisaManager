@@ -86,9 +86,14 @@ from handlers.post import (
     handle_save_draft,
     handle_save_template,
     handle_schedule_post,
+    handle_schedule_date,
+    handle_schedule_hour,
+    handle_schedule_minute,
     process_scheduled_posts,
     handle_templates_command,
     handle_use_template_command,
+    handle_templates_menu,
+    handle_template_use_callback,
     handle_any_message,
 )
 from handlers.settings import (
@@ -105,6 +110,8 @@ from handlers.settings import (
     handle_do_restart,
     handle_group_command,
     handle_groups_command,
+    handle_groups_menu,
+    handle_create_group,
 )
 from handlers.history import (
     handle_history,
@@ -115,9 +122,10 @@ from handlers.history import (
     handle_delete,
     handle_duplicate,
     handle_retry,
+    handle_publish_draft,
     handle_approve,
 )
-from handlers.admin import handle_stats, handle_health, run_channel_health_checks, daily_report
+from handlers.admin import handle_stats, handle_health, handle_tools_menu, run_channel_health_checks, daily_report
 from handlers.help import handle_help, handle_help_section
 from handlers.users import (
     handle_users_menu,
@@ -172,6 +180,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_delete, pattern="^delete_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_duplicate, pattern="^duplicate_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_retry, pattern="^retry_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_publish_draft, pattern="^publish_draft_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_approve, pattern="^approve_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_settings, pattern="^settings$"))
     app.add_handler(CallbackQueryHandler(handle_confirm_post, pattern="^confirm_post$"))
@@ -182,6 +191,9 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_channels_back, pattern="^channels_back$"))
     app.add_handler(CallbackQueryHandler(handle_save_draft, pattern="^save_draft$"))
     app.add_handler(CallbackQueryHandler(handle_save_template, pattern="^save_template$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_date, pattern="^schedule_date_(today|tomorrow)$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_hour, pattern="^schedule_hour_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_minute, pattern="^schedule_minute_\\d+_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_schedule_post, pattern="^schedule_post$"))
     app.add_handler(CallbackQueryHandler(handle_add_channel, pattern="^add_channel$"))
     app.add_handler(CallbackQueryHandler(handle_add_bale_channel, pattern="^add_bale_channel$"))
@@ -190,6 +202,13 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_bot_restart, pattern="^bot_restart$"))
     app.add_handler(CallbackQueryHandler(handle_do_restart, pattern="^do_restart$"))
     app.add_handler(CallbackQueryHandler(handle_back_main, pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(handle_tools_menu, pattern="^tools_menu$"))
+    app.add_handler(CallbackQueryHandler(handle_templates_menu, pattern="^tools_templates$"))
+    app.add_handler(CallbackQueryHandler(handle_template_use_callback, pattern="^use_template_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_groups_menu, pattern="^tools_groups$"))
+    app.add_handler(CallbackQueryHandler(handle_create_group, pattern="^create_group$"))
+    app.add_handler(CallbackQueryHandler(handle_stats, pattern="^tools_stats$"))
+    app.add_handler(CallbackQueryHandler(handle_health, pattern="^tools_health$"))
     app.add_handler(CallbackQueryHandler(handle_help, pattern="^help$"))
     app.add_handler(CallbackQueryHandler(handle_help_section, pattern="^help_(publish|roles|settings|tools)$"))
     app.add_handler(CallbackQueryHandler(handle_approval_settings, pattern="^approval_settings$"))

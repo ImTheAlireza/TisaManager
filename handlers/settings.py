@@ -1,6 +1,6 @@
 import logging
 import time
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
@@ -44,7 +44,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tg_channels and not bale_channels:
         text = "📢 <b>کانالی تنظیم نشده است.</b>\n\nبرای شروع ارسال، کانال اضافه کنید."
 
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=settings_markup(tg_channels + bale_channels, is_sudo_user=await is_sudo(query.from_user.id)))
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=settings_markup(tg_channels + bale_channels, is_sudo_user=await is_owner(query.from_user.id)))
 
 
 async def handle_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -87,7 +87,29 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if state and state_is_expired(state):
         _settings_states.pop(user_id, None)
         state = None
-    if not state or state.get("state") != "awaiting_channel_input":
+    if not state:
+        return False
+    if state_is_expired(state):
+        _settings_states.pop(user_id, None)
+        return False
+    if state.get("state") == "awaiting_group_input":
+        raw = update.message.text.strip() if update.message and update.message.text else ""
+        if ":" not in raw:
+            await update.message.reply_text("❌ قالب نامعتبر است. نمونه: اخبار: 1,2,3")
+            return True
+        name, ids = raw.split(":", 1)
+        try:
+            channel_ids = [int(x.strip()) for x in ids.split(",") if x.strip()]
+        except ValueError:
+            await update.message.reply_text("❌ شناسه کانال نامعتبر است.")
+            return True
+        valid = {c["id"] for c in await get_active_channels()}
+        channel_ids = [cid for cid in channel_ids if cid in valid]
+        ok = bool(name.strip() and channel_ids) and await create_channel_group(user_id, name.strip(), channel_ids)
+        _settings_states.pop(user_id, None)
+        await update.message.reply_text("✅ گروه ساخته شد." if ok else "❌ گروه ساخته نشد؛ نام یا کانال‌ها را بررسی کنید.")
+        return True
+    if state.get("state") != "awaiting_channel_input":
         return False
 
     if not update.message or not update.message.text:
@@ -183,7 +205,7 @@ async def handle_remove_channel(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=settings_markup(tg_channels + bale_channels, is_sudo_user=await is_sudo(query.from_user.id)),
+        reply_markup=settings_markup(tg_channels + bale_channels, is_sudo_user=await is_owner(query.from_user.id)),
     )
 
 
@@ -221,45 +243,22 @@ async def handle_toggle_approval(update: Update, context: ContextTypes.DEFAULT_T
 async def handle_bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    logger.info("[STATUS] Sudo user %s requested bot status", query.from_user.id)
-
-    if not await is_sudo(query.from_user.id):
-        logger.warning("[STATUS] Unauthorized status request by user %s", query.from_user.id)
-        await query.answer("❌ فقط ادمین اصلی (Sudo) دسترسی دارد.", show_alert=True)
+    if not await is_owner(query.from_user.id):
+        await query.answer("❌ فقط sudo یا owner دسترسی دارد.", show_alert=True)
         return
-
-    try:
-        import subprocess
-        import os
-        config_path = os.path.expanduser("~/supervisord.conf")
-        cmd = ["supervisorctl", "-c", config_path, "status", "tisa_manager"]
-        logger.info("[STATUS] Attempting supervisorctl status with config: %s", config_path)
-        
-        res = subprocess.run(
-            cmd,
-            capture_output=True, text=True, timeout=5
-        )
-        output = res.stdout.strip() or res.stderr.strip() or "بدون خروجی"
-        logger.info("[STATUS] Success: stdout=%s | stderr=%s", res.stdout, res.stderr)
-    except Exception as e:
-        logger.error("[STATUS] Failed: %s", e, exc_info=True)
-        # Fallback without explicit config path if supervisord.conf is default or elsewhere
-        try:
-            logger.info("[STATUS] Trying fallback supervisorctl status without custom config")
-            res = subprocess.run(
-                ["supervisorctl", "status", "tisa_manager"],
-                capture_output=True, text=True, timeout=5
-            )
-            output = res.stdout.strip() or res.stderr.strip() or "بدون خروجی"
-            logger.info("[STATUS] Fallback success: stdout=%s | stderr=%s", res.stdout, res.stderr)
-        except Exception as e2:
-            logger.error("[STATUS] Fallback also failed: %s", e2, exc_info=True)
-            output = f"خطا در اجرای دستور: {e}"
-
-    if len(output) > 200:
-        output = output[:200] + "..."
-    await query.answer(f"📊 وضعیت:\n{output}", show_alert=True)
+    from handlers.admin import run_channel_health_checks
+    from database import get_channel_health
+    await run_channel_health_checks(context)
+    rows = await get_channel_health()
+    if not rows:
+        await query.answer("📋 کانالی تنظیم نشده است.", show_alert=True)
+        return
+    healthy = sum(1 for row in rows if row.get("last_health_status") == "healthy")
+    lines = [f"🩺 وضعیت کانال‌ها: {healthy}/{len(rows)} سالم"]
+    for row in rows:
+        icon = "✅" if row.get("last_health_status") == "healthy" else "❌"
+        lines.append(f"{icon} {row['name']} ({row['platform']}): {row.get('last_health_status') or 'نامشخص'}")
+    await query.answer("\n".join(lines)[:1900], show_alert=True)
 
 
 async def handle_bot_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -324,7 +323,34 @@ async def handle_do_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     threading.Thread(target=_do_restart, daemon=True).start()
 
 
+async def handle_groups_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not await is_owner(user_id):
+        await query.edit_message_text("❌ غیرمجاز.")
+        return
+    groups = await get_channel_groups(user_id)
+    text = "📋 گروه‌های کانال:\n" + ("\n".join(f"• {g['name']} ({g['channel_count']} کانال)" for g in groups) if groups else "هنوز گروهی ساخته نشده است.")
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ ساخت گروه", callback_data="create_group")],
+        [InlineKeyboardButton("◀️ ابزارها", callback_data="tools_menu")],
+    ]))
+
+
+async def handle_create_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_owner(query.from_user.id):
+        await query.edit_message_text("❌ غیرمجاز.")
+        return
+    _settings_states[query.from_user.id] = {"state": "awaiting_group_input", "created_at": time.monotonic()}
+    await query.edit_message_text("نام گروه و شناسه کانال‌ها را به شکل زیر ارسال کنید:\nنام گروه: 1,2,3")
+
+
 async def handle_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from handlers.post import cancel_all_workflows
+    cancel_all_workflows(update.effective_user.id)
     user_id = update.effective_user.id
     if not await is_owner(user_id):
         await update.message.reply_text("❌ غیرمجاز.")
@@ -349,6 +375,8 @@ async def handle_group_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from handlers.post import cancel_all_workflows
+    cancel_all_workflows(update.effective_user.id)
     user_id = update.effective_user.id
     if not await is_owner(user_id):
         await update.message.reply_text("❌ غیرمجاز.")
