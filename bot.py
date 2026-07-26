@@ -98,6 +98,8 @@ from handlers.post import (
 )
 from handlers.settings import (
     handle_settings,
+    handle_manage_channels,
+    handle_add_template,
     handle_add_channel,
     handle_add_bale_channel,
     handle_channel_input,
@@ -183,6 +185,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_publish_draft, pattern="^publish_draft_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_approve, pattern="^approve_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_settings, pattern="^settings$"))
+    app.add_handler(CallbackQueryHandler(handle_manage_channels, pattern="^manage_channels$"))
+    app.add_handler(CallbackQueryHandler(handle_add_template, pattern="^add_template$"))
     app.add_handler(CallbackQueryHandler(handle_confirm_post, pattern="^confirm_post$"))
     app.add_handler(CallbackQueryHandler(handle_cancel_post, pattern="^cancel_post$"))
     app.add_handler(CallbackQueryHandler(handle_choose_channels, pattern="^choose_channels$"))

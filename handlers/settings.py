@@ -11,7 +11,7 @@ from database import (
     is_sudo,
     remove_channel, create_channel_group, get_channel_groups, get_setting, set_setting,
 )
-from keyboards import main_menu_keyboard, settings_markup
+from keyboards import main_menu_keyboard, settings_markup, settings_main_markup
 from utils import state_is_expired
 import bale_client
 
@@ -29,22 +29,35 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ غیرمجاز.")
         return
 
-    tg_channels = await get_active_channels("telegram")
-    bale_channels = await get_active_channels("bale")
+    await query.edit_message_text(
+        "⚙️ <b>تنظیمات ربات</b>\n\nیک بخش را انتخاب کنید:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=settings_main_markup(is_sudo_user=await is_owner(query.from_user.id)),
+    )
 
-    text = ""
-    if tg_channels:
-        text += "📣 <b>کانال‌های تلگرام:</b>\n"
-        for ch in tg_channels:
-            text += f"  • {ch['name']} ({ch['chat_type']})\n"
-    if bale_channels:
-        text += "\n🔵 <b>کانال‌های بله:</b>\n"
-        for ch in bale_channels:
-            text += f"  • {ch['name']} ({ch['chat_type']})\n"
-    if not tg_channels and not bale_channels:
-        text = "📢 <b>کانالی تنظیم نشده است.</b>\n\nبرای شروع ارسال، کانال اضافه کنید."
 
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=settings_markup(tg_channels + bale_channels, is_sudo_user=await is_owner(query.from_user.id)))
+async def handle_manage_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_owner(query.from_user.id):
+        await query.edit_message_text("❌ غیرمجاز.")
+        return
+    channels = await get_active_channels()
+    text = "📢 <b>مدیریت کانال‌ها</b>\n\n"
+    text += "\n".join(f"• {ch['name']} ({ch['platform']}, {ch['chat_type']})" for ch in channels) if channels else "هنوز کانالی اضافه نشده است."
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=settings_markup(channels, is_sudo_user=await is_owner(query.from_user.id)))
+
+
+async def handle_add_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_owner(query.from_user.id):
+        await query.edit_message_text("❌ غیرمجاز.")
+        return
+    # Reuse the safe post preview flow; the user can choose «ذخیره قالب» and nothing is published automatically.
+    from handlers.post import handle_new_post, user_states
+    await handle_new_post(update, context)
+    user_states[query.from_user.id]["template_only"] = True
 
 
 async def handle_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):

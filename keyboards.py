@@ -31,6 +31,13 @@ def confirm_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def template_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📑 ذخیره قالب", callback_data="save_template")],
+        [InlineKeyboardButton("❌ لغو", callback_data="cancel_post")],
+    ])
+
+
 def channel_selection_keyboard(channels: list[dict], selected: set[int]) -> InlineKeyboardMarkup:
     buttons = []
     for channel in channels:
@@ -86,38 +93,37 @@ def restart_confirm_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def settings_keyboard(channels: list[dict], is_sudo_user: bool = False) -> list[list[InlineKeyboardButton]]:
+def settings_keyboard(is_sudo_user: bool = False) -> list[list[InlineKeyboardButton]]:
+    return [
+        [InlineKeyboardButton("📢 مدیریت کانال‌ها", callback_data="manage_channels")],
+        [InlineKeyboardButton("📑 افزودن قالب", callback_data="add_template")],
+        [InlineKeyboardButton("🔐 تنظیم تأیید پست‌ها", callback_data="approval_settings")],
+        [InlineKeyboardButton("◀️ بازگشت", callback_data="back_main")],
+    ]
+
+
+def settings_main_markup(is_sudo_user: bool = False) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(settings_keyboard(is_sudo_user=is_sudo_user))
+
+
+def channel_management_keyboard(channels: list[dict], is_sudo_user: bool = False) -> InlineKeyboardMarkup:
     buttons = []
     for ch in channels:
         icon = "🔵" if ch.get("platform") == "bale" else "📣"
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    f"🗑️ {icon} {ch['name']} ({ch['chat_type']})",
-                    callback_data=f"remove_{ch['id']}",
-                )
-            ]
-        )
-    buttons.append(
-        [InlineKeyboardButton("➕ افزودن کانال تلگرام", callback_data="add_channel")]
-    )
-    buttons.append(
-        [InlineKeyboardButton("➕ افزودن کانال بله", callback_data="add_bale_channel")]
-    )
-    buttons.append([InlineKeyboardButton("🔐 تنظیم تأیید پست‌ها", callback_data="approval_settings")])
-    if is_sudo_user:
-        buttons.append(
-            [
-                InlineKeyboardButton("📊 وضعیت ربات", callback_data="bot_status"),
-                InlineKeyboardButton("🔄 ری‌استارت", callback_data="bot_restart"),
-            ]
-        )
-    buttons.append([InlineKeyboardButton("◀️ بازگشت", callback_data="back_main")])
-    return buttons
+        buttons.append([InlineKeyboardButton(
+            f"🗑️ {icon} {ch['name']} ({ch['chat_type']})",
+            callback_data=f"remove_{ch['id']}",
+        )])
+    buttons.extend([
+        [InlineKeyboardButton("➕ افزودن کانال تلگرام", callback_data="add_channel")],
+        [InlineKeyboardButton("➕ افزودن کانال بله", callback_data="add_bale_channel")],
+        [InlineKeyboardButton("◀️ تنظیمات", callback_data="settings")],
+    ])
+    return InlineKeyboardMarkup(buttons)
 
 
 def settings_markup(channels: list[dict], is_sudo_user: bool = False) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(settings_keyboard(channels, is_sudo_user=is_sudo_user))
+    return channel_management_keyboard(channels, is_sudo_user=is_sudo_user)
 
 
 def users_menu_keyboard() -> InlineKeyboardMarkup:
