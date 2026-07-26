@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT", Path(__file__).resolve().parent)).resolve()
 BACKUP_TZ = ZoneInfo(os.getenv("BACKUP_TIMEZONE", "Asia/Tehran"))
 MAX_RESTORE_BYTES = 250 * 1024 * 1024
+MAX_RESTORE_FILES = 10000
 _restore_waiting: set[int] = set()
 
 
@@ -60,7 +61,10 @@ def _run_backup_sync(output: Path):
 
 def _safe_extract(zip_path: Path, destination: Path):
     with zipfile.ZipFile(zip_path) as archive:
-        total = sum(info.file_size for info in archive.infolist())
+        infos = archive.infolist()
+        total = sum(info.file_size for info in infos)
+        if len(infos) > MAX_RESTORE_FILES:
+            raise ValueError("backup contains too many files")
         if total > MAX_RESTORE_BYTES:
             raise ValueError("backup is too large")
         names = archive.namelist()
@@ -69,10 +73,14 @@ def _safe_extract(zip_path: Path, destination: Path):
         manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
         if manifest.get("format") != "tisa-manager-backup" or manifest.get("version") != 1:
             raise ValueError("unsupported backup version")
-        for name in names:
+        for info in infos:
+            name = info.filename
             target = (destination / name).resolve()
             if not str(target).startswith(str(destination.resolve()) + os.sep):
                 raise ValueError("unsafe path in backup")
+            # Do not restore symbolic links from an uploaded archive.
+            if ((info.external_attr >> 16) & 0o170000) == 0o120000:
+                raise ValueError("symbolic links are not allowed in backups")
         archive.extractall(destination)
 
 
@@ -165,15 +173,31 @@ async def handle_restore_document(update, context) -> bool:
     fd, filename = tempfile.mkstemp(prefix="tisa_restore_upload_", suffix=".zip")
     os.close(fd)
     temp_path = Path(filename)
+    emergency_backup = None
     try:
         file = await context.bot.get_file(document.file_id)
         await file.download_to_drive(str(temp_path))
-        await update.message.reply_text("⏳ در حال بررسی و بازیابی پروژه و پایگاه‌داده...")
+        await update.message.reply_text("⏳ ابتدا یک پشتیبان اضطراری می‌سازم، سپس بازیابی را انجام می‌دهم...")
+        emergency_backup = await create_backup()
         await restore_backup(temp_path)
+        emergency_backup.unlink(missing_ok=True)
         await update.message.reply_text("✅ بازیابی کامل شد. برای اعمال کدهای جدید، ربات باید ری‌استارت شود.")
     except Exception as exc:
         logger.exception("Restore failed")
-        await update.message.reply_text(f"❌ بازیابی انجام نشد: {exc}")
+        rollback_ok = False
+        if emergency_backup and emergency_backup.exists():
+            try:
+                await restore_backup(emergency_backup)
+                rollback_ok = True
+            except Exception:
+                logger.exception("Automatic rollback failed")
+            try:
+                with emergency_backup.open("rb") as archive:
+                    await context.bot.send_document(chat_id=SUDO_USER_ID, document=archive, caption="🚨 بازیابی ناموفق بود؛ این پشتیبان اضطراری قبل از بازیابی است.")
+            finally:
+                emergency_backup.unlink(missing_ok=True)
+        suffix = " وضعیت قبلی بازیابی شد." if rollback_ok else " برای بررسی دستی، پشتیبان اضطراری ارسال شد."
+        await update.message.reply_text(f"❌ بازیابی انجام نشد.{suffix}")
     finally:
         temp_path.unlink(missing_ok=True)
     return True

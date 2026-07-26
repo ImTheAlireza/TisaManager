@@ -1,6 +1,7 @@
+import time
 import unittest
 
-from utils import html_text
+from utils import html_text, state_is_expired
 
 
 class HtmlTextTests(unittest.TestCase):
@@ -9,6 +10,10 @@ class HtmlTextTests(unittest.TestCase):
 
     def test_none_is_safe(self):
         self.assertEqual(html_text(None), "")
+
+    def test_state_expiration(self):
+        self.assertFalse(state_is_expired({"created_at": time.monotonic()}))
+        self.assertTrue(state_is_expired({"created_at": time.monotonic() - 31 * 60}))
 
 
 if __name__ == "__main__":

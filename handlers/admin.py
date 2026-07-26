@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from telegram import Update
@@ -56,21 +57,24 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def run_channel_health_checks(context: ContextTypes.DEFAULT_TYPE):
-    channels = await get_channel_health()
-    for channel in channels:
-        if not channel["is_active"]:
-            continue
-        try:
-            if channel["platform"] == "bale":
-                result = await bale_client.get_chat(channel["chat_id"])
-                if not result.get("ok"):
-                    raise RuntimeError(result.get("description", "Bale API error"))
-            else:
-                await context.bot.get_chat(channel["chat_id"])
-            await update_channel_health(channel["id"], "healthy")
-        except Exception as exc:
-            logger.warning("Channel health check failed for %s: %s", channel["name"], exc)
-            await update_channel_health(channel["id"], "unhealthy", str(exc)[:1000])
+    channels = [channel for channel in await get_channel_health() if channel["is_active"]]
+    semaphore = asyncio.Semaphore(10)
+
+    async def check(channel):
+        async with semaphore:
+            try:
+                if channel["platform"] == "bale":
+                    result = await asyncio.wait_for(bale_client.get_chat(channel["chat_id"]), timeout=20)
+                    if not result.get("ok"):
+                        raise RuntimeError(result.get("description", "Bale API error"))
+                else:
+                    await asyncio.wait_for(context.bot.get_chat(channel["chat_id"]), timeout=20)
+                await update_channel_health(channel["id"], "healthy")
+            except Exception as exc:
+                logger.warning("Channel health check failed for %s: %s", channel["name"], exc)
+                await update_channel_health(channel["id"], "unhealthy", str(exc)[:1000])
+
+    await asyncio.gather(*(check(channel) for channel in channels))
 
 
 async def handle_health(update: Update, context: ContextTypes.DEFAULT_TYPE):

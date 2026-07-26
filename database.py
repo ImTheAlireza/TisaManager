@@ -1,3 +1,4 @@
+import asyncio
 import aiomysql
 import json
 from config import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME, SUDO_USER_ID
@@ -7,19 +8,37 @@ _pool: aiomysql.Pool | None = None
 
 async def get_pool() -> aiomysql.Pool:
     global _pool
-    if _pool is None:
-        _pool = await aiomysql.create_pool(
-            host=DB_HOST,
-            port=DB_PORT,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            db=DB_NAME,
-            autocommit=True,
-            charset="utf8mb4",
-            minsize=1,
-            maxsize=5,
-        )
-    return _pool
+    if _pool is not None and not _pool.closed:
+        return _pool
+    last_error = None
+    for attempt in range(3):
+        try:
+            _pool = await aiomysql.create_pool(
+                host=DB_HOST,
+                port=DB_PORT,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                db=DB_NAME,
+                autocommit=True,
+                charset="utf8mb4",
+                minsize=1,
+                maxsize=5,
+            )
+            return _pool
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+    raise RuntimeError("Could not connect to MySQL after 3 attempts") from last_error
+
+
+async def close_pool():
+    """Close the shared pool during a graceful application shutdown."""
+    global _pool
+    if _pool is not None and not _pool.closed:
+        _pool.close()
+        await _pool.wait_closed()
+    _pool = None
 
 
 async def init_db():
@@ -122,6 +141,15 @@ async def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """)
+            for index_name, columns in (
+                ("idx_post_history_user", "user_id"),
+                ("idx_post_history_created", "created_at"),
+                ("idx_post_history_status", "delivery_status"),
+            ):
+                await cur.execute("SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = %s AND table_name = 'post_history' AND index_name = %s", (DB_NAME, index_name))
+                if not (await cur.fetchone())[0]:
+                    await cur.execute(f"CREATE INDEX {index_name} ON post_history ({columns})")
+
             await cur.execute("""
                 CREATE TABLE IF NOT EXISTS scheduled_posts (
                     id INT AUTO_INCREMENT PRIMARY KEY,

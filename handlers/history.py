@@ -11,7 +11,7 @@ from database import (
     get_user_posts, get_all_posts, get_user_posts_paginated, get_all_posts_paginated,
     count_user_posts, count_all_posts, get_post, update_post_text, update_post_caption,
     delete_post, is_writer_or_above, is_owner, is_sudo, can_edit_post, can_delete_post,
-    get_user_role, get_post, has_permission, update_post_status, save_post_version, save_post,
+    get_user_role, has_permission, update_post_status, save_post_version, save_post,
 )
 from keyboards import main_menu_keyboard, history_keyboard, post_detail_keyboard, confirm_keyboard
 from utils import html_text, state_is_expired
@@ -111,11 +111,6 @@ async def _try_delete_message(context, chat_id, message_id, platform):
     except Exception as e:
         logger.error("Delete failed [%s] chat=%s msg=%s: %s", platform, chat_id, message_id, e)
         return False
-
-
-def _msg_text(text):
-    """Try to send edit_message_text, fallback to reply_text."""
-    pass
 
 
 async def handle_history_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):

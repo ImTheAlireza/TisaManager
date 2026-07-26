@@ -1,3 +1,4 @@
+import html
 import logging
 import os
 import sys
@@ -18,7 +19,7 @@ def _send_log_sync(text: str):
     try:
         from urllib.request import urlopen
         from urllib.parse import urlencode
-        data = urlencode({"chat_id": LOG_CHANNEL_ID, "text": text, "parse_mode": "HTML"}).encode()
+        data = urlencode({"chat_id": LOG_CHANNEL_ID, "text": html.escape(text), "parse_mode": "HTML"}).encode()
         urlopen(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data=data, timeout=10)
     except Exception:
         pass
@@ -48,7 +49,7 @@ logging.basicConfig(
 
 if BOT_TOKEN:
     tg_handler = TelegramLogHandler(level=logging.WARNING)
-    tg_handler.setFormatter(logging.Formatter("<b>%(asctime)s</b>\n%(name)s - %(levelname)s\n\n<pre>%(message)s</pre>"))
+    tg_handler.setFormatter(logging.Formatter("%(asctime)s\n%(name)s - %(levelname)s\n\n%(message)s"))
     logging.getLogger().addHandler(tg_handler)
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from config import BOT_TOKEN as _CONFIRM_TOKEN  # noqa: F811
-from database import init_db
+from database import init_db, close_pool
 from handlers.start import start
 from handlers.post import (
     handle_confirm_post,
@@ -152,11 +153,15 @@ async def notify_online(context):
         logger.error("Failed to send online notification: %s", e)
 
 
+async def shutdown_database(application):
+    await close_pool()
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN not set. Check your .env file.")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_shutdown(shutdown_database).build()
 
     # Command handlers
     app.add_handler(CommandHandler("start", start))
