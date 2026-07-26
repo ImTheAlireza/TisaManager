@@ -1,4 +1,5 @@
 import logging
+import time
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -10,6 +11,7 @@ from database import (
     get_user_role, update_user_role,
 )
 from keyboards import users_menu_keyboard, users_list_keyboard, user_detail_keyboard, role_select_keyboard, main_menu_keyboard
+from utils import state_is_expired
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +47,15 @@ async def handle_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await _safe_edit(query, "➕ <b>افزودن کاربر</b>\n\nشناسه تلگرام کاربر را ارسال کنید:")
-    _add_user_states[user_id] = {"step": "waiting_id"}
+    _add_user_states[user_id] = {"step": "waiting_id", "created_at": time.monotonic()}
 
 
 async def handle_add_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = _add_user_states.get(user_id)
+    if state and state_is_expired(state):
+        _add_user_states.pop(user_id, None)
+        state = None
     if not state:
         return False
 
@@ -86,7 +91,7 @@ async def handle_add_user_input(update: Update, context: ContextTypes.DEFAULT_TY
             return True
 
         # Sudo can choose role
-        _add_user_states[user_id] = {"step": "waiting_role", "target_id": target_id}
+        _add_user_states[user_id] = {"step": "waiting_role", "target_id": target_id, "created_at": time.monotonic()}
         await update.message.reply_text(
             f"نقش کاربر <code>{target_id}</code> را انتخاب کنید:",
             parse_mode=ParseMode.HTML,
@@ -103,6 +108,9 @@ async def handle_role_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     user_id = query.from_user.id
     state = _add_user_states.get(user_id)
+    if state and state_is_expired(state):
+        _add_user_states.pop(user_id, None)
+        state = None
     if not state or state.get("step") != "waiting_role":
         return
 
@@ -190,8 +198,8 @@ async def handle_promote_owner(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     user_id = query.from_user.id
-    if not await is_owner(user_id):
-        await query.edit_message_text("❌ غیرمجاز.")
+    if not await is_sudo(user_id):
+        await query.answer("❌ فقط sudo می‌تواند نویسنده را به owner ارتقا دهد.", show_alert=True)
         return
 
     try:
