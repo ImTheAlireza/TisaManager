@@ -11,9 +11,9 @@ from telegram.constants import ParseMode
 from database import (
     get_active_channels, is_writer_or_above, is_sudo, is_owner, save_post,
     update_post_message_ids, update_post_delivery, create_schedule, get_due_schedules,
-    update_schedule, has_permission, update_post_status, create_template, get_templates, get_template, get_setting,
+    update_schedule, has_permission, update_post_status, get_setting,
 )
-from keyboards import confirm_keyboard, template_confirm_keyboard, main_menu_keyboard, channel_selection_keyboard, schedule_date_keyboard, schedule_hour_keyboard, schedule_minute_keyboard
+from keyboards import confirm_keyboard, main_menu_keyboard, channel_selection_keyboard, schedule_date_keyboard, schedule_hour_keyboard, schedule_minute_keyboard
 from utils import html_text
 
 logger = logging.getLogger(__name__)
@@ -21,10 +21,6 @@ logger = logging.getLogger(__name__)
 # Per-user state tracking
 user_states: dict[int, dict] = {}
 STATE_TTL_SECONDS = 30 * 60
-
-
-def _confirm_keyboard(state):
-    return template_confirm_keyboard() if state.get("template_only") else confirm_keyboard()
 
 
 def _active_state(user_id: int):
@@ -60,7 +56,7 @@ async def _process_media_group_callback(context: ContextTypes.DEFAULT_TYPE):
         chat_id=msg.chat.id,
         text="\n".join(lines),
         parse_mode=ParseMode.HTML,
-        reply_markup=_confirm_keyboard(state),
+        reply_markup=confirm_keyboard(),
     )
 
 
@@ -136,7 +132,7 @@ async def _handle_media_item(update, context, media_type, file_id):
     await msg.reply_text(
         "\n".join(preview_lines),
         parse_mode=ParseMode.HTML,
-        reply_markup=_confirm_keyboard(state),
+        reply_markup=confirm_keyboard(),
     )
     return True
 
@@ -166,7 +162,7 @@ async def handle_text_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📝 <b>پیش‌نمایش پست:</b>\n\n{html_text(text)}\n\nبه همه کانال‌ها ارسال شود؟",
         parse_mode=ParseMode.HTML,
-        reply_markup=_confirm_keyboard(state),
+        reply_markup=confirm_keyboard(),
     )
     return True
 
@@ -196,7 +192,7 @@ async def handle_document_post(update: Update, context: ContextTypes.DEFAULT_TYP
     await msg.reply_text(
         "\n".join(preview_lines),
         parse_mode=ParseMode.HTML,
-        reply_markup=_confirm_keyboard(state),
+        reply_markup=confirm_keyboard(),
     )
     return True
 
@@ -465,13 +461,13 @@ async def handle_channels_done(update: Update, context: ContextTypes.DEFAULT_TYP
     if not selected:
         await query.answer("حداقل یک کانال را انتخاب کنید.", show_alert=True)
         return
-    await query.edit_message_text("✅ کانال‌ها انتخاب شدند. برای ادامه یکی از گزینه‌ها را انتخاب کنید.", reply_markup=_confirm_keyboard(state))
+    await query.edit_message_text("✅ کانال‌ها انتخاب شدند. برای ادامه یکی از گزینه‌ها را انتخاب کنید.", reply_markup=confirm_keyboard())
     await query.answer()
 
 
 async def handle_channels_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.edit_message_text("📝 پست آماده است. مقصدهای انتخاب‌شده حفظ شدند.", reply_markup=_confirm_keyboard(state))
+    await query.edit_message_text("📝 پست آماده است. مقصدهای انتخاب‌شده حفظ شدند.", reply_markup=confirm_keyboard())
     await query.answer()
 
 
@@ -495,36 +491,6 @@ async def handle_save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_states.pop(query.from_user.id, None)
     await query.edit_message_text(f"💾 پیش‌نویس #{post_id} ذخیره شد.", reply_markup=main_menu_keyboard(is_sudo=await is_sudo(query.from_user.id), is_owner=await is_owner(query.from_user.id)))
     await query.answer()
-
-
-async def handle_save_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    state = _active_state(query.from_user.id)
-    if not state or state.get("state") != "awaiting_confirm":
-        await query.answer("❌ پستی در انتظار نیست.", show_alert=True)
-        return
-    state["state"] = "awaiting_template_name"
-    await query.edit_message_text("📑 نام قالب را ارسال کنید:")
-    await query.answer()
-
-
-async def handle_template_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    state = _active_state(user_id)
-    if not state or state.get("state") != "awaiting_template_name":
-        return False
-    name = update.message.text.strip()[:150]
-    if not name:
-        await update.message.reply_text("❌ نام قالب نمی‌تواند خالی باشد.")
-        return True
-    ok = await create_template(user_id, name, state)
-    if state.get("template_only"):
-        user_states.pop(user_id, None)
-        await update.message.reply_text("✅ قالب ذخیره شد." if ok else "⚠️ قالبی با این نام وجود دارد.", reply_markup=main_menu_keyboard(is_sudo=await is_sudo(user_id), is_owner=await is_owner(user_id)))
-        return True
-    state["state"] = "awaiting_confirm"
-    await update.message.reply_text("✅ قالب ذخیره شد." if ok else "⚠️ قالبی با این نام وجود دارد.", reply_markup=_confirm_keyboard(state))
-    return True
 
 
 async def handle_schedule_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -608,7 +574,7 @@ async def handle_schedule_input(update: Update, context: ContextTypes.DEFAULT_TY
         tehran_time = datetime.strptime(update.message.text.strip(), "%Y-%m-%d %H:%M")
         await _finish_schedule(user_id, state, tehran_time, update, context)
     except ValueError:
-        await update.message.reply_text("❌ زمان گذشته یا قالب نامعتبر است. نمونه: 2026-08-01 14:30 (تهران)")
+        await update.message.reply_text("❌ زمان گذشته یا فرمت نامعتبر است. نمونه: 2026-08-01 14:30 (تهران)")
     return True
 
 
@@ -651,59 +617,6 @@ async def handle_cancel_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-async def handle_templates_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    templates = await get_templates(user_id)
-    await query.answer()
-    if not templates:
-        await query.edit_message_text("📑 قالبی وجود ندارد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ ابزارها", callback_data="tools_menu")]]))
-        return
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"📑 {t['name']}", callback_data=f"use_template_{t['id']}")] for t in templates] + [[InlineKeyboardButton("◀️ ابزارها", callback_data="tools_menu")]])
-    await query.edit_message_text("📑 قالب مورد نظر را انتخاب کنید:", reply_markup=markup)
-
-
-async def handle_template_use_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    template = await get_template(user_id, int(query.data.removeprefix("use_template_")))
-    await query.answer()
-    if not template:
-        await query.edit_message_text("❌ قالب یافت نشد.")
-        return
-    user_states[user_id] = {"state": "awaiting_confirm", "type": template["post_type"], "text": template.get("text"), "caption": template.get("caption") or "", "file_id": template.get("file_id"), "media": json.loads(template.get("media_json") or "[]"), "created_at": time.monotonic()}
-    await query.edit_message_text("📑 قالب آماده است.", reply_markup=confirm_keyboard())
-
-
-async def handle_templates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cancel_all_workflows(update.effective_user.id)
-    templates = await get_templates(update.effective_user.id)
-    if not templates:
-        await update.message.reply_text("📑 قالبی وجود ندارد.")
-        return
-    text = "📑 قالب‌ها:\n" + "\n".join(f"• #{t['id']} — {t['name']}" for t in templates)
-    text += "\n\nبرای استفاده: /use_template شناسه"
-    await update.message.reply_text(text)
-
-
-async def handle_use_template_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cancel_all_workflows(update.effective_user.id)
-    parts = (update.message.text or "").split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await update.message.reply_text("قالب: /use_template شناسه")
-        return
-    template = await get_template(update.effective_user.id, int(parts[1]))
-    if not template:
-        await update.message.reply_text("❌ قالب یافت نشد.")
-        return
-    user_states[update.effective_user.id] = {
-        "state": "awaiting_confirm", "type": template["post_type"], "text": template.get("text"),
-        "caption": template.get("caption") or "", "file_id": template.get("file_id"),
-        "media": json.loads(template.get("media_json") or "[]"), "created_at": time.monotonic(),
-    }
-    await update.message.reply_text("📑 قالب آماده است.", reply_markup=confirm_keyboard())
-
-
 async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route incoming media/text to the correct handler based on user state."""
     user_id = update.effective_user.id
@@ -714,10 +627,6 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if state.get("state") in {"awaiting_schedule", "awaiting_schedule_date", "awaiting_schedule_hour", "awaiting_schedule_minute"}:
         await handle_schedule_input(update, context)
         return
-    if state.get("state") == "awaiting_template_name":
-        await handle_template_name(update, context)
-        return
-
     allowed_states = {"awaiting_post", "awaiting_media_group"}
     if state.get("state") not in allowed_states:
         return

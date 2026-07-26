@@ -149,20 +149,6 @@ async def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """)
             await cur.execute("""
-                CREATE TABLE IF NOT EXISTS templates (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    owner_id BIGINT NOT NULL,
-                    name VARCHAR(150) NOT NULL,
-                    post_type VARCHAR(20) NOT NULL DEFAULT 'text',
-                    text TEXT,
-                    caption TEXT,
-                    file_id VARCHAR(512),
-                    media_json TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE KEY unique_template_owner_name (owner_id, name)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """)
-            await cur.execute("""
                 CREATE TABLE IF NOT EXISTS channel_groups (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     owner_id BIGINT NOT NULL,
@@ -187,6 +173,7 @@ async def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """)
             await cur.execute("INSERT IGNORE INTO bot_settings (setting_key, setting_value, updated_by) VALUES ('approval_required', '0', %s)", (SUDO_USER_ID,))
+            await cur.execute("DROP TABLE IF EXISTS templates")
             await cur.execute("SELECT setting_value FROM bot_settings WHERE setting_key = 'legacy_delivery_migrated'")
             if not await cur.fetchone():
                 # Older releases incorrectly labelled already-published rows as pending.
@@ -202,8 +189,8 @@ async def init_db():
             """)
             await cur.executemany(
                 "INSERT IGNORE INTO role_permissions (role, permission) VALUES (%s, %s)",
-                [("sudo", p) for p in ("publish", "approve", "manage_users", "manage_channels", "manage_templates", "manage_groups", "view_analytics")] +
-                [("owner", p) for p in ("publish", "approve", "manage_users", "manage_channels", "manage_templates", "manage_groups", "view_analytics")] +
+                [("sudo", p) for p in ("publish", "approve", "manage_users", "manage_channels", "manage_groups", "view_analytics")] +
+                [("owner", p) for p in ("publish", "approve", "manage_users", "manage_channels", "manage_groups", "view_analytics")] +
                 [("writer", "create_draft")],
             )
 
@@ -353,33 +340,6 @@ async def get_post_versions(post_id: int):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute("SELECT * FROM post_versions WHERE post_id = %s ORDER BY version_no DESC", (post_id,))
-            return list(await cur.fetchall())
-
-
-async def create_template(owner_id: int, name: str, state: dict) -> bool:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            try:
-                await cur.execute("INSERT INTO templates (owner_id, name, post_type, text, caption, file_id, media_json) VALUES (%s,%s,%s,%s,%s,%s,%s)", (owner_id, name, state.get("type"), state.get("text"), state.get("caption"), state.get("file_id"), json.dumps(state.get("media", []))))
-                return True
-            except aiomysql.IntegrityError:
-                return False
-
-
-async def get_template(owner_id: int, template_id: int):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute("SELECT * FROM templates WHERE id = %s AND owner_id = %s", (template_id, owner_id))
-            return await cur.fetchone()
-
-
-async def get_templates(owner_id: int):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute("SELECT * FROM templates WHERE owner_id = %s ORDER BY name", (owner_id,))
             return list(await cur.fetchall())
 
 

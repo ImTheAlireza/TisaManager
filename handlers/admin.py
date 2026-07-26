@@ -35,7 +35,7 @@ async def handle_tools_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await query.edit_message_text("🧰 ابزارها را انتخاب کنید:", reply_markup=InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 آمار", callback_data="tools_stats"), InlineKeyboardButton("🩺 سلامت کانال‌ها", callback_data="tools_health")],
-        [InlineKeyboardButton("📑 قالب‌ها", callback_data="tools_templates"), InlineKeyboardButton("📋 گروه‌های کانال", callback_data="tools_groups")],
+        [InlineKeyboardButton("📋 گروه‌های کانال", callback_data="tools_groups")],
         [InlineKeyboardButton("◀️ منوی اصلی", callback_data="back_main")],
     ]))
 

@@ -48,18 +48,6 @@ async def handle_manage_channels(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=settings_markup(channels, is_sudo_user=await is_owner(query.from_user.id)))
 
 
-async def handle_add_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not await is_owner(query.from_user.id):
-        await query.edit_message_text("❌ غیرمجاز.")
-        return
-    # Reuse the safe post preview flow; the user can choose «ذخیره قالب» and nothing is published automatically.
-    from handlers.post import handle_new_post, user_states
-    await handle_new_post(update, context)
-    user_states[query.from_user.id]["template_only"] = True
-
-
 async def handle_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -108,7 +96,7 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if state.get("state") == "awaiting_group_input":
         raw = update.message.text.strip() if update.message and update.message.text else ""
         if ":" not in raw:
-            await update.message.reply_text("❌ قالب نامعتبر است. نمونه: اخبار: 1,2,3")
+            await update.message.reply_text("❌ فرمت نامعتبر است. نمونه: اخبار: 1,2,3")
             return True
         name, ids = raw.split(":", 1)
         try:
@@ -370,7 +358,7 @@ async def handle_group_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     parts = (update.message.text or "").split(maxsplit=2)
     if len(parts) < 3:
-        await update.message.reply_text("قالب: /group نام_گروه شناسه_کانال‌ها\nمثال: /group اخبار 1,2,3")
+        await update.message.reply_text("فرمت: /group نام_گروه شناسه_کانال‌ها\nمثال: /group اخبار 1,2,3")
         return
     name, raw_ids = parts[1], parts[2]
     try:

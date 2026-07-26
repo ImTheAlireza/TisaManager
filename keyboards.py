@@ -22,20 +22,12 @@ def confirm_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🎯 انتخاب کانال‌ها", callback_data="choose_channels")],
             [
                 InlineKeyboardButton("💾 ذخیره پیش‌نویس", callback_data="save_draft"),
-                InlineKeyboardButton("📑 ذخیره قالب", callback_data="save_template"),
             ],
             [InlineKeyboardButton("🕒 زمان‌بندی", callback_data="schedule_post"),
             ],
             [InlineKeyboardButton("❌ لغو", callback_data="cancel_post")],
         ]
     )
-
-
-def template_confirm_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📑 ذخیره قالب", callback_data="save_template")],
-        [InlineKeyboardButton("❌ لغو", callback_data="cancel_post")],
-    ])
 
 
 def channel_selection_keyboard(channels: list[dict], selected: set[int]) -> InlineKeyboardMarkup:
@@ -96,7 +88,6 @@ def restart_confirm_keyboard() -> InlineKeyboardMarkup:
 def settings_keyboard(is_sudo_user: bool = False) -> list[list[InlineKeyboardButton]]:
     buttons = [
         [InlineKeyboardButton("📢 مدیریت کانال‌ها", callback_data="manage_channels")],
-        [InlineKeyboardButton("📑 افزودن قالب", callback_data="add_template")],
         [InlineKeyboardButton("🔐 تنظیم تأیید پست‌ها", callback_data="approval_settings")],
     ]
     if is_sudo_user:
