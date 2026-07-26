@@ -1,3 +1,4 @@
+import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
@@ -11,6 +12,8 @@ from database import (
 )
 from keyboards import main_menu_keyboard, settings_markup
 import bale_client
+
+logger = logging.getLogger(__name__)
 
 # Per-user state for channel input
 _settings_states: dict[int, dict] = {}
@@ -39,7 +42,7 @@ async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tg_channels and not bale_channels:
         text = "📢 <b>کانالی تنظیم نشده است.</b>\n\nبرای شروع ارسال، کانال اضافه کنید."
 
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=settings_markup(tg_channels + bale_channels))
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=settings_markup(tg_channels + bale_channels, is_sudo_user=await is_sudo(query.from_user.id)))
 
 
 async def handle_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -175,8 +178,114 @@ async def handle_remove_channel(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=settings_markup(tg_channels + bale_channels),
+        reply_markup=settings_markup(tg_channels + bale_channels, is_sudo_user=await is_sudo(query.from_user.id)),
     )
+
+
+async def handle_bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    logger.info("[STATUS] Sudo user %s requested bot status", query.from_user.id)
+
+    if not await is_sudo(query.from_user.id):
+        logger.warning("[STATUS] Unauthorized status request by user %s", query.from_user.id)
+        await query.answer("❌ فقط ادمین اصلی (Sudo) دسترسی دارد.", show_alert=True)
+        return
+
+    try:
+        import subprocess
+        import os
+        config_path = os.path.expanduser("~/supervisord.conf")
+        cmd = ["supervisorctl", "-c", config_path, "status", "tisa_manager"]
+        logger.info("[STATUS] Attempting supervisorctl status with config: %s", config_path)
+        
+        res = subprocess.run(
+            cmd,
+            capture_output=True, text=True, timeout=5
+        )
+        output = res.stdout.strip() or res.stderr.strip() or "بدون خروجی"
+        logger.info("[STATUS] Success: stdout=%s | stderr=%s", res.stdout, res.stderr)
+    except Exception as e:
+        logger.error("[STATUS] Failed: %s", e, exc_info=True)
+        # Fallback without explicit config path if supervisord.conf is default or elsewhere
+        try:
+            logger.info("[STATUS] Trying fallback supervisorctl status without custom config")
+            res = subprocess.run(
+                ["supervisorctl", "status", "tisa_manager"],
+                capture_output=True, text=True, timeout=5
+            )
+            output = res.stdout.strip() or res.stderr.strip() or "بدون خروجی"
+            logger.info("[STATUS] Fallback success: stdout=%s | stderr=%s", res.stdout, res.stderr)
+        except Exception as e2:
+            logger.error("[STATUS] Fallback also failed: %s", e2, exc_info=True)
+            output = f"خطا در اجرای دستور: {e}"
+
+    if len(output) > 200:
+        output = output[:200] + "..."
+    await query.answer(f"📊 وضعیت:\n{output}", show_alert=True)
+
+
+async def handle_bot_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    logger.info("[RESTART] Sudo user %s requested bot restart confirmation", query.from_user.id)
+
+    if not await is_sudo(query.from_user.id):
+        logger.warning("[RESTART] Unauthorized restart request by user %s", query.from_user.id)
+        await query.answer("❌ فقط ادمین اصلی (Sudo) دسترسی دارد.", show_alert=True)
+        return
+
+    from keyboards import restart_confirm_keyboard
+    await query.edit_message_text(
+        "⚠️ <b>تأیید ری‌استارت</b>\n\nآیا از ری‌استارت کردن ربات اطمینان دارید؟",
+        parse_mode=ParseMode.HTML,
+        reply_markup=restart_confirm_keyboard()
+    )
+
+
+async def handle_do_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    logger.info("[RESTART] Sudo user %s confirmed bot restart", query.from_user.id)
+
+    if not await is_sudo(query.from_user.id):
+        logger.warning("[RESTART] Unauthorized do_restart request by user %s", query.from_user.id)
+        await query.answer("❌ فقط ادمین اصلی (Sudo) دسترسی دارد.", show_alert=True)
+        return
+
+    await query.edit_message_text("🔄 <b>در حال ری‌استارت ربات...</b>\nلطفاً چند لحظه صبر کنید.", parse_mode=ParseMode.HTML)
+
+    def _do_restart():
+        import time
+        time.sleep(1)
+        try:
+            import subprocess
+            import os
+            config_path = os.path.expanduser("~/supervisord.conf")
+            cmd = ["supervisorctl", "-c", config_path, "restart", "tisa_manager"]
+            logger.info("[RESTART] Starting supervisor restart with config: %s", config_path)
+            
+            res = subprocess.run(
+                cmd,
+                capture_output=True, text=True, timeout=15
+            )
+            logger.info("[RESTART] Supervisor restart completed: stdout=%s | stderr=%s", res.stdout, res.stderr)
+        except Exception as e:
+            logger.error("[RESTART] Supervisor restart failed with custom config: %s. Trying fallback...", e)
+            try:
+                res = subprocess.run(
+                    ["supervisorctl", "restart", "tisa_manager"],
+                    capture_output=True, text=True, timeout=15
+                )
+                logger.info("[RESTART] Fallback supervisor restart completed: stdout=%s | stderr=%s", res.stdout, res.stderr)
+            except Exception as e2:
+                logger.error("[RESTART] Fallback supervisor restart also failed: %s", e2, exc_info=True)
+
+    import threading
+    threading.Thread(target=_do_restart, daemon=True).start()
 
 
 async def handle_back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):

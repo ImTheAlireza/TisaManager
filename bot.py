@@ -69,6 +69,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.constants import ParseMode
 
 from config import BOT_TOKEN as _CONFIRM_TOKEN  # noqa: F811
 from database import init_db
@@ -86,9 +87,13 @@ from handlers.settings import (
     handle_channel_input,
     handle_remove_channel,
     handle_back_main,
+    handle_bot_status,
+    handle_bot_restart,
+    handle_do_restart,
 )
 from handlers.history import (
     handle_history,
+    handle_history_noop,
     handle_post_detail,
     handle_edit,
     handle_edit_input,
@@ -107,6 +112,19 @@ from handlers.users import (
 )
 
 
+async def notify_online(context):
+    try:
+        from config import SUDO_USER_ID
+        await context.bot.send_message(
+            chat_id=SUDO_USER_ID,
+            text="🟢 <b>ربات آنلاین شد و آماده به کار است.</b>",
+            parse_mode=ParseMode.HTML
+        )
+        logger.info("Online notification sent to sudo user %s", SUDO_USER_ID)
+    except Exception as e:
+        logger.error("Failed to send online notification: %s", e)
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN not set. Check your .env file.")
@@ -119,6 +137,8 @@ def main():
     # Callback query handlers (inline buttons)
     app.add_handler(CallbackQueryHandler(handle_new_post, pattern="^new_post$"))
     app.add_handler(CallbackQueryHandler(handle_history, pattern="^history$"))
+    app.add_handler(CallbackQueryHandler(handle_history, pattern="^history_page_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_history_noop, pattern="^history_noop$"))
     app.add_handler(CallbackQueryHandler(handle_post_detail, pattern="^post_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_edit, pattern="^edit_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_delete, pattern="^delete_\\d+$"))
@@ -128,6 +148,9 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_add_channel, pattern="^add_channel$"))
     app.add_handler(CallbackQueryHandler(handle_add_bale_channel, pattern="^add_bale_channel$"))
     app.add_handler(CallbackQueryHandler(handle_remove_channel, pattern="^remove_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_bot_status, pattern="^bot_status$"))
+    app.add_handler(CallbackQueryHandler(handle_bot_restart, pattern="^bot_restart$"))
+    app.add_handler(CallbackQueryHandler(handle_do_restart, pattern="^do_restart$"))
     app.add_handler(CallbackQueryHandler(handle_back_main, pattern="^back_main$"))
     # User management handlers
     app.add_handler(CallbackQueryHandler(handle_users_menu, pattern="^users_menu$"))
@@ -157,8 +180,9 @@ def main():
 
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, route_message))
 
-    # Initialize database
+    # Initialize database and send online notification
     app.job_queue.run_once(lambda ctx: init_db(), when=0)
+    app.job_queue.run_once(notify_online, when=1)
 
     logger.info("Bot starting...")
     app.run_polling()

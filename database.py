@@ -282,6 +282,17 @@ async def get_user_posts(user_id: int, limit: int = 10) -> list[dict]:
             return list(await cur.fetchall())
 
 
+async def get_user_posts_paginated(user_id: int, limit: int, offset: int) -> list[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT id, post_type, text, caption, created_at FROM post_history WHERE user_id = %s ORDER BY id DESC LIMIT %s OFFSET %s",
+                (user_id, limit, offset),
+            )
+            return list(await cur.fetchall())
+
+
 async def get_all_posts(limit: int = 20) -> list[dict]:
     """Get all posts (for sudo/owner)."""
     pool = await get_pool()
@@ -292,6 +303,35 @@ async def get_all_posts(limit: int = 20) -> list[dict]:
                 (limit,),
             )
             return list(await cur.fetchall())
+
+
+async def get_all_posts_paginated(limit: int, offset: int) -> list[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT id, user_id, post_type, text, caption, created_at FROM post_history ORDER BY id DESC LIMIT %s OFFSET %s",
+                (limit, offset),
+            )
+            return list(await cur.fetchall())
+
+
+async def count_user_posts(user_id: int) -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT COUNT(*) FROM post_history WHERE user_id = %s", (user_id,))
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def count_all_posts() -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT COUNT(*) FROM post_history")
+            row = await cur.fetchone()
+            return row[0] if row else 0
 
 
 async def get_post(post_id: int) -> dict | None:
