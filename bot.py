@@ -77,7 +77,18 @@ from handlers.start import start
 from handlers.post import (
     handle_confirm_post,
     handle_cancel_post,
+    handle_cancel_command,
     handle_new_post,
+    handle_choose_channels,
+    handle_toggle_channel,
+    handle_channels_done,
+    handle_channels_back,
+    handle_save_draft,
+    handle_save_template,
+    handle_schedule_post,
+    process_scheduled_posts,
+    handle_templates_command,
+    handle_use_template_command,
     handle_any_message,
 )
 from handlers.settings import (
@@ -88,8 +99,12 @@ from handlers.settings import (
     handle_remove_channel,
     handle_back_main,
     handle_bot_status,
+    handle_approval_settings,
+    handle_toggle_approval,
     handle_bot_restart,
     handle_do_restart,
+    handle_group_command,
+    handle_groups_command,
 )
 from handlers.history import (
     handle_history,
@@ -98,7 +113,12 @@ from handlers.history import (
     handle_edit,
     handle_edit_input,
     handle_delete,
+    handle_duplicate,
+    handle_retry,
+    handle_approve,
 )
+from handlers.admin import handle_stats, handle_health, run_channel_health_checks, daily_report
+from handlers.help import handle_help, handle_help_section
 from handlers.users import (
     handle_users_menu,
     handle_add_user,
@@ -133,6 +153,14 @@ def main():
 
     # Command handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", handle_cancel_command))
+    app.add_handler(CommandHandler("group", handle_group_command))
+    app.add_handler(CommandHandler("groups", handle_groups_command))
+    app.add_handler(CommandHandler("help", handle_help))
+    app.add_handler(CommandHandler("templates", handle_templates_command))
+    app.add_handler(CommandHandler("use_template", handle_use_template_command))
+    app.add_handler(CommandHandler("stats", handle_stats))
+    app.add_handler(CommandHandler("health", handle_health))
 
     # Callback query handlers (inline buttons)
     app.add_handler(CallbackQueryHandler(handle_new_post, pattern="^new_post$"))
@@ -142,9 +170,19 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_post_detail, pattern="^post_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_edit, pattern="^edit_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_delete, pattern="^delete_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_duplicate, pattern="^duplicate_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_retry, pattern="^retry_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_approve, pattern="^approve_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_settings, pattern="^settings$"))
     app.add_handler(CallbackQueryHandler(handle_confirm_post, pattern="^confirm_post$"))
     app.add_handler(CallbackQueryHandler(handle_cancel_post, pattern="^cancel_post$"))
+    app.add_handler(CallbackQueryHandler(handle_choose_channels, pattern="^choose_channels$"))
+    app.add_handler(CallbackQueryHandler(handle_toggle_channel, pattern="^toggle_channel_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_channels_done, pattern="^channels_done$"))
+    app.add_handler(CallbackQueryHandler(handle_channels_back, pattern="^channels_back$"))
+    app.add_handler(CallbackQueryHandler(handle_save_draft, pattern="^save_draft$"))
+    app.add_handler(CallbackQueryHandler(handle_save_template, pattern="^save_template$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_post, pattern="^schedule_post$"))
     app.add_handler(CallbackQueryHandler(handle_add_channel, pattern="^add_channel$"))
     app.add_handler(CallbackQueryHandler(handle_add_bale_channel, pattern="^add_bale_channel$"))
     app.add_handler(CallbackQueryHandler(handle_remove_channel, pattern="^remove_\\d+$"))
@@ -152,6 +190,10 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_bot_restart, pattern="^bot_restart$"))
     app.add_handler(CallbackQueryHandler(handle_do_restart, pattern="^do_restart$"))
     app.add_handler(CallbackQueryHandler(handle_back_main, pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(handle_help, pattern="^help$"))
+    app.add_handler(CallbackQueryHandler(handle_help_section, pattern="^help_(publish|roles|settings|tools)$"))
+    app.add_handler(CallbackQueryHandler(handle_approval_settings, pattern="^approval_settings$"))
+    app.add_handler(CallbackQueryHandler(handle_toggle_approval, pattern="^toggle_approval$"))
     # User management handlers
     app.add_handler(CallbackQueryHandler(handle_users_menu, pattern="^users_menu$"))
     app.add_handler(CallbackQueryHandler(handle_add_user, pattern="^add_user$"))
@@ -181,8 +223,14 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, route_message))
 
     # Initialize database and send online notification
-    app.job_queue.run_once(lambda ctx: init_db(), when=0)
+    async def initialize_database(context):
+        await init_db()
+
+    app.job_queue.run_once(initialize_database, when=0)
     app.job_queue.run_once(notify_online, when=1)
+    app.job_queue.run_repeating(process_scheduled_posts, interval=60, first=10, name="scheduled_posts")
+    app.job_queue.run_repeating(run_channel_health_checks, interval=900, first=30, name="channel_health")
+    app.job_queue.run_repeating(daily_report, interval=86400, first=86400, name="daily_report")
 
     logger.info("Bot starting...")
     app.run_polling()

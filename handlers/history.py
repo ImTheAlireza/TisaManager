@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import ContextTypes
@@ -10,9 +11,11 @@ from database import (
     get_user_posts, get_all_posts, get_user_posts_paginated, get_all_posts_paginated,
     count_user_posts, count_all_posts, get_post, update_post_text, update_post_caption,
     delete_post, is_writer_or_above, is_owner, is_sudo, can_edit_post, can_delete_post,
-    get_user_role,
+    get_user_role, get_post, has_permission, update_post_status, save_post_version,
 )
-from keyboards import main_menu_keyboard, history_keyboard, post_detail_keyboard
+from keyboards import main_menu_keyboard, history_keyboard, post_detail_keyboard, confirm_keyboard
+from utils import html_text, state_is_expired
+from handlers.post import publish_existing_post, user_states
 
 logger = logging.getLogger(__name__)
 
@@ -50,21 +53,21 @@ async def _try_edit_message(context, chat_id, message_id, platform, post, new_te
 
             # First try editing caption (works if caption already existed)
             try:
-                await context.bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=new_text, parse_mode=ParseMode.HTML)
+                await context.bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=new_text)
                 return True
             except BadRequest:
                 # If editing caption fails (e.g., adding caption to captionless media or media group),
                 # fallback to edit_message_media
                 if post_type == "photo":
-                    media = InputMediaPhoto(media=post.get("file_id"), caption=new_text, parse_mode=ParseMode.HTML)
+                    media = InputMediaPhoto(media=post.get("file_id"), caption=new_text)
                     await context.bot.edit_message_media(chat_id=chat_id, message_id=message_id, media=media)
                     return True
                 elif post_type == "video":
-                    media = InputMediaVideo(media=post.get("file_id"), caption=new_text, parse_mode=ParseMode.HTML)
+                    media = InputMediaVideo(media=post.get("file_id"), caption=new_text)
                     await context.bot.edit_message_media(chat_id=chat_id, message_id=message_id, media=media)
                     return True
                 elif post_type == "document":
-                    media = InputMediaDocument(media=post.get("file_id"), caption=new_text, parse_mode=ParseMode.HTML)
+                    media = InputMediaDocument(media=post.get("file_id"), caption=new_text)
                     await context.bot.edit_message_media(chat_id=chat_id, message_id=message_id, media=media)
                     return True
                 elif post_type == "media_group":
@@ -74,9 +77,9 @@ async def _try_edit_message(context, chat_id, message_id, platform, post, new_te
                         m_type = first_media.get("type")
                         m_file_id = first_media.get("file_id")
                         if m_type == "video":
-                            media = InputMediaVideo(media=m_file_id, caption=new_text, parse_mode=ParseMode.HTML)
+                            media = InputMediaVideo(media=m_file_id, caption=new_text)
                         else:
-                            media = InputMediaPhoto(media=m_file_id, caption=new_text, parse_mode=ParseMode.HTML)
+                            media = InputMediaPhoto(media=m_file_id, caption=new_text)
                         await context.bot.edit_message_media(chat_id=chat_id, message_id=message_id, media=media)
                         return True
                 raise
@@ -201,11 +204,13 @@ async def handle_post_detail(update: Update, context: ContextTypes.DEFAULT_TYPE)
     label = type_labels.get(post["post_type"], post["post_type"])
     date = post["created_at"].strftime("%Y/%m/%d %H:%M") if post["created_at"] else ""
 
-    lines = [f"<b>{label}</b>", f"📅 {date}", ""]
+    status_labels = {"pending": "⏳ در انتظار", "draft": "💾 پیش‌نویس", "pending_approval": "🔐 در انتظار تأیید", "completed": "✅ کامل", "partial": "⚠️ ناقص", "failed": "❌ ناموفق"}
+    delivery_status = status_labels.get(post.get("delivery_status"), "نامشخص")
+    lines = [f"<b>{label}</b>", f"📅 {date}", f"📤 وضعیت ارسال: {delivery_status}", ""]
     if post.get("text"):
-        lines.append(f"📝 متن:\n{post['text']}")
+        lines.append(f"📝 متن:\n{html_text(post['text'])}")
     if post.get("caption"):
-        lines.append(f"💬 کپشن:\n{post['caption']}")
+        lines.append(f"💬 کپشن:\n{html_text(post['caption'])}")
     if post["post_type"] == "media_group" and post.get("media_json"):
         media = _safe_parse_json(post["media_json"])
         if media:
@@ -261,12 +266,15 @@ async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except BadRequest:
         await query.message.reply_text(f"✏️ <b>ویرایش پست</b>\n\n{hint}", parse_mode=ParseMode.HTML)
 
-    _edit_states[query.from_user.id] = {"post_id": post_id, "post": post}
+    _edit_states[query.from_user.id] = {"post_id": post_id, "post": post, "created_at": time.monotonic()}
 
 
 async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = _edit_states.get(user_id)
+    if state and state_is_expired(state):
+        _edit_states.pop(user_id, None)
+        state = None
     if not state:
         return False
     if not update.message or not update.message.text:
@@ -276,6 +284,9 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post_id = state["post_id"]
     post = state["post"]
     _edit_states.pop(user_id, None)
+
+    # Preserve the previous content before applying the edit.
+    await save_post_version(post_id, user_id, post.get("text"), post.get("caption"))
 
     # Update database
     if post["post_type"] == "text":
@@ -312,6 +323,63 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(result, reply_markup=await _menu_kb(update.effective_user.id))
     return True
+
+
+async def handle_duplicate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        post_id = int(query.data.removeprefix("duplicate_"))
+    except ValueError:
+        return
+    post = await get_post(post_id)
+    if not post or not await can_edit_post(query.from_user.id, post_id):
+        await query.edit_message_text("❌ اجازه کپی این پست را ندارید.")
+        return
+    state = {"state": "awaiting_confirm", "type": post["post_type"], "text": post.get("text"),
+             "file_id": post.get("file_id"), "caption": post.get("caption") or "", "media": _safe_parse_json(post.get("media_json")),
+             "selected_channel_ids": _safe_parse_json(post.get("target_channels_json")), "created_at": time.monotonic()}
+    user_states[query.from_user.id] = state
+    await query.edit_message_text("📄 کپی پست آماده است. مقصدها و عملیات را انتخاب کنید.", reply_markup=confirm_keyboard())
+
+
+async def handle_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await has_permission(query.from_user.id, "approve"):
+        await query.answer("❌ فقط مالک می‌تواند پست را تأیید کند.", show_alert=True)
+        return
+    try:
+        post_id = int(query.data.removeprefix("approve_"))
+    except ValueError:
+        return
+    post = await get_post(post_id)
+    if not post or post.get("delivery_status") != "pending_approval":
+        await query.edit_message_text("❌ این پست در انتظار تأیید نیست.")
+        return
+    await query.edit_message_text("⏳ پست تأیید شد، در حال انتشار...")
+    await update_post_status(post_id, "pending")
+    sent, failed = await publish_existing_post(post, context.bot)
+    await query.message.reply_text(f"✅ انتشار انجام شد: {sent} موفق، {failed} ناموفق.", reply_markup=await _menu_kb(query.from_user.id))
+
+
+async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        post_id = int(query.data.removeprefix("retry_"))
+    except ValueError:
+        return
+    if not await can_edit_post(query.from_user.id, post_id):
+        await query.edit_message_text("❌ اجازه ارسال مجدد این پست را ندارید.")
+        return
+    post = await get_post(post_id)
+    if not post:
+        await query.edit_message_text("❌ پست یافت نشد.")
+        return
+    await query.edit_message_text("⏳ در حال ارسال مجدد...")
+    sent, failed = await publish_existing_post(post, context.bot)
+    await query.message.reply_text(f"🔁 ارسال مجدد انجام شد: {sent} موفق، {failed} ناموفق.", reply_markup=await _menu_kb(query.from_user.id))
 
 
 async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):

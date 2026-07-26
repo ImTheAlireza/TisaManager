@@ -4,6 +4,7 @@ import json
 import logging
 import tempfile
 import os
+import asyncio
 
 from config import BALE_TOKEN
 
@@ -47,6 +48,11 @@ def _post(url, data=None, files=None):
     return json.loads(resp.read().decode())
 
 
+async def _request_async(method, data=None, files=None):
+    """Run the legacy urllib client without blocking the bot event loop."""
+    return await asyncio.to_thread(_request, method, data, files)
+
+
 def _request(method, data=None, files=None):
     url = f"{BASE_URL}/{method}"
     try:
@@ -67,7 +73,7 @@ async def send_message(chat_id, text, parse_mode=None, reply_markup=None):
         data["parse_mode"] = parse_mode
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
-    return _request("sendMessage", data)
+    return await _request_async("sendMessage", data)
 
 
 async def send_photo(chat_id, photo, caption=None, parse_mode=None):
@@ -78,10 +84,10 @@ async def send_photo(chat_id, photo, caption=None, parse_mode=None):
         data["parse_mode"] = parse_mode
     if isinstance(photo, bytes):
         files = {"photo": ("photo.jpg", photo, "image/jpeg")}
-        return _request("sendPhoto", data, files=files)
+        return await _request_async("sendPhoto", data, files=files)
     else:
         data["photo"] = photo
-        return _request("sendPhoto", data)
+        return await _request_async("sendPhoto", data)
 
 
 async def send_video(chat_id, video, caption=None, parse_mode=None):
@@ -92,10 +98,10 @@ async def send_video(chat_id, video, caption=None, parse_mode=None):
         data["parse_mode"] = parse_mode
     if isinstance(video, bytes):
         files = {"video": ("video.mp4", video, "video/mp4")}
-        return _request("sendVideo", data, files=files)
+        return await _request_async("sendVideo", data, files=files)
     else:
         data["video"] = video
-        return _request("sendVideo", data)
+        return await _request_async("sendVideo", data)
 
 
 async def send_document(chat_id, document, caption=None, parse_mode=None):
@@ -106,10 +112,10 @@ async def send_document(chat_id, document, caption=None, parse_mode=None):
         data["parse_mode"] = parse_mode
     if isinstance(document, bytes):
         files = {"document": ("document.bin", document, "application/octet-stream")}
-        return _request("sendDocument", data, files=files)
+        return await _request_async("sendDocument", data, files=files)
     else:
         data["document"] = document
-        return _request("sendDocument", data)
+        return await _request_async("sendDocument", data)
 
 
 async def send_media_group(chat_id, media_files, caption=None):
@@ -130,24 +136,24 @@ async def send_media_group(chat_id, media_files, caption=None):
         media_items.append(item)
 
     data = {"chat_id": chat_id, "media": json.dumps(media_items)}
-    return _request("sendMediaGroup", data, files=files)
+    return await _request_async("sendMediaGroup", data, files=files)
 
 
 async def get_chat(chat_id):
-    return _request("getChat", {"chat_id": chat_id})
+    return await _request_async("getChat", {"chat_id": chat_id})
 
 
 async def get_me():
-    return _request("getMe")
+    return await _request_async("getMe")
 
 
 async def edit_message_text(chat_id, message_id, text):
-    return _request("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text})
+    return await _request_async("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text})
 
 
 async def edit_message_caption(chat_id, message_id, caption):
-    return _request("editMessageCaption", {"chat_id": chat_id, "message_id": message_id, "caption": caption})
+    return await _request_async("editMessageCaption", {"chat_id": chat_id, "message_id": message_id, "caption": caption})
 
 
 async def delete_message(chat_id, message_id):
-    return _request("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+    return await _request_async("deleteMessage", {"chat_id": chat_id, "message_id": message_id})

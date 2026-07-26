@@ -5,6 +5,7 @@ def main_menu_keyboard(is_sudo: bool = False, is_owner: bool = False) -> InlineK
     buttons = [
         [InlineKeyboardButton("📝 پست جدید", callback_data="new_post")],
         [InlineKeyboardButton("📋 تاریخچه پست‌ها", callback_data="history")],
+        [InlineKeyboardButton("❓ راهنمای استفاده", callback_data="help")],
     ]
     if is_sudo or is_owner:
         buttons.append([InlineKeyboardButton("👥 مدیریت کاربران", callback_data="users_menu")])
@@ -16,12 +17,39 @@ def main_menu_keyboard(is_sudo: bool = False, is_owner: bool = False) -> InlineK
 def confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("✅ تأیید و ارسال", callback_data="confirm_post")],
+            [InlineKeyboardButton("🎯 انتخاب کانال‌ها", callback_data="choose_channels")],
             [
-                InlineKeyboardButton("✅ تأیید و ارسال", callback_data="confirm_post"),
-                InlineKeyboardButton("❌ لغو", callback_data="cancel_post"),
-            ]
+                InlineKeyboardButton("💾 ذخیره پیش‌نویس", callback_data="save_draft"),
+                InlineKeyboardButton("📑 ذخیره قالب", callback_data="save_template"),
+            ],
+            [InlineKeyboardButton("🕒 زمان‌بندی", callback_data="schedule_post"),
+            ],
+            [InlineKeyboardButton("❌ لغو", callback_data="cancel_post")],
         ]
     )
+
+
+def channel_selection_keyboard(channels: list[dict], selected: set[int]) -> InlineKeyboardMarkup:
+    buttons = []
+    for channel in channels:
+        marker = "✅" if channel["id"] in selected else "⬜"
+        icon = "🔵" if channel.get("platform") == "bale" else "📣"
+        buttons.append([InlineKeyboardButton(
+            f"{marker} {icon} {channel['name']}",
+            callback_data=f"toggle_channel_{channel['id']}",
+        )])
+    buttons.append([InlineKeyboardButton("✅ تأیید انتخاب", callback_data="channels_done")])
+    buttons.append([InlineKeyboardButton("◀️ بازگشت", callback_data="channels_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def approval_settings_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    label = "🔴 خاموش کردن تأیید" if enabled else "🟢 روشن کردن تأیید"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data="toggle_approval")],
+        [InlineKeyboardButton("◀️ بازگشت به تنظیمات", callback_data="settings")],
+    ])
 
 
 def restart_confirm_keyboard() -> InlineKeyboardMarkup:
@@ -53,6 +81,7 @@ def settings_keyboard(channels: list[dict], is_sudo_user: bool = False) -> list[
     buttons.append(
         [InlineKeyboardButton("➕ افزودن کانال بله", callback_data="add_bale_channel")]
     )
+    buttons.append([InlineKeyboardButton("🔐 تنظیم تأیید پست‌ها", callback_data="approval_settings")])
     if is_sudo_user:
         buttons.append(
             [
@@ -145,6 +174,11 @@ def post_detail_keyboard(post_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("✏️ ویرایش", callback_data=f"edit_{post_id}"),
                 InlineKeyboardButton("🗑️ حذف", callback_data=f"delete_{post_id}"),
             ],
+            [
+                InlineKeyboardButton("📄 کپی", callback_data=f"duplicate_{post_id}"),
+                InlineKeyboardButton("🔁 ارسال مجدد", callback_data=f"retry_{post_id}"),
+            ],
+            [InlineKeyboardButton("✅ تأیید انتشار", callback_data=f"approve_{post_id}")],
             [InlineKeyboardButton("◀️ بازگشت", callback_data="history")],
         ]
     )

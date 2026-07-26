@@ -1,4 +1,5 @@
 import logging
+import time
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
@@ -8,9 +9,10 @@ from database import (
     get_active_channels,
     is_owner,
     is_sudo,
-    remove_channel,
+    remove_channel, create_channel_group, get_channel_groups, get_setting, set_setting,
 )
 from keyboards import main_menu_keyboard, settings_markup
+from utils import state_is_expired
 import bale_client
 
 logger = logging.getLogger(__name__)
@@ -50,7 +52,7 @@ async def handle_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     user_id = query.from_user.id
-    _settings_states[user_id] = {"state": "awaiting_channel_input", "platform": "telegram"}
+    _settings_states[user_id] = {"state": "awaiting_channel_input", "platform": "telegram", "created_at": time.monotonic()}
 
     await query.edit_message_text(
         "➕ <b>افزودن کانال تلگرام</b>\n\n"
@@ -67,7 +69,7 @@ async def handle_add_bale_channel(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     user_id = query.from_user.id
-    _settings_states[user_id] = {"state": "awaiting_channel_input", "platform": "bale"}
+    _settings_states[user_id] = {"state": "awaiting_channel_input", "platform": "bale", "created_at": time.monotonic()}
 
     await query.edit_message_text(
         "➕ <b>افزودن کانال بله</b>\n\n"
@@ -82,6 +84,9 @@ async def handle_add_bale_channel(update: Update, context: ContextTypes.DEFAULT_
 async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = _settings_states.get(user_id)
+    if state and state_is_expired(state):
+        _settings_states.pop(user_id, None)
+        state = None
     if not state or state.get("state") != "awaiting_channel_input":
         return False
 
@@ -180,6 +185,37 @@ async def handle_remove_channel(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode=ParseMode.HTML,
         reply_markup=settings_markup(tg_channels + bale_channels, is_sudo_user=await is_sudo(query.from_user.id)),
     )
+
+
+async def handle_approval_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not await is_owner(user_id):
+        await query.answer("❌ فقط sudo یا owner دسترسی دارد.", show_alert=True)
+        return
+    enabled = (await get_setting("approval_required", "0")) == "1"
+    status = "روشن ✅" if enabled else "خاموش ❌"
+    from keyboards import approval_settings_keyboard
+    await query.edit_message_text(
+        f"🔐 <b>تأیید قبل از انتشار</b>\n\nوضعیت فعلی: <b>{status}</b>\n\n"
+        "وقتی روشن باشد، پست‌های نویسندگان قبل از انتشار باید توسط sudo یا owner تأیید شوند.\n"
+        "وقتی خاموش باشد، نویسندگان مستقیماً منتشر می‌کنند.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=approval_settings_keyboard(enabled),
+    )
+
+
+async def handle_toggle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not await is_owner(user_id):
+        await query.answer("❌ فقط sudo یا owner دسترسی دارد.", show_alert=True)
+        return
+    current = (await get_setting("approval_required", "0")) == "1"
+    await set_setting("approval_required", "0" if current else "1", user_id)
+    await handle_approval_settings(update, context)
 
 
 async def handle_bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -286,6 +322,43 @@ async def handle_do_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     import threading
     threading.Thread(target=_do_restart, daemon=True).start()
+
+
+async def handle_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await is_owner(user_id):
+        await update.message.reply_text("❌ غیرمجاز.")
+        return
+    parts = (update.message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await update.message.reply_text("قالب: /group نام_گروه شناسه_کانال‌ها\nمثال: /group اخبار 1,2,3")
+        return
+    name, raw_ids = parts[1], parts[2]
+    try:
+        channel_ids = [int(x.strip()) for x in raw_ids.split(",") if x.strip()]
+    except ValueError:
+        await update.message.reply_text("❌ شناسه کانال نامعتبر است.")
+        return
+    valid = {c["id"] for c in await get_active_channels()}
+    channel_ids = [cid for cid in channel_ids if cid in valid]
+    if not channel_ids:
+        await update.message.reply_text("❌ هیچ کانال فعالی انتخاب نشده است.")
+        return
+    ok = await create_channel_group(user_id, name, channel_ids)
+    await update.message.reply_text("✅ گروه کانال ساخته شد." if ok else "⚠️ این نام گروه قبلاً وجود دارد.")
+
+
+async def handle_groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await is_owner(user_id):
+        await update.message.reply_text("❌ غیرمجاز.")
+        return
+    groups = await get_channel_groups(user_id)
+    if not groups:
+        await update.message.reply_text("📋 گروه کانالی وجود ندارد.")
+        return
+    text = "📋 گروه‌های کانال:\n" + "\n".join(f"• {g['name']} ({g['channel_count']} کانال)" for g in groups)
+    await update.message.reply_text(text)
 
 
 async def handle_back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):

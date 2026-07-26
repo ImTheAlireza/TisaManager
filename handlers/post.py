@@ -1,23 +1,39 @@
 import logging
 import json
+import time
+from datetime import datetime
 
 from telegram import Update, InputMediaPhoto, InputMediaVideo
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
-from database import get_active_channels, is_writer_or_above, is_sudo, is_owner, save_post, update_post_message_ids
-from keyboards import confirm_keyboard, main_menu_keyboard
+from database import (
+    get_active_channels, is_writer_or_above, is_sudo, is_owner, save_post,
+    update_post_message_ids, update_post_delivery, create_schedule, get_due_schedules,
+    update_schedule, has_permission, update_post_status, create_template, get_templates, get_template, get_setting,
+)
+from keyboards import confirm_keyboard, main_menu_keyboard, channel_selection_keyboard
+from utils import html_text
 
 logger = logging.getLogger(__name__)
 
 # Per-user state tracking
 user_states: dict[int, dict] = {}
+STATE_TTL_SECONDS = 30 * 60
+
+
+def _active_state(user_id: int):
+    state = user_states.get(user_id)
+    if state and time.monotonic() - state.get("created_at", 0) > STATE_TTL_SECONDS:
+        user_states.pop(user_id, None)
+        return None
+    return state
 
 
 async def _process_media_group_callback(context: ContextTypes.DEFAULT_TYPE):
     """Job callback that fires after media group debounce."""
     user_id = context.job.data
-    state = user_states.get(user_id)
+    state = _active_state(user_id)
     if not state or state.get("state") != "awaiting_media_group":
         return
     media = state.get("media", [])
@@ -30,7 +46,7 @@ async def _process_media_group_callback(context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📝 <b>پیش‌نمایش پست:</b>\n"]
     if caption:
-        lines.append(f"کپشن: {caption}")
+        lines.append(f"کپشن: {html_text(caption)}")
     lines.append(f"\n📦 تعداد رسانه‌ها: {len(media)}")
     lines.append("\nبه همه کانال‌ها ارسال شود؟")
 
@@ -65,7 +81,7 @@ async def handle_new_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = query.from_user.id
-    user_states[user_id] = {"state": "awaiting_post", "media": [], "caption": ""}
+    user_states[user_id] = {"state": "awaiting_post", "media": [], "caption": "", "created_at": time.monotonic()}
     await query.edit_message_text(
         "📝 پست خود را ارسال کنید.\n\n"
         "می‌توانید ارسال کنید:\n"
@@ -80,7 +96,7 @@ async def handle_new_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _handle_media_item(update, context, media_type, file_id):
     """Common handler for photo/video in a media group or single."""
     user_id = update.effective_user.id
-    state = user_states.get(user_id)
+    state = _active_state(user_id)
     if not state or state.get("state") not in ("awaiting_post", "awaiting_media_group"):
         return False
 
@@ -109,7 +125,7 @@ async def _handle_media_item(update, context, media_type, file_id):
 
     preview_lines = ["📝 <b>پیش‌نمایش پست:</b>\n"]
     if caption:
-        preview_lines.append(f"کپشن: {caption}")
+        preview_lines.append(f"کپشن: {html_text(caption)}")
     preview_lines.append("\nبه همه کانال‌ها ارسال شود؟")
 
     await msg.reply_text(
@@ -132,7 +148,7 @@ async def handle_video_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    state = user_states.get(user_id)
+    state = _active_state(user_id)
     if not state or state.get("state") != "awaiting_post":
         return False
 
@@ -143,7 +159,7 @@ async def handle_text_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["message"] = update.message
 
     await update.message.reply_text(
-        f"📝 <b>پیش‌نمایش پست:</b>\n\n{text}\n\nبه همه کانال‌ها ارسال شود؟",
+        f"📝 <b>پیش‌نمایش پست:</b>\n\n{html_text(text)}\n\nبه همه کانال‌ها ارسال شود؟",
         parse_mode=ParseMode.HTML,
         reply_markup=confirm_keyboard(),
     )
@@ -152,7 +168,7 @@ async def handle_text_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    state = user_states.get(user_id)
+    state = _active_state(user_id)
     if not state or state.get("state") not in ("awaiting_post", "awaiting_media_group"):
         return False
 
@@ -168,8 +184,8 @@ async def handle_document_post(update: Update, context: ContextTypes.DEFAULT_TYP
 
     preview_lines = ["📝 <b>پیش‌نمایش پست:</b>\n"]
     if caption:
-        preview_lines.append(f"کپشن: {caption}")
-    preview_lines.append(f"\n📎 فایل: {doc.file_name}")
+        preview_lines.append(f"کپشن: {html_text(caption)}")
+    preview_lines.append(f"\n📎 فایل: {html_text(doc.file_name)}")
     preview_lines.append("\nبه همه کانال‌ها ارسال شود؟")
 
     await msg.reply_text(
@@ -280,18 +296,58 @@ async def _post_to_bale(channels, state, bot):
     return sent, failed, message_ids
 
 
+async def publish_existing_post(post: dict, bot) -> tuple[int, int]:
+    """Publish a stored post, used by scheduled jobs and retry actions."""
+    selected = set(json.loads(post.get("target_channels_json") or "[]"))
+    tg = await get_active_channels("telegram")
+    bale = await get_active_channels("bale")
+    if selected:
+        tg = [c for c in tg if c["id"] in selected]
+        bale = [c for c in bale if c["id"] in selected]
+    state = {"type": post["post_type"], "text": post.get("text"), "file_id": post.get("file_id"),
+             "caption": post.get("caption"), "media": json.loads(post.get("media_json") or "[]")}
+    tg_sent, tg_failed, tg_ids = await _post_to_telegram(tg, state, bot)
+    bale_sent, bale_failed, bale_ids = await _post_to_bale(bale, state, bot)
+    await update_post_message_ids(post["id"], json.dumps(tg_ids + bale_ids), None)
+    total = len(tg) + len(bale)
+    sent = tg_sent + bale_sent
+    status = "completed" if sent == total and total else ("partial" if sent else "failed")
+    await update_post_delivery(post["id"], status, json.dumps({"telegram_failed": tg_failed, "bale_failed": bale_failed}))
+    return sent, tg_failed + bale_failed
+
+
+async def process_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
+    from database import get_post
+    for schedule in await get_due_schedules():
+        try:
+            post = await get_post(schedule["post_id"])
+            if not post:
+                await update_schedule(schedule["id"], "failed", "post not found")
+                continue
+            await publish_existing_post(post, context.bot)
+            await update_schedule(schedule["id"], "completed")
+        except Exception as exc:
+            logger.exception("Scheduled post %s failed", schedule["id"])
+            await update_schedule(schedule["id"], "failed", str(exc)[:1000])
+
+
 async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     user_id = query.from_user.id
-    state = user_states.get(user_id)
+    state = _active_state(user_id)
     if not state or state.get("state") != "awaiting_confirm":
         await query.edit_message_text("❌ پستی در انتظار نیست. برای شروع /start را بزنید.")
         return
 
     tg_channels = await get_active_channels("telegram")
     bale_channels = await get_active_channels("bale")
+    selected_ids = state.get("selected_channel_ids")
+    if selected_ids:
+        selected_ids = set(selected_ids)
+        tg_channels = [c for c in tg_channels if c["id"] in selected_ids]
+        bale_channels = [c for c in bale_channels if c["id"] in selected_ids]
 
     logger.info("Found %d Telegram channels, %d Bale channels", len(tg_channels), len(bale_channels))
 
@@ -304,6 +360,9 @@ async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     post_type = state.get("type")
 
+    # Approval is an owner-controlled global setting and defaults to off.
+    approval_required = (await get_setting("approval_required", "0")) == "1"
+
     # Save to history first
     media_json = json.dumps(state.get("media")) if post_type == "media_group" else None
     post_id = await save_post(
@@ -312,7 +371,14 @@ async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         file_id=state.get("file_id"),
         caption=state.get("caption"),
         media_json=media_json,
+        target_channels_json=json.dumps([c["id"] for c in tg_channels + bale_channels]),
+        delivery_status="pending_approval" if approval_required and not await has_permission(user_id, "approve") else "pending",
     )
+
+    if approval_required and not await has_permission(user_id, "approve"):
+        user_states.pop(user_id, None)
+        await query.edit_message_text(f"📝 پست #{post_id} برای تأیید مالک ارسال شد.", reply_markup=main_menu_keyboard(is_sudo=await is_sudo(user_id), is_owner=await is_owner(user_id)))
+        return
 
     tg_sent, tg_failed, tg_message_ids = await _post_to_telegram(tg_channels, state, context.bot)
     bale_sent, bale_failed, bale_message_ids = await _post_to_bale(bale_channels, state, context.bot)
@@ -320,6 +386,11 @@ async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Update history with all message IDs
     all_message_ids = tg_message_ids + bale_message_ids
     await update_post_message_ids(post_id, json.dumps(all_message_ids), None)
+    total = len(tg_channels) + len(bale_channels)
+    total_sent = tg_sent + bale_sent
+    delivery_status = "completed" if total_sent == total else ("partial" if total_sent else "failed")
+    delivery_errors = {"telegram_failed": tg_failed, "bale_failed": bale_failed}
+    await update_post_delivery(post_id, delivery_status, json.dumps(delivery_errors))
 
     user_states.pop(user_id, None)
 
@@ -343,6 +414,143 @@ async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def _channel_picker(update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
+    state = _active_state(user_id)
+    if not state or state.get("state") != "awaiting_confirm":
+        await query.answer("❌ پستی در انتظار نیست.", show_alert=True)
+        return
+    channels = await get_active_channels()
+    selected = set(state.get("selected_channel_ids", [c["id"] for c in channels]))
+    state["selected_channel_ids"] = list(selected)
+    await query.edit_message_text(
+        "🎯 کانال‌های مقصد را انتخاب کنید:",
+        reply_markup=channel_selection_keyboard(channels, selected),
+    )
+    await query.answer()
+
+
+async def handle_choose_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _channel_picker(update, context)
+
+
+async def handle_toggle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    state = _active_state(query.from_user.id)
+    if not state:
+        await query.answer("❌ نشست منقضی شده است.", show_alert=True)
+        return
+    channel_id = int(query.data.removeprefix("toggle_channel_"))
+    selected = set(state.get("selected_channel_ids", []))
+    if channel_id in selected:
+        selected.remove(channel_id)
+    else:
+        selected.add(channel_id)
+    state["selected_channel_ids"] = list(selected)
+    channels = await get_active_channels()
+    await query.edit_message_reply_markup(reply_markup=channel_selection_keyboard(channels, selected))
+    await query.answer()
+
+
+async def handle_channels_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    state = _active_state(query.from_user.id)
+    selected = state.get("selected_channel_ids", []) if state else []
+    if not selected:
+        await query.answer("حداقل یک کانال را انتخاب کنید.", show_alert=True)
+        return
+    await query.edit_message_text("✅ کانال‌ها انتخاب شدند. برای ادامه یکی از گزینه‌ها را انتخاب کنید.", reply_markup=confirm_keyboard())
+    await query.answer()
+
+
+async def handle_channels_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.edit_message_text("📝 پست آماده است. مقصدهای انتخاب‌شده حفظ شدند.", reply_markup=confirm_keyboard())
+    await query.answer()
+
+
+async def _save_current_post(user_id, state, delivery_status="draft"):
+    media_json = json.dumps(state.get("media")) if state.get("type") == "media_group" else None
+    return await save_post(
+        user_id, state.get("type"), text=state.get("text"), file_id=state.get("file_id"),
+        caption=state.get("caption"), media_json=media_json,
+        target_channels_json=json.dumps(state.get("selected_channel_ids", [])),
+        delivery_status=delivery_status,
+    )
+
+
+async def handle_save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    state = _active_state(query.from_user.id)
+    if not state or state.get("state") != "awaiting_confirm":
+        await query.answer("❌ پستی در انتظار نیست.", show_alert=True)
+        return
+    post_id = await _save_current_post(query.from_user.id, state)
+    user_states.pop(query.from_user.id, None)
+    await query.edit_message_text(f"💾 پیش‌نویس #{post_id} ذخیره شد.", reply_markup=main_menu_keyboard(is_sudo=await is_sudo(query.from_user.id), is_owner=await is_owner(query.from_user.id)))
+    await query.answer()
+
+
+async def handle_save_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    state = _active_state(query.from_user.id)
+    if not state or state.get("state") != "awaiting_confirm":
+        await query.answer("❌ پستی در انتظار نیست.", show_alert=True)
+        return
+    state["state"] = "awaiting_template_name"
+    await query.edit_message_text("📑 نام قالب را ارسال کنید:")
+    await query.answer()
+
+
+async def handle_template_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = _active_state(user_id)
+    if not state or state.get("state") != "awaiting_template_name":
+        return False
+    name = update.message.text.strip()[:150]
+    if not name:
+        await update.message.reply_text("❌ نام قالب نمی‌تواند خالی باشد.")
+        return True
+    ok = await create_template(user_id, name, state)
+    state["state"] = "awaiting_confirm"
+    await update.message.reply_text("✅ قالب ذخیره شد." if ok else "⚠️ قالبی با این نام وجود دارد.", reply_markup=confirm_keyboard())
+    return True
+
+
+async def handle_schedule_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    state = _active_state(query.from_user.id)
+    if not state or state.get("state") != "awaiting_confirm":
+        await query.answer("❌ پستی در انتظار نیست.", show_alert=True)
+        return
+    if not state.get("selected_channel_ids"):
+        channels = await get_active_channels()
+        state["selected_channel_ids"] = [c["id"] for c in channels]
+    state["state"] = "awaiting_schedule"
+    await query.edit_message_text("🕒 زمان را به شکل YYYY-MM-DD HH:MM ارسال کنید (زمان محلی سرور):")
+    await query.answer()
+
+
+async def handle_schedule_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = _active_state(user_id)
+    if not state or state.get("state") != "awaiting_schedule":
+        return False
+    try:
+        run_at = datetime.strptime(update.message.text.strip(), "%Y-%m-%d %H:%M")
+        if run_at <= datetime.now():
+            raise ValueError("past")
+    except ValueError:
+        await update.message.reply_text("❌ قالب نامعتبر است. نمونه: 2026-08-01 14:30")
+        return True
+    post_id = await _save_current_post(user_id, state)
+    await create_schedule(user_id, post_id, run_at)
+    user_states.pop(user_id, None)
+    await update.message.reply_text(f"✅ پست #{post_id} برای {run_at:%Y-%m-%d %H:%M} زمان‌بندی شد.", reply_markup=main_menu_keyboard(is_sudo=await is_sudo(user_id), is_owner=await is_owner(user_id)))
+    return True
+
+
 async def handle_cancel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -357,11 +565,64 @@ async def handle_cancel_post(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def handle_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel every interactive workflow belonging to the current user."""
+    user_id = update.effective_user.id
+    user_states.pop(user_id, None)
+    # These modules keep their own short-lived workflow state.
+    from handlers.history import _edit_states
+    from handlers.settings import _settings_states
+    from handlers.users import _add_user_states
+    _edit_states.pop(user_id, None)
+    _settings_states.pop(user_id, None)
+    _add_user_states.pop(user_id, None)
+    await update.message.reply_text(
+        "✅ عملیات لغو شد.",
+        reply_markup=main_menu_keyboard(
+            is_sudo=await is_sudo(user_id), is_owner=await is_owner(user_id)
+        ),
+    )
+
+
+async def handle_templates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    templates = await get_templates(update.effective_user.id)
+    if not templates:
+        await update.message.reply_text("📑 قالبی وجود ندارد.")
+        return
+    text = "📑 قالب‌ها:\n" + "\n".join(f"• #{t['id']} — {t['name']}" for t in templates)
+    text += "\n\nبرای استفاده: /use_template شناسه"
+    await update.message.reply_text(text)
+
+
+async def handle_use_template_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parts = (update.message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await update.message.reply_text("قالب: /use_template شناسه")
+        return
+    template = await get_template(update.effective_user.id, int(parts[1]))
+    if not template:
+        await update.message.reply_text("❌ قالب یافت نشد.")
+        return
+    user_states[update.effective_user.id] = {
+        "state": "awaiting_confirm", "type": template["post_type"], "text": template.get("text"),
+        "caption": template.get("caption") or "", "file_id": template.get("file_id"),
+        "media": json.loads(template.get("media_json") or "[]"), "created_at": time.monotonic(),
+    }
+    await update.message.reply_text("📑 قالب آماده است.", reply_markup=confirm_keyboard())
+
+
 async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route incoming media/text to the correct handler based on user state."""
     user_id = update.effective_user.id
-    state = user_states.get(user_id)
+    state = _active_state(user_id)
     if not state:
+        return
+
+    if state.get("state") == "awaiting_schedule":
+        await handle_schedule_input(update, context)
+        return
+    if state.get("state") == "awaiting_template_name":
+        await handle_template_name(update, context)
         return
 
     allowed_states = {"awaiting_post", "awaiting_media_group"}
