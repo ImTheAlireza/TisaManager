@@ -76,6 +76,7 @@ from telegram.constants import ParseMode
 
 from config import BOT_TOKEN as _CONFIRM_TOKEN  # noqa: F811
 from database import init_db, close_pool
+from utils import private_actor
 from handlers.start import start
 from handlers.post import (
     handle_confirm_post,
@@ -228,10 +229,15 @@ def main():
     # Message handler for post content + channel input
     # Must be last so callbacks are matched first
     async def route_message(update, context):
-        # Only accept interactive workflow inputs in private chat.
-        # Messages from groups/supergroups must never trigger post creation,
-        # editing, channel adding, user adding or restore workflows.
-        if update.effective_chat.type != "private":
+        # Reject every non-private message. Messages from groups, supergroups and
+        # channels must never trigger post creation, editing, channel adding,
+        # user adding or restore workflows.
+        #
+        # private_actor also rejects updates with no effective_user (anonymous
+        # channel posts / service messages) and no message (edited messages),
+        # both of which reach this handler via filters.ALL and used to raise
+        # AttributeError before any chat-type check could run.
+        if private_actor(update) is None:
             return
         # Restore uploads must be handled before normal workflow routing.
         if await handle_restore_document(update, context):
@@ -249,7 +255,12 @@ def main():
         # Then try post handlers
         await handle_any_message(update, context)
 
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, route_message))
+    # filters.ChatType.PRIVATE stops group/supergroup/channel updates at the
+    # dispatcher, so route_message is only ever invoked for private chats.
+    # The in-function check above stays as defence in depth.
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.ALL & ~filters.COMMAND, route_message)
+    )
 
     # Initialize database and send online notification
     async def initialize_database(context):

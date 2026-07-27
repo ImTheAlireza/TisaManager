@@ -4,14 +4,17 @@ from telegram.ext import ContextTypes
 from database import is_sudo, is_owner, is_writer_or_above
 from keyboards import main_menu_keyboard
 from handlers.post import cancel_all_workflows
+from utils import private_actor
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    # /start only works in private chat — interactive menus must never
-    # appear in groups to prevent accidental workflow triggers.
-    if update.effective_chat.type != "private":
+    # /start only works in private chat — interactive menus must never appear in
+    # groups, supergroups or channels. Checked before reading effective_user
+    # because channel posts are anonymous and carry no user.
+    actor = private_actor(update)
+    if actor is None:
         return
+    user_id = actor.id
     # /start always returns the user to a clean workflow.
     cancel_all_workflows(user_id)
 
