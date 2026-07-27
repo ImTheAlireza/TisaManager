@@ -8,6 +8,10 @@ from handlers.post import cancel_all_workflows
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    # /start only works in private chat — interactive menus must never
+    # appear in groups to prevent accidental workflow triggers.
+    if update.effective_chat.type != "private":
+        return
     # /start always returns the user to a clean workflow.
     cancel_all_workflows(user_id)
 
