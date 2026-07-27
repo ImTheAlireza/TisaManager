@@ -14,7 +14,7 @@ from database import (
     update_schedule, has_permission, update_post_status, get_setting,
 )
 from keyboards import confirm_keyboard, main_menu_keyboard, channel_selection_keyboard, schedule_date_keyboard, schedule_hour_keyboard, schedule_minute_keyboard
-from utils import html_text, private_actor
+from utils import html_text, is_private_chat, private_actor
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,12 @@ def _schedule_media_group(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 async def handle_new_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    # Never arm a posting workflow from a shared chat. The global gate in bot.py
+    # already stops this, but arming state here would leave the user's next
+    # private message silently captured as post content, so refuse locally too.
+    if not is_private_chat(update):
+        return
 
     if not await is_writer_or_above(query.from_user.id):
         await query.edit_message_text("❌ غیرمجاز.")

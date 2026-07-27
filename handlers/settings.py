@@ -12,7 +12,7 @@ from database import (
     remove_channel, create_channel_group, get_channel_groups, get_setting, set_setting,
 )
 from keyboards import main_menu_keyboard, settings_markup, settings_main_markup
-from utils import state_is_expired
+from utils import is_private_chat, state_is_expired
 import bale_client
 
 logger = logging.getLogger(__name__)
@@ -393,6 +393,10 @@ async def handle_groups_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    # "Back to main menu" is the pivot that turned a group /help into the full
+    # admin menu; never render that keyboard outside a private chat.
+    if not is_private_chat(update):
+        return
     user_id = query.from_user.id
     await query.edit_message_text(
         "🤖 ربات مدیریت پست\n\nیک گزینه را انتخاب کنید:",

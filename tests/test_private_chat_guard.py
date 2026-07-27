@@ -311,3 +311,110 @@ class StartCommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HelpMenuEscalationTests(unittest.TestCase):
+    """Regression for the /help -> back -> new post escalation found in review.
+
+    Reported chain: send /help in a group, tap "main menu" on the bot's reply,
+    then tap "new post" — the bot rendered the full admin menu in the group and
+    armed a posting workflow. Message-level filters did not cover this because
+    CallbackQueryHandler ignores them, so the buttons stayed live.
+    """
+
+    def setUp(self):
+        post.user_states.clear()
+
+    def tearDown(self):
+        post.user_states.clear()
+
+    @staticmethod
+    def _callback_update(chat_type, data):
+        sent = []
+        chat = types.SimpleNamespace(type=chat_type, id=-100)
+        user = types.SimpleNamespace(id=USER_ID)
+
+        async def answer(*a, **k):
+            pass
+
+        async def edit_message_text(text, **k):
+            sent.append(text)
+
+        query = types.SimpleNamespace(
+            data=data, from_user=user, answer=answer,
+            edit_message_text=edit_message_text,
+            message=types.SimpleNamespace(chat=chat),
+        )
+        update = types.SimpleNamespace(
+            effective_chat=chat, effective_user=user,
+            message=None, callback_query=query,
+        )
+        return update, sent
+
+    def test_help_command_renders_nothing_in_a_group(self):
+        from handlers.help import handle_help
+        for chat_type in NON_PRIVATE:
+            with self.subTest(chat_type=chat_type):
+                update = make_update(chat_type)
+                run(handle_help(update, None))
+                self.assertEqual(update.message._sent, [])
+
+    def test_back_to_main_menu_is_not_rendered_in_a_group(self):
+        from handlers.settings import handle_back_main
+        for chat_type in NON_PRIVATE:
+            with self.subTest(chat_type=chat_type):
+                update, sent = self._callback_update(chat_type, "back_main")
+                run(handle_back_main(update, None))
+                self.assertEqual(sent, [])
+
+    def test_new_post_button_does_not_arm_state_from_a_group(self):
+        """The critical one: a group tap must not leave awaiting_post armed.
+
+        Otherwise the victim's next private message is silently swallowed as
+        post content, even though the group message itself is rejected.
+        """
+        from handlers.post import handle_new_post
+        for chat_type in NON_PRIVATE:
+            with self.subTest(chat_type=chat_type):
+                update, sent = self._callback_update(chat_type, "new_post")
+                run(handle_new_post(update, None))
+                self.assertEqual(sent, [])
+                self.assertNotIn(USER_ID, post.user_states)
+
+    def test_full_reported_chain_is_dead_at_every_step(self):
+        from handlers.help import handle_help
+        from handlers.settings import handle_back_main
+        from handlers.post import handle_new_post
+
+        help_update = make_update("supergroup")
+        run(handle_help(help_update, None))
+        back_update, back_sent = self._callback_update("supergroup", "back_main")
+        run(handle_back_main(back_update, None))
+        new_update, new_sent = self._callback_update("supergroup", "new_post")
+        run(handle_new_post(new_update, None))
+
+        self.assertEqual(help_update.message._sent, [])
+        self.assertEqual(back_sent, [])
+        self.assertEqual(new_sent, [])
+        self.assertEqual(post.user_states, {})
+
+
+class GlobalGateTests(unittest.TestCase):
+    """The gate must be registered globally, not bolted onto individual handlers."""
+
+    def setUp(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "bot.py"), encoding="utf-8") as handle:
+            self.source = handle.read()
+
+    def test_gate_runs_before_every_other_handler(self):
+        self.assertIn("TypeHandler(Update, block_non_private), group=-1", self.source)
+
+    def test_gate_halts_the_update(self):
+        self.assertIn("raise ApplicationHandlerStop", self.source)
+
+    def test_gate_is_defined_before_handlers_are_registered(self):
+        self.assertLess(
+            self.source.index("async def block_non_private"),
+            self.source.index('CommandHandler("start"'),
+        )

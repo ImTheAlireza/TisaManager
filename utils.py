@@ -41,5 +41,8 @@ def private_actor(update):
     return getattr(update, "effective_user", None)
 
 
+GROUP_NOTICE = "⛔️ این ربات فقط در چت خصوصی کار می‌کند."
+
+
 def state_is_expired(state: dict) -> bool:
     return time.monotonic() - state.get("created_at", 0) > STATE_TTL_SECONDS

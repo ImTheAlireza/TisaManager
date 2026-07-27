@@ -4,6 +4,7 @@ from telegram.constants import ParseMode
 
 from database import is_writer_or_above, get_user_role
 from keyboards import main_menu_keyboard
+from utils import is_private_chat
 
 
 def _help_keyboard():
@@ -23,6 +24,11 @@ TEXT = {
 
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE, section="main"):
+    # Help renders the menu keyboard, whose "main menu" button leads to the full
+    # admin menu. Posting it into a group hands everyone in that group a live
+    # control panel, so refuse outside private chat.
+    if not is_private_chat(update):
+        return
     user_id = update.effective_user.id
     if not await is_writer_or_above(user_id):
         if update.callback_query:
@@ -42,6 +48,8 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE, section=
 
 
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private_chat(update):
+        return
     from handlers.post import cancel_all_workflows
     cancel_all_workflows(update.effective_user.id)
     await show_help(update, context, "main")
