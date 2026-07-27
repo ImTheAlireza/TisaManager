@@ -620,6 +620,10 @@ async def handle_cancel_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route incoming media/text to the correct handler based on user state."""
     user_id = update.effective_user.id
+    # Only accept post content in private chat — group messages must never
+    # trigger post submission (use the "new post" button instead).
+    if update.effective_chat.type != "private":
+        return
     state = _active_state(user_id)
     if not state:
         return
