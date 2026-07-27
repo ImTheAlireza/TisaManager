@@ -14,7 +14,7 @@ from database import (
     update_schedule, has_permission, update_post_status, get_setting,
 )
 from keyboards import confirm_keyboard, main_menu_keyboard, channel_selection_keyboard, schedule_date_keyboard, schedule_hour_keyboard, schedule_minute_keyboard
-from utils import html_text
+from utils import html_text, is_private_chat, private_actor
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,12 @@ async def handle_new_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    # Never arm a posting workflow from a shared chat. The global gate in bot.py
+    # already stops this, but arming state here would leave the user's next
+    # private message silently captured as post content, so refuse locally too.
+    if not is_private_chat(update):
+        return
+
     if not await is_writer_or_above(query.from_user.id):
         await query.edit_message_text("❌ غیرمجاز.")
         return
@@ -96,7 +102,10 @@ async def handle_new_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _handle_media_item(update, context, media_type, file_id):
     """Common handler for photo/video in a media group or single."""
-    user_id = update.effective_user.id
+    actor = private_actor(update)
+    if actor is None:
+        return False
+    user_id = actor.id
     state = _active_state(user_id)
     if not state or state.get("state") not in ("awaiting_post", "awaiting_media_group"):
         return False
@@ -138,17 +147,24 @@ async def _handle_media_item(update, context, media_type, file_id):
 
 
 async def handle_photo_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if private_actor(update) is None or not update.message.photo:
+        return False
     photo = update.message.photo[-1]
     return await _handle_media_item(update, context, "photo", photo.file_id)
 
 
 async def handle_video_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if private_actor(update) is None or not update.message.video:
+        return False
     video = update.message.video
     return await _handle_media_item(update, context, "video", video.file_id)
 
 
 async def handle_text_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    actor = private_actor(update)
+    if actor is None:
+        return False
+    user_id = actor.id
     state = _active_state(user_id)
     if not state or state.get("state") != "awaiting_post":
         return False
@@ -168,7 +184,10 @@ async def handle_text_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_document_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    actor = private_actor(update)
+    if actor is None:
+        return False
+    user_id = actor.id
     state = _active_state(user_id)
     if not state or state.get("state") not in ("awaiting_post", "awaiting_media_group"):
         return False
@@ -566,9 +585,14 @@ async def handle_schedule_minute(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_schedule_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    actor = private_actor(update)
+    if actor is None:
+        return False
+    user_id = actor.id
     state = _active_state(user_id)
     if not state or state.get("state") not in {"awaiting_schedule", "awaiting_schedule_date", "awaiting_schedule_hour", "awaiting_schedule_minute"}:
+        return False
+    if not update.message.text:
         return False
     try:
         tehran_time = datetime.strptime(update.message.text.strip(), "%Y-%m-%d %H:%M")
@@ -607,7 +631,12 @@ def cancel_all_workflows(user_id: int):
 
 async def handle_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel every interactive workflow belonging to the current user."""
-    user_id = update.effective_user.id
+    # /cancel is part of the private-chat workflow; ignore it in groups so the
+    # bot stays silent in shared chats.
+    actor = private_actor(update)
+    if actor is None:
+        return
+    user_id = actor.id
     cancel_all_workflows(user_id)
     await update.message.reply_text(
         "✅ عملیات لغو شد.",
@@ -619,11 +648,14 @@ async def handle_cancel_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route incoming media/text to the correct handler based on user state."""
-    user_id = update.effective_user.id
-    # Only accept post content in private chat — group messages must never
-    # trigger post submission (use the "new post" button instead).
-    if update.effective_chat.type != "private":
+    # Only accept post content in private chat — group, supergroup and channel
+    # messages must never trigger post submission (use the "new post" button).
+    # This must happen before touching effective_user/message: anonymous channel
+    # posts carry no user and edited updates carry no message.
+    actor = private_actor(update)
+    if actor is None:
         return
+    user_id = actor.id
     state = _active_state(user_id)
     if not state:
         return

@@ -65,17 +65,21 @@ sys.excepthook = handle_exception
 
 
 # --- Now import everything else (errors will be logged) ---
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 from telegram.constants import ParseMode
 
 from config import BOT_TOKEN as _CONFIRM_TOKEN  # noqa: F811
 from database import init_db, close_pool
+from utils import GROUP_NOTICE, is_private_chat, private_actor
 from handlers.start import start
 from handlers.post import (
     handle_confirm_post,
@@ -140,6 +144,32 @@ from handlers.users import (
 )
 
 
+async def block_non_private(update, context):
+    """Drop every update that does not come from a private chat.
+
+    Registered in group -1 so it runs before all other handlers and raises
+    ApplicationHandlerStop, which prevents any later handler from seeing the
+    update. This is the single choke point for the private-chat rule:
+
+    * MessageHandler filters cannot cover callback queries — CallbackQueryHandler
+      ignores message filters entirely, so every inline button (new post, settings,
+      users, backup, ...) was reachable from a group by tapping a menu the bot had
+      posted there via /help.
+    * Per-handler checks are easy to forget; a new command or button would silently
+      reopen the hole. Enforcing it here means a handler cannot opt out by accident.
+    """
+    if is_private_chat(update):
+        return
+    # Answer taps so the client stops spinning, and tell the user where to go.
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        try:
+            await query.answer(GROUP_NOTICE, show_alert=True)
+        except Exception:
+            logger.debug("Could not answer callback query from non-private chat", exc_info=True)
+    raise ApplicationHandlerStop
+
+
 async def notify_online(context):
     try:
         from config import SUDO_USER_ID
@@ -162,6 +192,11 @@ def main():
         raise RuntimeError("BOT_TOKEN not set. Check your .env file.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_shutdown(shutdown_database).build()
+
+    # Global private-chat gate. Group -1 runs before every other group, and the
+    # handler raises ApplicationHandlerStop, so nothing below can ever be reached
+    # from a group, supergroup or channel — commands and inline buttons included.
+    app.add_handler(TypeHandler(Update, block_non_private), group=-1)
 
     # Command handlers
     app.add_handler(CommandHandler("start", start))
@@ -228,10 +263,15 @@ def main():
     # Message handler for post content + channel input
     # Must be last so callbacks are matched first
     async def route_message(update, context):
-        # Only accept interactive workflow inputs in private chat.
-        # Messages from groups/supergroups must never trigger post creation,
-        # editing, channel adding, user adding or restore workflows.
-        if update.effective_chat.type != "private":
+        # Reject every non-private message. Messages from groups, supergroups and
+        # channels must never trigger post creation, editing, channel adding,
+        # user adding or restore workflows.
+        #
+        # private_actor also rejects updates with no effective_user (anonymous
+        # channel posts / service messages) and no message (edited messages),
+        # both of which reach this handler via filters.ALL and used to raise
+        # AttributeError before any chat-type check could run.
+        if private_actor(update) is None:
             return
         # Restore uploads must be handled before normal workflow routing.
         if await handle_restore_document(update, context):
@@ -249,7 +289,12 @@ def main():
         # Then try post handlers
         await handle_any_message(update, context)
 
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, route_message))
+    # filters.ChatType.PRIVATE stops group/supergroup/channel updates at the
+    # dispatcher, so route_message is only ever invoked for private chats.
+    # The in-function check above stays as defence in depth.
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.ALL & ~filters.COMMAND, route_message)
+    )
 
     # Initialize database and send online notification
     async def initialize_database(context):
