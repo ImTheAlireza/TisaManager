@@ -107,6 +107,12 @@ async def handle_role_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     user_id = query.from_user.id
+    # Granting a role is the highest-value action in the bot; re-check ownership
+    # here rather than trusting that the state could only have been armed by one.
+    if not await is_owner(user_id):
+        _add_user_states.pop(user_id, None)
+        await _safe_edit(query, "❌ غیرمجاز.")
+        return
     state = _add_user_states.get(user_id)
     if state and state_is_expired(state):
         _add_user_states.pop(user_id, None)

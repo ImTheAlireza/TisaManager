@@ -118,6 +118,35 @@ def run(coro):
     return asyncio.run(coro)
 
 
+class _patched:
+    """Temporarily replace an attribute on a module (no external deps)."""
+
+    def __init__(self, target, name, value):
+        self.target, self.name, self.value = target, name, value
+
+    def __enter__(self):
+        self.original = getattr(self.target, self.name)
+        setattr(self.target, self.name, self.value)
+        return self.value
+
+    def __exit__(self, *exc):
+        setattr(self.target, self.name, self.original)
+        return False
+
+
+def _async_return(value):
+    async def _stub(*a, **k):
+        return value
+    return _stub
+
+
+def _async_record(sink, value=True):
+    async def _stub(*a, **k):
+        sink.append((a, k))
+        return value
+    return _stub
+
+
 class HelperTests(unittest.TestCase):
     def test_only_private_is_accepted(self):
         self.assertTrue(is_private_chat(make_update("private")))
@@ -418,3 +447,90 @@ class GlobalGateTests(unittest.TestCase):
             self.source.index("async def block_non_private"),
             self.source.index('CommandHandler("start"'),
         )
+
+
+class CallbackAuthorizationTests(unittest.TestCase):
+    """Inline buttons must re-check permission, not trust that they were shown.
+
+    Hiding a button only removes it from one rendered keyboard. Telegram lets any
+    user replay arbitrary callback_data, and a keyboard already sitting in a chat
+    stays tappable after the user is demoted. These handlers armed privileged
+    workflows with no is_owner() check at all.
+    """
+
+    @staticmethod
+    def _query(data, sent):
+        user = types.SimpleNamespace(id=USER_ID)
+        chat = types.SimpleNamespace(type="private", id=5)
+
+        async def answer(*a, **k):
+            pass
+
+        async def edit_message_text(text, **k):
+            sent.append(text)
+
+        return types.SimpleNamespace(
+            data=data, from_user=user, answer=answer,
+            edit_message_text=edit_message_text,
+            message=types.SimpleNamespace(chat=chat),
+        )
+
+    def _update(self, data, sent):
+        return types.SimpleNamespace(
+            effective_chat=types.SimpleNamespace(type="private", id=5),
+            effective_user=types.SimpleNamespace(id=USER_ID),
+            message=None, callback_query=self._query(data, sent),
+        )
+
+    def test_non_owner_cannot_arm_channel_add(self):
+        import handlers.settings as settings
+        for handler_name, data in (
+            ("handle_add_channel", "add_channel"),
+            ("handle_add_bale_channel", "add_bale_channel"),
+        ):
+            with self.subTest(handler=handler_name):
+                settings._settings_states.clear()
+                sent = []
+                with _patched(settings, "is_owner", _async_return(False)):
+                    run(getattr(settings, handler_name)(self._update(data, sent), None))
+                self.assertNotIn(USER_ID, settings._settings_states)
+
+    def test_channel_input_rejects_state_armed_before_demotion(self):
+        """State armed while owner must not be redeemable after demotion."""
+        import handlers.settings as settings
+        settings._settings_states[USER_ID] = {
+            "state": "awaiting_channel_input", "platform": "telegram",
+            "created_at": time.monotonic(),
+        }
+        update = make_update("private")
+        with _patched(settings, "is_owner", _async_return(False)):
+            handled = run(settings.handle_channel_input(update, None))
+        self.assertFalse(handled)
+        self.assertNotIn(USER_ID, settings._settings_states)
+
+    def test_non_owner_cannot_grant_a_role(self):
+        import handlers.users as users
+        users._add_user_states[USER_ID] = {
+            "step": "waiting_role", "target_id": 12345,
+            "created_at": time.monotonic(),
+        }
+        granted = []
+        sent = []
+        with _patched(users, "is_owner", _async_return(False)), \
+             _patched(users, "add_user", _async_record(granted)):
+            run(users.handle_role_select(self._update("role_owner", sent), None))
+        self.assertEqual(granted, [], "a non-owner granted a role")
+        self.assertNotIn(USER_ID, users._add_user_states)
+
+    def test_owner_can_still_grant_a_role(self):
+        import handlers.users as users
+        users._add_user_states[USER_ID] = {
+            "step": "waiting_role", "target_id": 12345,
+            "created_at": time.monotonic(),
+        }
+        granted = []
+        sent = []
+        with _patched(users, "is_owner", _async_return(True)), \
+             _patched(users, "add_user", _async_record(granted)):
+            run(users.handle_role_select(self._update("role_writer", sent), None))
+        self.assertEqual(len(granted), 1, "owner was blocked from granting a role")

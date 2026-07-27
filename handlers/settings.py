@@ -53,6 +53,11 @@ async def handle_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     user_id = query.from_user.id
+    # Buttons only hide an action, they do not protect it: callback_data can be
+    # replayed by anyone, and a stale keyboard survives a demotion.
+    if not await is_owner(user_id):
+        await query.edit_message_text("❌ غیرمجاز.")
+        return
     _settings_states[user_id] = {"state": "awaiting_channel_input", "platform": "telegram", "created_at": time.monotonic()}
 
     await query.edit_message_text(
@@ -70,6 +75,9 @@ async def handle_add_bale_channel(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     user_id = query.from_user.id
+    if not await is_owner(user_id):
+        await query.edit_message_text("❌ غیرمجاز.")
+        return
     _settings_states[user_id] = {"state": "awaiting_channel_input", "platform": "bale", "created_at": time.monotonic()}
 
     await query.edit_message_text(
@@ -91,6 +99,11 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if not state:
         return False
     if state_is_expired(state):
+        _settings_states.pop(user_id, None)
+        return False
+    # Re-check at redemption time: the state may have been armed while the user
+    # was still an owner, then redeemed after a demotion.
+    if not await is_owner(user_id):
         _settings_states.pop(user_id, None)
         return False
     if state.get("state") == "awaiting_group_input":
