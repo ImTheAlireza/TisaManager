@@ -228,6 +228,11 @@ def main():
     # Message handler for post content + channel input
     # Must be last so callbacks are matched first
     async def route_message(update, context):
+        # Only accept interactive workflow inputs in private chat.
+        # Messages from groups/supergroups must never trigger post creation,
+        # editing, channel adding, user adding or restore workflows.
+        if update.effective_chat.type != "private":
+            return
         # Restore uploads must be handled before normal workflow routing.
         if await handle_restore_document(update, context):
             return
