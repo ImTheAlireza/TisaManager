@@ -1,4 +1,6 @@
 import asyncio
+import logging
+
 import aiomysql
 import json
 from config import (
@@ -23,6 +25,8 @@ DELIVERY_STATUSES = {
 #   completed / failed / cancelled / expired -> terminal
 SCHEDULE_STATUSES = {"scheduled", "processing", "completed", "failed", "cancelled", "expired"}
 
+logger = logging.getLogger(__name__)
+
 _pool: aiomysql.Pool | None = None
 
 
@@ -43,6 +47,13 @@ async def get_pool() -> aiomysql.Pool:
                 charset="utf8mb4",
                 minsize=1,
                 maxsize=5,
+                # Pin every session to UTC. Without this, TIMESTAMP columns are
+                # written and read back in whatever timezone the MySQL server
+                # happens to run in, so `created_at` came back as a wall-clock
+                # time in the server's zone while the code treated it as UTC.
+                # Pinning here makes every column in the schema unambiguously
+                # UTC, matching the explicit UTC_TIMESTAMP() writes elsewhere.
+                init_command="SET time_zone = '+00:00'",
             )
             return _pool
         except Exception as exc:
@@ -276,6 +287,71 @@ async def init_db():
             """)
             await cur.execute("INSERT IGNORE INTO bot_settings (setting_key, setting_value, updated_by) VALUES ('approval_required', '0', %s)", (SUDO_USER_ID,))
             await cur.execute("DROP TABLE IF EXISTS templates")
+            # One-time: rebase TIMESTAMP columns written before the pool pinned
+            # sessions to UTC. Those rows hold wall-clock time in the server's
+            # own zone, so they render shifted (a Tehran server showed history
+            # 3.5h off; a UTC+2 one, 95 minutes off). MySQL stores TIMESTAMP as
+            # an epoch and converts on read, so with the session now pinned to
+            # UTC the fix is to add back the offset the old session applied.
+            await cur.execute("SELECT setting_value FROM bot_settings WHERE setting_key = 'timestamps_utc_migrated'")
+            if not await cur.fetchone():
+                # Measure the server's own offset by asking a connection that is
+                # NOT pinned to UTC — that is the zone legacy rows were written
+                # in. CONVERT_TZ needs the mysql.time_zone tables, which are
+                # often not loaded, so fall back to a plain session query.
+                await cur.execute("SELECT @@system_time_zone")
+                server_tz = (await cur.fetchone())[0]
+                shift = 0
+                probe = await aiomysql.connect(
+                    host=DB_HOST, port=DB_PORT, user=DB_USER,
+                    password=DB_PASSWORD, db=DB_NAME, autocommit=True,
+                    charset="utf8mb4",
+                )
+                try:
+                    async with probe.cursor() as pc:
+                        # SYSTEM session tz == the zone the old pool used.
+                        await pc.execute("SELECT TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW())")
+                        result = await pc.fetchone()
+                        server_offset = int(result[0] or 0) if result else 0
+                finally:
+                    probe.close()
+                # Legacy rows hold server-local wall clock. To turn that into
+                # real UTC we SUBTRACT the server's offset: a UTC+2 server
+                # stored 16:13 for a 14:13 UTC event, so the shift is -7200.
+                shift = -server_offset
+                if shift:
+                    logger.warning(
+                        "Rebasing legacy timestamps: server tz %s is %+d seconds from UTC",
+                        server_tz, shift,
+                    )
+                    for table, columns in (
+                        ("post_history", ("created_at", "delivery_completed_at")),
+                        ("channels", ("created_at", "last_health_check")),
+                        ("users", ("created_at",)),
+                        ("post_versions", ("created_at",)),
+                        ("channel_groups", ("created_at",)),
+                    ):
+                        for column in columns:
+                            await cur.execute(
+                                "SELECT COUNT(*) FROM information_schema.columns "
+                                "WHERE table_schema = %s AND table_name = %s AND column_name = %s",
+                                (DB_NAME, table, column),
+                            )
+                            if not (await cur.fetchone())[0]:
+                                continue
+                            await cur.execute(
+                                f"UPDATE {table} SET {column} = "
+                                f"DATE_ADD({column}, INTERVAL %s SECOND) WHERE {column} IS NOT NULL",
+                                (shift,),
+                            )
+                else:
+                    logger.info("Server timezone is UTC; no timestamp rebase needed")
+                await cur.execute(
+                    "INSERT INTO bot_settings (setting_key, setting_value, updated_by) "
+                    "VALUES ('timestamps_utc_migrated', '1', %s)",
+                    (SUDO_USER_ID,),
+                )
+
             await cur.execute("SELECT setting_value FROM bot_settings WHERE setting_key = 'legacy_delivery_migrated'")
             if not await cur.fetchone():
                 # Older releases incorrectly labelled already-published rows as pending.

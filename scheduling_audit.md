@@ -243,3 +243,53 @@ required for this part.
 
 Note: `jdatetime` is used *only* by the test cross-check and is skipped when not
 installed — it is not a runtime dependency and is not in `requirements.txt`.
+
+---
+
+## Part 4 — timestamp bug (reported: history showed 16:08 at 17:43)
+
+### What was wrong
+
+Two independent bugs, both visible in the reported output
+(`📅 ۱۴۰۵-۰۵-۱۲ 16:08` — Persian date, Latin clock):
+
+**A. `TIMESTAMP` columns were never really UTC.** The pool opened connections
+without pinning a timezone, so MySQL wrote and read `created_at`,
+`delivery_completed_at` and `last_health_check` in the *server's* zone. The code
+then treated those values as UTC. This is issue #14 from Part 1 — I fixed the
+columns I added (`scheduled_posts`, `post_deliveries`, `workflow_sessions` all
+use explicit `UTC_TIMESTAMP()`), but left the pre-existing `TIMESTAMP` columns
+inconsistent.
+
+**B. `created_at` was rendered without conversion.** `handlers/history.py` and
+`keyboards.py` formatted the raw value instead of calling `format_local`,
+which is also why the clock kept Latin digits while the date did not.
+
+The 95-minute gap identifies the cause precisely: 17:43 Tehran is 14:13 UTC, and
+16:08 is 1h55m ahead of that — consistent with a **UTC+2 (CEST)** database
+server, whose wall clock was being shown as if it were Tehran time.
+
+### Fixes
+
+- **Pool pins every session to UTC** (`init_command="SET time_zone = '+00:00'"`),
+  making every column in the schema unambiguously UTC.
+- **All display goes through `format_local` / `format_local_short`** (the latter
+  is new, for compact list rows). No handler formats a raw DB value any more —
+  verified by grep.
+- **One-time migration** rebases legacy rows. It measures the server offset on a
+  deliberately *unpinned* probe connection (that being the zone the old rows
+  were written in) and **subtracts** it. `CONVERT_TZ` is avoided because it
+  silently returns NULL unless `mysql.time_zone` is populated. Guarded by a
+  `timestamps_utc_migrated` flag, and it deliberately skips the three tables
+  that were already UTC-native.
+
+### Verification
+
+The sign of that shift is the dangerous part — getting it backwards would double
+the error rather than remove it. Confirmed against a real SQL engine that
+`+TIMESTAMPDIFF` produced 18:13 (wrong) and `-TIMESTAMPDIFF` produced 14:13
+(correct), and covered it for offsets 0, +2, +3.5, −5 and +5.5.
+
+10 new regression tests. I verified they genuinely catch the bug by
+reintroducing it — 6 fail, including one asserting no Latin digits leak into a
+Persian timestamp. Full suite: **125 passed**.

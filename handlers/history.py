@@ -198,10 +198,9 @@ async def handle_post_detail(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     type_labels = {"text": "📝 متن", "photo": "🖼️ عکس", "video": "🎬 ویدیو", "document": "📎 فایل", "media_group": "📦 گروه رسانه"}
     label = type_labels.get(post["post_type"], post["post_type"])
-    # created_at is a DB TIMESTAMP in server-local time, so render the date
-    # directly rather than treating it as UTC.
-    date = (f"{format_local_date(post['created_at'].date())} "
-            f"{post['created_at']:%H:%M}") if post["created_at"] else ""
+    # created_at is stored UTC (the pool pins every session to +00:00), so it
+    # must go through the same conversion as every other timestamp.
+    date = format_local(post["created_at"]) if post["created_at"] else ""
 
     status_labels = {"pending": "⏳ در انتظار", "draft": "💾 پیش‌نویس", "scheduled": "🕒 زمان‌بندی‌شده", "pending_approval": "🔐 در انتظار تأیید", "completed": "✅ کامل", "partial": "⚠️ ناقص", "failed": "❌ ناموفق"}
     delivery_status = status_labels.get(post.get("delivery_status"), "نامشخص")

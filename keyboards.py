@@ -334,18 +334,10 @@ def history_keyboard(posts: list[dict], page: int = 1, total_pages: int = 1, is_
         preview = post.get("text") or post.get("caption") or ""
         if len(preview) > 30:
             preview = preview[:30] + "..."
-        if post["created_at"]:
-            import jalali
-            from utils import USE_JALALI
-            if USE_JALALI:
-                _, jm, jd = jalali.to_jalali(post["created_at"])
-                date = jalali.to_persian_digits(
-                    f"{jm:02d}/{jd:02d} {post['created_at']:%H:%M}"
-                )
-            else:
-                date = post["created_at"].strftime("%m/%d %H:%M")
-        else:
-            date = ""
+        # Stored UTC -> display timezone. Rendering the raw value here showed
+        # history entries in the DB server's zone instead of the user's.
+        from utils import format_local_short
+        date = format_local_short(post["created_at"])
         label = f"{type_icon} {date} | {preview}"
         if is_admin and post.get("user_id"):
             label = f"{type_icon} {date} | {preview}"

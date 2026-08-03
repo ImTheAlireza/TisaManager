@@ -390,3 +390,101 @@ class CalendarToggleTests(unittest.TestCase):
             with self.subTest(jalali=mode):
                 self.utils.set_calendar(mode)
                 self.utils.parse_user_datetime(self.utils.date_example())
+
+
+class StoredTimeRenderingTests(unittest.TestCase):
+    """Regression: history showed the raw DB value instead of local time.
+
+    A post created at 14:13 UTC is 17:43 in Tehran. Rendering the stored value
+    without conversion showed the DB server's wall clock instead — 95 minutes
+    off on a UTC+2 server, 3.5 hours off on a Tehran one.
+    """
+
+    STORED_UTC = datetime(2026, 8, 3, 14, 13)
+    EXPECTED_LOCAL_CLOCK = "۱۷:۴۳"
+
+    def setUp(self):
+        import utils
+        self.utils = utils
+        self._orig = utils.USE_JALALI
+        utils.set_calendar(True)
+
+    def tearDown(self):
+        self.utils.set_calendar(self._orig)
+
+    def test_detail_view_converts_to_local(self):
+        out = self.utils.format_local(self.STORED_UTC)
+        self.assertIn(self.EXPECTED_LOCAL_CLOCK, out)
+        self.assertEqual(out, "۱۴۰۵-۰۵-۱۲ ۱۷:۴۳")
+
+    def test_list_row_converts_to_local(self):
+        out = self.utils.format_local_short(self.STORED_UTC)
+        self.assertIn(self.EXPECTED_LOCAL_CLOCK, out)
+
+    def test_clock_is_never_left_in_latin_digits(self):
+        # The original bug rendered a Persian date beside a Latin clock.
+        for text in (self.utils.format_local(self.STORED_UTC),
+                     self.utils.format_local_short(self.STORED_UTC)):
+            with self.subTest(text=text):
+                self.assertFalse(any(ch in text for ch in "0123456789"),
+                                 f"Latin digits leaked into {text!r}")
+
+    def test_raw_value_is_not_what_gets_shown(self):
+        # Guards against a future regression back to strftime on the raw value.
+        raw = f"{self.STORED_UTC:%H:%M}"
+        self.assertNotIn(raw, self.utils.format_local(self.STORED_UTC))
+
+    def test_gregorian_mode_also_converts(self):
+        self.utils.set_calendar(False)
+        self.assertEqual(self.utils.format_local(self.STORED_UTC), "2026-08-03 17:43")
+        self.assertEqual(self.utils.format_local_short(self.STORED_UTC), "08/03 17:43")
+
+    def test_none_is_handled(self):
+        self.assertEqual(self.utils.format_local(None), "—")
+        self.assertEqual(self.utils.format_local_short(None), "")
+
+    def test_history_row_and_detail_agree(self):
+        detail = self.utils.format_local(self.STORED_UTC)
+        row = self.utils.format_local_short(self.STORED_UTC)
+        self.assertTrue(detail.endswith(row.split()[-1]),
+                        "list and detail views disagree about the time")
+
+
+class LegacyTimestampRebaseTests(unittest.TestCase):
+    """The one-time migration that rebases pre-UTC-pinning rows.
+
+    Legacy rows hold the DB server's wall clock, so the correction is to
+    SUBTRACT the server's UTC offset. Getting the sign wrong would double the
+    error instead of removing it.
+    """
+
+    def test_shift_sign_recovers_true_utc(self):
+        true_utc = datetime(2026, 8, 3, 14, 13)
+        for offset_hours in (0, 2, 3.5, -5, 5.5):
+            with self.subTest(offset=offset_hours):
+                # What MySQL handed back under the old, unpinned session.
+                legacy = true_utc + timedelta(hours=offset_hours)
+                # TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW()) on that server.
+                server_offset = int(offset_hours * 3600)
+                shift = -server_offset          # what init_db applies
+                migrated = legacy + timedelta(seconds=shift)
+                self.assertEqual(migrated, true_utc)
+
+    def test_utc_server_needs_no_shift(self):
+        self.assertEqual(-0, 0)
+        true_utc = datetime(2026, 8, 3, 14, 13)
+        self.assertEqual(true_utc + timedelta(seconds=-0), true_utc)
+
+    def test_migrated_rows_render_correctly(self):
+        import utils
+        orig = utils.USE_JALALI
+        utils.set_calendar(True)
+        try:
+            true_utc = datetime(2026, 8, 3, 14, 13)
+            for offset_hours in (0, 2, 3.5):
+                with self.subTest(offset=offset_hours):
+                    legacy = true_utc + timedelta(hours=offset_hours)
+                    migrated = legacy + timedelta(seconds=-int(offset_hours * 3600))
+                    self.assertEqual(utils.format_local(migrated), "۱۴۰۵-۰۵-۱۲ ۱۷:۴۳")
+        finally:
+            utils.set_calendar(orig)

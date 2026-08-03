@@ -74,6 +74,17 @@ def format_local(utc_dt: datetime, fmt: str = "%Y-%m-%d %H:%M") -> str:
     return local.strftime(fmt)
 
 
+def format_local_short(utc_dt: datetime) -> str:
+    """Compact 'MM/DD HH:MM' for list rows. Input is stored naive UTC."""
+    local = utc_naive_to_local(utc_dt)
+    if not local:
+        return ""
+    if USE_JALALI:
+        _, jm, jd = jalali.to_jalali(local)
+        return jalali.to_persian_digits(f"{jm:02d}/{jd:02d} {local:%H:%M}")
+    return local.strftime("%m/%d %H:%M")
+
+
 def format_local_date(value, long_form: bool = False) -> str:
     """Render a date (already local) for display."""
     if value is None:
