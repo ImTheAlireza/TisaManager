@@ -305,7 +305,63 @@ async def handle_do_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ فقط ادمین اصلی (Sudo) دسترسی دارد.", show_alert=True)
         return
 
-    await query.edit_message_text("🔄 <b>در حال ری‌استارت ربات...</b>\nلطفاً چند لحظه صبر کنید.", parse_mode=ParseMode.HTML)
+    from config import RESTART_DRAIN_TIMEOUT_SECONDS
+    from handlers.post import (
+        user_states, persist_state, inflight_count, wait_for_inflight,
+    )
+
+    # 1. Flush every in-memory workflow to the database so nobody loses the
+    #    post they are composing. The restart handler used to do none of this.
+    saved = 0
+    for uid, state in list(user_states.items()):
+        try:
+            await persist_state(uid, state)
+            saved += 1
+        except Exception:
+            logger.exception("[RESTART] Could not persist workflow for %s", uid)
+
+    # 2. Tell everyone mid-workflow what is happening, so their next message is
+    #    not swallowed silently by a bot that is going down.
+    notified = 0
+    for uid in list(user_states.keys()):
+        if uid == query.from_user.id:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text="⏸ ربات برای چند لحظه ری‌استارت می‌شود.\n"
+                     "کار شما ذخیره شد و پس از بازگشت ادامه خواهد داشت. "
+                     "لطفاً تا اعلام آماده‌باش چیزی نفرستید.",
+            )
+            notified += 1
+        except Exception:
+            logger.debug("[RESTART] Could not notify %s", uid, exc_info=True)
+
+    # 3. Wait for in-flight publishes. Restarting mid-broadcast would leave a
+    #    post delivered to some channels and not others.
+    pending = await inflight_count()
+    if pending:
+        await query.edit_message_text(
+            f"⏳ <b>در انتظار اتمام {pending} ارسال در حال انجام...</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        drained = await wait_for_inflight(RESTART_DRAIN_TIMEOUT_SECONDS)
+        if not drained:
+            remaining = await inflight_count()
+            logger.warning("[RESTART] Proceeding with %d publish(es) still in flight", remaining)
+            await query.edit_message_text(
+                f"⚠️ <b>{remaining} ارسال هنوز تمام نشده است.</b>\n"
+                "ری‌استارت ادامه می‌یابد؛ این پست‌ها پس از بازگشت بازیابی می‌شوند.",
+                parse_mode=ParseMode.HTML,
+            )
+
+    logger.info("[RESTART] Drained. %d workflow(s) saved, %d user(s) notified", saved, notified)
+    await query.edit_message_text(
+        f"🔄 <b>در حال ری‌استارت ربات...</b>\n"
+        f"💾 {saved} عملیات در حال انجام ذخیره شد.\n"
+        "لطفاً چند لحظه صبر کنید.",
+        parse_mode=ParseMode.HTML,
+    )
 
     def _do_restart():
         import time

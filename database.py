@@ -1,7 +1,27 @@
 import asyncio
 import aiomysql
 import json
-from config import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME, SUDO_USER_ID
+from config import (
+    DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME, SUDO_USER_ID,
+    SCHEDULE_CLAIM_TIMEOUT_SECONDS, SCHEDULE_MAX_ATTEMPTS,
+)
+
+# Delivery states a post_history row may hold.
+#   draft            -> saved, never sent
+#   scheduled        -> a scheduled_posts row owns it; must not be published by hand
+#   pending_approval -> waiting for an owner
+#   pending          -> handed to the publisher right now
+#   completed / partial / failed -> terminal delivery outcomes
+DELIVERY_STATUSES = {
+    "draft", "scheduled", "pending_approval", "pending",
+    "completed", "partial", "failed",
+}
+
+# Lifecycle of a scheduled_posts row.
+#   scheduled  -> waiting for run_at
+#   processing -> claimed by a worker right now (crash-recoverable)
+#   completed / failed / cancelled / expired -> terminal
+SCHEDULE_STATUSES = {"scheduled", "processing", "completed", "failed", "cancelled", "expired"}
 
 _pool: aiomysql.Pool | None = None
 
@@ -150,6 +170,8 @@ async def init_db():
                 if not (await cur.fetchone())[0]:
                     await cur.execute(f"CREATE INDEX {index_name} ON post_history ({columns})")
 
+            # All timestamps in this table are naive UTC so they can be compared
+            # against UTC_TIMESTAMP() regardless of the MySQL session timezone.
             await cur.execute("""
                 CREATE TABLE IF NOT EXISTS scheduled_posts (
                     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -158,9 +180,61 @@ async def init_db():
                     run_at DATETIME NOT NULL,
                     status VARCHAR(20) NOT NULL DEFAULT 'scheduled',
                     error TEXT,
-                    processed_at TIMESTAMP NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    attempts INT NOT NULL DEFAULT 0,
+                    claimed_at DATETIME NULL,
+                    processed_at DATETIME NULL,
+                    created_at DATETIME NOT NULL,
                     INDEX idx_scheduled_due (status, run_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """)
+            # Migrations for installs created before claiming/retry existed.
+            for column, definition in (
+                ("attempts", "INT NOT NULL DEFAULT 0"),
+                ("claimed_at", "DATETIME NULL"),
+            ):
+                await cur.execute("""
+                    SELECT COUNT(*) FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = 'scheduled_posts' AND column_name = %s
+                """, (DB_NAME, column))
+                if not (await cur.fetchone())[0]:
+                    await cur.execute(f"ALTER TABLE scheduled_posts ADD COLUMN {column} {definition}")
+            # The due index only ever existed inline in CREATE TABLE, so older
+            # databases never received it.
+            await cur.execute(
+                "SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = %s "
+                "AND table_name = 'scheduled_posts' AND index_name = 'idx_scheduled_due'",
+                (DB_NAME,),
+            )
+            if not (await cur.fetchone())[0]:
+                await cur.execute("CREATE INDEX idx_scheduled_due ON scheduled_posts (status, run_at)")
+
+            # Per-channel delivery outcome. One row per (post, channel) so an
+            # automatic retry can target exactly the channels that failed
+            # instead of re-blasting the ones that already succeeded.
+            await cur.execute("""
+                CREATE TABLE IF NOT EXISTS post_deliveries (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    post_id INT NOT NULL,
+                    channel_id INT NOT NULL,
+                    platform VARCHAR(20) NOT NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    error TEXT,
+                    attempts INT NOT NULL DEFAULT 0,
+                    next_retry_at DATETIME NULL,
+                    updated_at DATETIME NOT NULL,
+                    UNIQUE KEY unique_post_channel (post_id, channel_id),
+                    INDEX idx_delivery_retry (status, next_retry_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """)
+
+            # Interactive workflow state, mirrored out of memory so a restart in
+            # the middle of composing a post does not lose the user's work.
+            await cur.execute("""
+                CREATE TABLE IF NOT EXISTS workflow_sessions (
+                    user_id BIGINT PRIMARY KEY,
+                    kind VARCHAR(40) NOT NULL,
+                    payload MEDIUMTEXT NOT NULL,
+                    updated_at DATETIME NOT NULL
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """)
 
@@ -462,8 +536,17 @@ async def get_analytics():
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             result = {}
-            await cur.execute("SELECT COUNT(*) AS total, SUM(delivery_status = 'completed') AS completed, SUM(delivery_status = 'partial') AS partial, SUM(delivery_status = 'failed') AS failed, SUM(delivery_status = 'draft') AS drafts, SUM(delivery_status = 'pending_approval') AS approvals FROM post_history")
+            await cur.execute(
+                "SELECT COUNT(*) AS total, SUM(delivery_status = 'completed') AS completed, "
+                "SUM(delivery_status = 'partial') AS partial, SUM(delivery_status = 'failed') AS failed, "
+                "SUM(delivery_status = 'draft') AS drafts, SUM(delivery_status = 'pending_approval') AS approvals, "
+                "SUM(delivery_status = 'scheduled') AS scheduled FROM post_history"
+            )
             result["posts"] = await cur.fetchone()
+            await cur.execute(
+                "SELECT COUNT(*) AS total FROM post_deliveries WHERE status = 'failed' AND next_retry_at IS NOT NULL"
+            )
+            result["pending_retries"] = (await cur.fetchone())["total"]
             await cur.execute("SELECT COUNT(*) AS total, SUM(is_active = TRUE) AS active FROM channels")
             result["channels"] = await cur.fetchone()
             await cur.execute("SELECT platform, COUNT(*) AS total FROM channels WHERE is_active = TRUE GROUP BY platform")
@@ -517,7 +600,7 @@ async def update_post_status(post_id: int, status: str):
 
 async def update_post_delivery(post_id: int, status: str, error: str = None):
     """Record the final aggregate delivery result for a post."""
-    if status not in {"pending", "completed", "partial", "failed"}:
+    if status not in DELIVERY_STATUSES:
         raise ValueError(f"Invalid delivery status: {status}")
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -530,29 +613,319 @@ async def update_post_delivery(post_id: int, status: str, error: str = None):
 
 
 async def create_schedule(user_id: int, post_id: int, run_at) -> int:
+    """Queue a post. ``run_at`` must be naive UTC."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO scheduled_posts (user_id, post_id, run_at, status) VALUES (%s, %s, %s, 'scheduled')",
+                "INSERT INTO scheduled_posts (user_id, post_id, run_at, status, created_at) "
+                "VALUES (%s, %s, %s, 'scheduled', UTC_TIMESTAMP())",
                 (user_id, post_id, run_at),
             )
             return cur.lastrowid
 
 
 async def get_due_schedules():
+    """Rows that are due. Read-only: callers must claim before publishing."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute("SELECT * FROM scheduled_posts WHERE status = 'scheduled' AND run_at <= UTC_TIMESTAMP() ORDER BY run_at LIMIT 50")
+            await cur.execute(
+                "SELECT * FROM scheduled_posts WHERE status = 'scheduled' "
+                "AND run_at <= UTC_TIMESTAMP() ORDER BY run_at LIMIT 50"
+            )
             return list(await cur.fetchall())
 
 
-async def update_schedule(schedule_id: int, status: str, error: str = None):
+async def claim_schedule(schedule_id: int) -> bool:
+    """Atomically take ownership of a due row.
+
+    Returns True for exactly one caller. The conditional UPDATE is what stops a
+    second worker — or the same worker after a crash-and-restart — from
+    publishing the same post twice.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
-            await cur.execute("UPDATE scheduled_posts SET status = %s, error = %s, processed_at = CURRENT_TIMESTAMP WHERE id = %s", (status, error, schedule_id))
+            await cur.execute(
+                "UPDATE scheduled_posts SET status = 'processing', claimed_at = UTC_TIMESTAMP(), "
+                "attempts = attempts + 1 WHERE id = %s AND status = 'scheduled'",
+                (schedule_id,),
+            )
+            return cur.rowcount == 1
+
+
+async def reclaim_stale_schedules() -> list[dict]:
+    """Recover rows whose worker died mid-publish.
+
+    A row stuck in 'processing' past the claim timeout goes back to 'scheduled'
+    so it is retried; one that has burned through its attempts is failed so it
+    cannot loop forever. Returns the rows that were abandoned.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT * FROM scheduled_posts WHERE status = 'processing' "
+                "AND claimed_at < UTC_TIMESTAMP() - INTERVAL %s SECOND",
+                (SCHEDULE_CLAIM_TIMEOUT_SECONDS,),
+            )
+            stale = list(await cur.fetchall())
+            if not stale:
+                return []
+            recoverable = [r["id"] for r in stale if r["attempts"] < SCHEDULE_MAX_ATTEMPTS]
+            abandoned = [r for r in stale if r["attempts"] >= SCHEDULE_MAX_ATTEMPTS]
+            if recoverable:
+                await cur.execute(
+                    "UPDATE scheduled_posts SET status = 'scheduled', claimed_at = NULL "
+                    f"WHERE id IN ({','.join(['%s'] * len(recoverable))})",
+                    recoverable,
+                )
+            if abandoned:
+                await cur.execute(
+                    "UPDATE scheduled_posts SET status = 'failed', claimed_at = NULL, "
+                    "processed_at = UTC_TIMESTAMP(), error = 'abandoned after repeated interruptions' "
+                    f"WHERE id IN ({','.join(['%s'] * len(abandoned))})",
+                    [r["id"] for r in abandoned],
+                )
+            return abandoned
+
+
+async def expire_stale_schedules(grace_seconds: int) -> list[dict]:
+    """Retire schedules that are so overdue that publishing them is wrong.
+
+    Without this, a bot that was down for two days publishes every missed post
+    at once when it comes back.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT * FROM scheduled_posts WHERE status = 'scheduled' "
+                "AND run_at < UTC_TIMESTAMP() - INTERVAL %s SECOND",
+                (grace_seconds,),
+            )
+            rows = list(await cur.fetchall())
+            if rows:
+                await cur.execute(
+                    "UPDATE scheduled_posts SET status = 'expired', processed_at = UTC_TIMESTAMP(), "
+                    f"error = 'missed schedule window' WHERE id IN ({','.join(['%s'] * len(rows))})",
+                    [r["id"] for r in rows],
+                )
+            return rows
+
+
+async def update_schedule(schedule_id: int, status: str, error: str = None):
+    if status not in SCHEDULE_STATUSES:
+        raise ValueError(f"Invalid schedule status: {status}")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE scheduled_posts SET status = %s, error = %s, processed_at = UTC_TIMESTAMP() WHERE id = %s",
+                (status, error, schedule_id),
+            )
+
+
+async def get_schedule(schedule_id: int) -> dict | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute("SELECT * FROM scheduled_posts WHERE id = %s", (schedule_id,))
+            return await cur.fetchone()
+
+
+async def get_active_schedule_for_post(post_id: int) -> dict | None:
+    """The open schedule owning this post, if any.
+
+    Used to refuse manual publishing of a post that a job is about to send.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT * FROM scheduled_posts WHERE post_id = %s AND status IN ('scheduled', 'processing') "
+                "ORDER BY run_at LIMIT 1",
+                (post_id,),
+            )
+            return await cur.fetchone()
+
+
+async def get_pending_schedules(user_id: int = None, limit: int = 50) -> list[dict]:
+    """Upcoming schedules, newest run_at first. ``user_id=None`` means all."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            if user_id is None:
+                await cur.execute(
+                    "SELECT s.*, p.post_type, p.text, p.caption FROM scheduled_posts s "
+                    "LEFT JOIN post_history p ON p.id = s.post_id "
+                    "WHERE s.status IN ('scheduled', 'processing') ORDER BY s.run_at LIMIT %s",
+                    (limit,),
+                )
+            else:
+                await cur.execute(
+                    "SELECT s.*, p.post_type, p.text, p.caption FROM scheduled_posts s "
+                    "LEFT JOIN post_history p ON p.id = s.post_id "
+                    "WHERE s.status IN ('scheduled', 'processing') AND s.user_id = %s "
+                    "ORDER BY s.run_at LIMIT %s",
+                    (user_id, limit),
+                )
+            return list(await cur.fetchall())
+
+
+async def cancel_schedule(schedule_id: int) -> bool:
+    """Cancel a schedule that has not been claimed yet.
+
+    Refuses rows already in 'processing' — that publish is in flight and
+    cancelling it would leave a half-sent post.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE scheduled_posts SET status = 'cancelled', processed_at = UTC_TIMESTAMP() "
+                "WHERE id = %s AND status = 'scheduled'",
+                (schedule_id,),
+            )
+            return cur.rowcount == 1
+
+
+async def reschedule(schedule_id: int, run_at) -> bool:
+    """Move an unclaimed schedule to a new naive-UTC time."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE scheduled_posts SET run_at = %s WHERE id = %s AND status = 'scheduled'",
+                (run_at, schedule_id),
+            )
+            return cur.rowcount == 1
+
+
+async def delete_schedules_for_post(post_id: int):
+    """Drop schedule rows for a post that no longer exists."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM scheduled_posts WHERE post_id = %s", (post_id,))
+
+
+# --- Per-channel delivery tracking & automatic retries ---
+
+async def record_delivery(post_id: int, channel_id: int, platform: str, status: str,
+                          error: str = None, next_retry_at=None):
+    """Upsert the outcome for one (post, channel) pair."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO post_deliveries (post_id, channel_id, platform, status, error, attempts, next_retry_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, 1, %s, UTC_TIMESTAMP()) "
+                "ON DUPLICATE KEY UPDATE status = VALUES(status), error = VALUES(error), "
+                "attempts = attempts + 1, next_retry_at = VALUES(next_retry_at), updated_at = UTC_TIMESTAMP()",
+                (post_id, channel_id, platform, status, error, next_retry_at),
+            )
+
+
+async def get_due_retries(limit: int = 50) -> list[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT * FROM post_deliveries WHERE status = 'failed' AND next_retry_at IS NOT NULL "
+                "AND next_retry_at <= UTC_TIMESTAMP() ORDER BY next_retry_at LIMIT %s",
+                (limit,),
+            )
+            return list(await cur.fetchall())
+
+
+async def claim_delivery_retry(delivery_id: int) -> bool:
+    """Atomically take a due retry so two ticks cannot both send it."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE post_deliveries SET status = 'retrying', next_retry_at = NULL, "
+                "updated_at = UTC_TIMESTAMP() WHERE id = %s AND status = 'failed'",
+                (delivery_id,),
+            )
+            return cur.rowcount == 1
+
+
+async def reclaim_stale_retries():
+    """Return retries stranded in 'retrying' by a crash back to 'failed'."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE post_deliveries SET status = 'failed', next_retry_at = UTC_TIMESTAMP() "
+                "WHERE status = 'retrying' AND updated_at < UTC_TIMESTAMP() - INTERVAL %s SECOND",
+                (SCHEDULE_CLAIM_TIMEOUT_SECONDS,),
+            )
+            return cur.rowcount
+
+
+async def get_post_deliveries(post_id: int) -> list[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT d.*, c.name AS channel_name FROM post_deliveries d "
+                "LEFT JOIN channels c ON c.id = d.channel_id WHERE d.post_id = %s ORDER BY d.id",
+                (post_id,),
+            )
+            return list(await cur.fetchall())
+
+
+async def delete_deliveries_for_post(post_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM post_deliveries WHERE post_id = %s", (post_id,))
+
+
+# --- Durable interactive workflow state ---
+
+async def save_workflow_session(user_id: int, kind: str, payload: dict):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO workflow_sessions (user_id, kind, payload, updated_at) "
+                "VALUES (%s, %s, %s, UTC_TIMESTAMP()) "
+                "ON DUPLICATE KEY UPDATE kind = VALUES(kind), payload = VALUES(payload), "
+                "updated_at = UTC_TIMESTAMP()",
+                (user_id, kind, json.dumps(payload, ensure_ascii=False)),
+            )
+
+
+async def load_workflow_sessions(max_age_seconds: int) -> list[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT * FROM workflow_sessions WHERE updated_at >= UTC_TIMESTAMP() - INTERVAL %s SECOND",
+                (max_age_seconds,),
+            )
+            return list(await cur.fetchall())
+
+
+async def delete_workflow_session(user_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM workflow_sessions WHERE user_id = %s", (user_id,))
+
+
+async def purge_workflow_sessions(max_age_seconds: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM workflow_sessions WHERE updated_at < UTC_TIMESTAMP() - INTERVAL %s SECOND",
+                (max_age_seconds,),
+            )
 
 
 async def get_user_posts(user_id: int, limit: int = 10) -> list[dict]:
@@ -650,7 +1023,16 @@ async def update_post_text(post_id: int, text: str):
 
 
 async def delete_post(post_id: int):
+    """Delete a post and everything that references it.
+
+    Without this the post_history row disappears while its scheduled_posts and
+    post_deliveries rows survive, and the jobs later fire on a post that no
+    longer exists.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
+            await cur.execute("DELETE FROM scheduled_posts WHERE post_id = %s", (post_id,))
+            await cur.execute("DELETE FROM post_deliveries WHERE post_id = %s", (post_id,))
+            await cur.execute("DELETE FROM post_versions WHERE post_id = %s", (post_id,))
             await cur.execute("DELETE FROM post_history WHERE id = %s", (post_id,))

@@ -1,11 +1,54 @@
 """Small helpers shared by handlers."""
 
 from html import escape
-
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import time
 
-STATE_TTL_SECONDS = 30 * 60
+try:  # config pulls in python-dotenv, which the unit tests do not install.
+    from config import DISPLAY_TIMEZONE, WORKFLOW_TTL_SECONDS
+except Exception:  # pragma: no cover - fallback for bare test environments
+    DISPLAY_TIMEZONE = "Asia/Tehran"
+    WORKFLOW_TTL_SECONDS = 30 * 60
+
+STATE_TTL_SECONDS = WORKFLOW_TTL_SECONDS
+
+# Single source of truth for the user-facing timezone. Storage is always UTC.
+LOCAL_TZ = ZoneInfo(DISPLAY_TIMEZONE)
+UTC = timezone.utc
+
+
+def now_local() -> datetime:
+    """Timezone-aware 'now' in the display timezone."""
+    return datetime.now(LOCAL_TZ)
+
+
+def local_to_utc_naive(local_dt: datetime) -> datetime:
+    """Convert a display-timezone datetime to the naive UTC we store.
+
+    Accepts naive input (interpreted as local) or aware input. ``fold=0`` keeps
+    the first occurrence of an ambiguous local time during a DST rollback,
+    matching what the user saw on the keyboard.
+    """
+    if local_dt.tzinfo is None:
+        local_dt = local_dt.replace(tzinfo=LOCAL_TZ)
+    return local_dt.astimezone(UTC).replace(tzinfo=None)
+
+
+def utc_naive_to_local(utc_dt: datetime) -> datetime:
+    """Convert a stored naive-UTC datetime back to display-timezone."""
+    if utc_dt is None:
+        return None
+    if utc_dt.tzinfo is None:
+        utc_dt = utc_dt.replace(tzinfo=UTC)
+    return utc_dt.astimezone(LOCAL_TZ)
+
+
+def format_local(utc_dt: datetime, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Render a stored naive-UTC datetime in the display timezone."""
+    local = utc_naive_to_local(utc_dt)
+    return local.strftime(fmt) if local else "—"
 
 # Telegram chat type for one-to-one conversations. Kept as a plain string so
 # this module stays importable without the telegram package (see tests).

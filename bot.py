@@ -77,7 +77,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from config import BOT_TOKEN as _CONFIRM_TOKEN  # noqa: F811
+from config import BOT_TOKEN as _CONFIRM_TOKEN, DISPLAY_TIMEZONE  # noqa: F811
 from database import init_db, close_pool
 from utils import GROUP_NOTICE, is_private_chat, private_actor
 from handlers.start import start
@@ -95,8 +95,22 @@ from handlers.post import (
     handle_schedule_date,
     handle_schedule_hour,
     handle_schedule_minute,
+    handle_schedule_back_date,
+    handle_schedule_back_hour,
+    handle_schedule_noop,
+    handle_legacy_schedule_button,
     process_scheduled_posts,
+    process_delivery_retries,
+    restore_workflow_states,
     handle_any_message,
+)
+from handlers.schedules import (
+    handle_scheduled_list,
+    handle_schedule_view,
+    handle_schedule_cancel,
+    handle_schedule_now,
+    handle_schedule_time_change,
+    handle_reschedule_input,
 )
 from handlers.settings import (
     handle_settings,
@@ -182,9 +196,54 @@ async def notify_online(context):
     except Exception as e:
         logger.error("Failed to send online notification: %s", e)
 
+    # Tell everyone whose workflow survived the restart that they can carry on.
+    # The restart handler asked them to wait, so it has to release them too.
+    from handlers.post import user_states
+    from config import SUDO_USER_ID as _sudo
+    for uid, state in list(user_states.items()):
+        if not state.get("restored"):
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text="🟢 ربات دوباره در دسترس است.\n"
+                     "کار قبلی شما بازیابی شد؛ می‌توانید ادامه دهید. "
+                     "برای شروع دوباره /cancel را بزنید.",
+            )
+        except Exception:
+            logger.debug("Could not notify restored user %s", uid, exc_info=True)
+        state.pop("restored", None)
+
 
 async def shutdown_database(application):
     await close_pool()
+
+
+async def on_error(update, context):
+    """Global error handler.
+
+    Without one, python-telegram-bot only logs ("No error handlers are
+    registered") and the user is left staring at a spinner that never resolves.
+    """
+    logger.error("Unhandled exception while processing update", exc_info=context.error)
+
+    # Always release the button the user pressed, otherwise the client spins.
+    query = getattr(update, "callback_query", None) if update else None
+    if query is not None:
+        try:
+            await query.answer("❌ خطایی رخ داد. دوباره تلاش کنید.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    message = getattr(update, "effective_message", None) if update else None
+    if message is not None:
+        try:
+            await message.reply_text(
+                "❌ خطایی رخ داد. اگر ادامه داشت /cancel را بزنید و دوباره تلاش کنید."
+            )
+        except Exception:
+            pass
 
 
 def main():
@@ -230,10 +289,29 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_channels_done, pattern="^channels_done$"))
     app.add_handler(CallbackQueryHandler(handle_channels_back, pattern="^channels_back$"))
     app.add_handler(CallbackQueryHandler(handle_save_draft, pattern="^save_draft$"))
-    app.add_handler(CallbackQueryHandler(handle_schedule_date, pattern="^schedule_date_(today|tomorrow)$"))
-    app.add_handler(CallbackQueryHandler(handle_schedule_hour, pattern="^schedule_hour_\\d+$"))
-    app.add_handler(CallbackQueryHandler(handle_schedule_minute, pattern="^schedule_minute_\\d+_\\d+$"))
+    # Dates travel as ISO strings so a tapped button is unambiguous even if the
+    # in-memory state has moved on. Order matters: the more specific
+    # "schedule_back_hour_" pattern must be registered before "schedule_hour_".
+    app.add_handler(CallbackQueryHandler(handle_schedule_back_date, pattern="^schedule_back_date$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_back_hour, pattern=r"^schedule_back_hour_\d{4}-\d{2}-\d{2}$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_date, pattern=r"^schedule_date_\d{4}-\d{2}-\d{2}$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_hour, pattern=r"^schedule_hour_\d{4}-\d{2}-\d{2}_\d{1,2}$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_minute, pattern=r"^schedule_minute_\d{4}-\d{2}-\d{2}_\d{1,2}_\d{1,2}$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_noop, pattern="^schedule_noop$"))
+    # Buttons rendered by the previous release are still on users' screens;
+    # absorb them instead of leaving the client spinning. Registered last so it
+    # only ever catches payloads the real handlers above did not match.
+    app.add_handler(CallbackQueryHandler(
+        handle_legacy_schedule_button,
+        pattern=r"^schedule_(date_(today|tomorrow)|hour_\d+|minute_\d+_\d+)$",
+    ))
     app.add_handler(CallbackQueryHandler(handle_schedule_post, pattern="^schedule_post$"))
+    # Managing existing schedules
+    app.add_handler(CallbackQueryHandler(handle_scheduled_list, pattern="^scheduled_list$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_view, pattern=r"^sched_view_\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_cancel, pattern=r"^sched_cancel_\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_now, pattern=r"^sched_now_\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_time_change, pattern=r"^sched_time_\d+$"))
     app.add_handler(CallbackQueryHandler(handle_add_channel, pattern="^add_channel$"))
     app.add_handler(CallbackQueryHandler(handle_add_bale_channel, pattern="^add_bale_channel$"))
     app.add_handler(CallbackQueryHandler(handle_remove_channel, pattern="^remove_\\d+$"))
@@ -247,7 +325,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_stats, pattern="^tools_stats$"))
     app.add_handler(CallbackQueryHandler(handle_health, pattern="^tools_health$"))
     app.add_handler(CallbackQueryHandler(handle_help, pattern="^help$"))
-    app.add_handler(CallbackQueryHandler(handle_help_section, pattern="^help_(publish|roles|settings|tools)$"))
+    app.add_handler(CallbackQueryHandler(handle_help_section, pattern="^help_(publish|schedule|roles|settings|tools)$"))
     app.add_handler(CallbackQueryHandler(handle_approval_settings, pattern="^approval_settings$"))
     app.add_handler(CallbackQueryHandler(handle_toggle_approval, pattern="^toggle_approval$"))
     # User management handlers
@@ -280,6 +358,9 @@ def main():
         # Try user input first
         if await handle_add_user_input(update, context):
             return
+        # Reschedule time entry for an existing schedule
+        if await handle_reschedule_input(update, context):
+            return
         # Try edit input
         if await handle_edit_input(update, context):
             return
@@ -296,16 +377,44 @@ def main():
         MessageHandler(filters.ChatType.PRIVATE & filters.ALL & ~filters.COMMAND, route_message)
     )
 
-    # Initialize database and send online notification
+    app.add_error_handler(on_error)
+
+    # Startup sequence. The periodic jobs are registered *after* init_db has
+    # actually finished rather than on a hopeful 10-second delay — migrations
+    # or a slow/retrying MySQL used to race the first scheduler tick.
     async def initialize_database(context):
         await init_db()
 
+        # Recover interactive workflows that a restart interrupted.
+        try:
+            restored = await restore_workflow_states(context)
+            if restored:
+                logger.info("Restored %d interrupted workflow(s)", restored)
+        except Exception:
+            logger.exception("Workflow restoration failed")
+
+        context.job_queue.run_repeating(
+            process_scheduled_posts, interval=60, first=5, name="scheduled_posts",
+            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
+        )
+        context.job_queue.run_repeating(
+            process_delivery_retries, interval=300, first=60, name="delivery_retries",
+            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 600},
+        )
+        context.job_queue.run_repeating(
+            run_channel_health_checks, interval=900, first=30, name="channel_health",
+            job_kwargs={"max_instances": 1, "coalesce": True},
+        )
+        context.job_queue.run_repeating(daily_report, interval=86400, first=86400, name="daily_report")
+        context.job_queue.run_daily(
+            nightly_backup,
+            time=dt_time(23, 59, tzinfo=ZoneInfo(DISPLAY_TIMEZONE)),
+            name="nightly_backup",
+        )
+        logger.info("Database ready; periodic jobs scheduled")
+
     app.job_queue.run_once(initialize_database, when=0)
-    app.job_queue.run_once(notify_online, when=1)
-    app.job_queue.run_repeating(process_scheduled_posts, interval=60, first=10, name="scheduled_posts")
-    app.job_queue.run_repeating(run_channel_health_checks, interval=900, first=30, name="channel_health")
-    app.job_queue.run_repeating(daily_report, interval=86400, first=86400, name="daily_report")
-    app.job_queue.run_daily(nightly_backup, time=dt_time(23, 59, tzinfo=ZoneInfo("Asia/Tehran")), name="nightly_backup")
+    app.job_queue.run_once(notify_online, when=2)
 
     logger.info("Bot starting...")
     app.run_polling()
