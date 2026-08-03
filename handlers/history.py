@@ -12,9 +12,10 @@ from database import (
     count_user_posts, count_all_posts, get_post, update_post_text, update_post_caption,
     delete_post, is_writer_or_above, is_owner, is_sudo, can_edit_post, can_delete_post,
     get_user_role, has_permission, update_post_status, save_post_version, save_post,
+    get_active_schedule_for_post, cancel_schedule, get_post_deliveries,
 )
 from keyboards import main_menu_keyboard, history_keyboard, post_detail_keyboard, confirm_keyboard
-from utils import html_text, state_is_expired
+from utils import html_text, state_is_expired, format_local, format_local_date
 from handlers.post import publish_existing_post, user_states
 
 logger = logging.getLogger(__name__)
@@ -197,11 +198,30 @@ async def handle_post_detail(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     type_labels = {"text": "📝 متن", "photo": "🖼️ عکس", "video": "🎬 ویدیو", "document": "📎 فایل", "media_group": "📦 گروه رسانه"}
     label = type_labels.get(post["post_type"], post["post_type"])
-    date = post["created_at"].strftime("%Y/%m/%d %H:%M") if post["created_at"] else ""
+    # created_at is stored UTC (the pool pins every session to +00:00), so it
+    # must go through the same conversion as every other timestamp.
+    date = format_local(post["created_at"]) if post["created_at"] else ""
 
-    status_labels = {"pending": "⏳ در انتظار", "draft": "💾 پیش‌نویس", "pending_approval": "🔐 در انتظار تأیید", "completed": "✅ کامل", "partial": "⚠️ ناقص", "failed": "❌ ناموفق"}
+    status_labels = {"pending": "⏳ در انتظار", "draft": "💾 پیش‌نویس", "scheduled": "🕒 زمان‌بندی‌شده", "pending_approval": "🔐 در انتظار تأیید", "completed": "✅ کامل", "partial": "⚠️ ناقص", "failed": "❌ ناموفق"}
     delivery_status = status_labels.get(post.get("delivery_status"), "نامشخص")
-    lines = [f"<b>{label}</b>", f"📅 {date}", f"📤 وضعیت ارسال: {delivery_status}", ""]
+    lines = [f"<b>{label}</b>", f"📅 {date}", f"📤 وضعیت ارسال: {delivery_status}"]
+
+    # Surface the schedule that owns this post, so a "scheduled" status is
+    # never a dead end the user cannot act on.
+    schedule = await get_active_schedule_for_post(post_id)
+    if schedule:
+        lines.append(f"🕒 زمان انتشار: {format_local(schedule['run_at'])} (#{schedule['id']})")
+
+    # Show which channels failed, and whether a retry is queued.
+    deliveries = await get_post_deliveries(post_id)
+    failed_rows = [d for d in deliveries if d["status"] in ("failed", "retrying")]
+    if failed_rows:
+        lines.append(f"❌ ناموفق در {len(failed_rows)} مقصد:")
+        for d in failed_rows[:5]:
+            name = d.get("channel_name") or f"#{d['channel_id']}"
+            when = f" — تلاش بعدی {format_local(d['next_retry_at'])}" if d.get("next_retry_at") else ""
+            lines.append(f"  • {html_text(name)}{when}")
+    lines.append("")
     if post.get("text"):
         lines.append(f"📝 متن:\n{html_text(post['text'])}")
     if post.get("caption"):
@@ -224,10 +244,14 @@ async def handle_post_detail(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(f"\n{' | '.join(parts)}")
 
     text = "\n".join(lines)
+    markup = post_detail_keyboard(
+        post_id, post.get("delivery_status", "completed"),
+        schedule_id=schedule["id"] if schedule else None,
+    )
     try:
-        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=post_detail_keyboard(post_id, post.get("delivery_status", "completed")))
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
     except BadRequest:
-        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=post_detail_keyboard(post_id, post.get("delivery_status", "completed")))
+        await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -250,6 +274,11 @@ async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post = await get_post(post_id)
     if post and post.get("delivery_status") == "draft":
         await query.edit_message_text("❌ پیش‌نویس با این گزینه قابل ویرایش نیست. ابتدا آن را منتشر کنید.")
+        return
+    if post and post.get("delivery_status") == "scheduled":
+        await query.edit_message_text(
+            "❌ پست زمان‌بندی‌شده قابل ویرایش نیست. ابتدا زمان‌بندی را لغو کنید."
+        )
         return
     if not post:
         try:
@@ -334,6 +363,9 @@ async def handle_duplicate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if post and post.get("delivery_status") == "draft":
         await query.edit_message_text("❌ پیش‌نویس قابل کپی نیست. ابتدا آن را منتشر کنید.")
         return
+    if post and post.get("delivery_status") == "scheduled":
+        await query.edit_message_text("❌ پست زمان‌بندی‌شده قابل کپی نیست.")
+        return
     if not post or not await can_edit_post(query.from_user.id, post_id):
         await query.edit_message_text("❌ اجازه کپی این پست را ندارید.")
         return
@@ -341,6 +373,9 @@ async def handle_duplicate(update: Update, context: ContextTypes.DEFAULT_TYPE):
              "file_id": post.get("file_id"), "caption": post.get("caption") or "", "media": _safe_parse_json(post.get("media_json")),
              "selected_channel_ids": _safe_parse_json(post.get("target_channels_json")), "created_at": time.monotonic()}
     user_states[query.from_user.id] = state
+    # Mirror to the DB so a restart does not lose the duplicated draft.
+    from handlers.post import persist_state
+    await persist_state(query.from_user.id, state)
     await query.edit_message_text("📄 کپی پست آماده است. مقصدها و عملیات را انتخاب کنید.", reply_markup=confirm_keyboard())
 
 
@@ -354,6 +389,15 @@ async def handle_publish_draft(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     if not await can_edit_post(query.from_user.id, post_id):
         await query.edit_message_text("❌ شما اجازه انتشار این پیش‌نویس را ندارید.")
+        return
+    # Defence in depth: a post owned by an open schedule must never be
+    # published from here, or it goes out now *and* again when the job fires.
+    active = await get_active_schedule_for_post(post_id)
+    if active:
+        await query.edit_message_text(
+            f"❌ این پست برای {format_local(active['run_at'])} زمان‌بندی شده است.\n"
+            "برای انتشار فوری از «🕒 پست‌های زمان‌بندی‌شده» اقدام کنید.",
+        )
         return
     await update_post_status(post_id, "pending")
     await query.edit_message_text("⏳ در حال انتشار پیش‌نویس...")
@@ -398,6 +442,11 @@ async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if post.get("delivery_status") == "draft":
         await query.edit_message_text("❌ پیش‌نویس را ابتدا با گزینه «انتشار پیش‌نویس» منتشر کنید.")
         return
+    if post.get("delivery_status") == "scheduled" or await get_active_schedule_for_post(post_id):
+        await query.edit_message_text(
+            "❌ این پست زمان‌بندی شده است. تا زمان انتشار، ارسال مجدد ممکن نیست."
+        )
+        return
     # A republish is a new history row, so it can be edited/deleted independently.
     new_id = await save_post(
         query.from_user.id, post["post_type"], text=post.get("text"), file_id=post.get("file_id"),
@@ -435,6 +484,18 @@ async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except BadRequest:
             await query.message.reply_text("❌ پست یافت نشد.", reply_markup=await _menu_kb(query.from_user.id))
         return
+
+    # Stop any pending schedule first, otherwise the job later fires on a post
+    # that no longer exists. A publish already in flight must not be deleted
+    # underneath the worker.
+    active = await get_active_schedule_for_post(post_id)
+    if active:
+        if active["status"] == "processing":
+            await query.answer(
+                "❌ این پست هم‌اکنون در حال ارسال است. بعداً دوباره تلاش کنید.", show_alert=True,
+            )
+            return
+        await cancel_schedule(active["id"])
 
     # Delete messages from all platforms
     msg_ids = _safe_parse_json(post.get("tg_message_ids"))

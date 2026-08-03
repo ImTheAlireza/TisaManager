@@ -5,6 +5,7 @@ def main_menu_keyboard(is_sudo: bool = False, is_owner: bool = False) -> InlineK
     buttons = [
         [InlineKeyboardButton("📝 پست جدید", callback_data="new_post")],
         [InlineKeyboardButton("📋 تاریخچه پست‌ها", callback_data="history")],
+        [InlineKeyboardButton("🕒 پست‌های زمان‌بندی‌شده", callback_data="scheduled_list")],
         [InlineKeyboardButton("🧰 ابزارها", callback_data="tools_menu")],
         [InlineKeyboardButton("❓ راهنمای استفاده", callback_data="help")],
     ]
@@ -44,32 +45,191 @@ def channel_selection_keyboard(channels: list[dict], selected: set[int]) -> Inli
     return InlineKeyboardMarkup(buttons)
 
 
-def schedule_date_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("امروز", callback_data="schedule_date_today"), InlineKeyboardButton("فردا", callback_data="schedule_date_tomorrow")],
-        [InlineKeyboardButton("❌ لغو", callback_data="cancel_post")],
-    ])
+def schedule_date_keyboard(today) -> InlineKeyboardMarkup:
+    """Seven selectable days starting today, labelled on the Persian calendar.
 
+    The callback payload stays an ISO *Gregorian* date, so storage and routing
+    are unaffected by the display calendar — only the label is localised.
+    """
+    from datetime import timedelta
+    import jalali
+    from utils import USE_JALALI
 
-def schedule_hour_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    for start in range(0, 24, 6):
-        rows.append([InlineKeyboardButton(f"{hour:02d}:00", callback_data=f"schedule_hour_{hour}") for hour in range(start, min(start + 6, 24))])
+    labels = {0: "امروز", 1: "فردا", 2: "پس‌فردا"}
+    rows, row = [], []
+    for offset in range(7):
+        day = today + timedelta(days=offset)
+        if USE_JALALI:
+            jy, jm, jd = jalali.to_jalali(day)
+            pretty = f"{jalali.to_persian_digits(jd)} {jalali.MONTH_NAMES[jm]}"
+        else:
+            pretty = f"{day:%m/%d}"
+        label = labels.get(offset) or f"{jalali.weekday_name(day)} {pretty}"
+        row.append(InlineKeyboardButton(label, callback_data=f"schedule_date_{day.isoformat()}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("📅 انتخاب از تقویم", callback_data="schedule_cal")])
     rows.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_post")])
     return InlineKeyboardMarkup(rows)
 
 
-def schedule_minute_keyboard(hour: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{hour:02d}:{minute:02d}", callback_data=f"schedule_minute_{hour}_{minute}") for minute in (0, 15, 30, 45)],
-        [InlineKeyboardButton("❌ لغو", callback_data="cancel_post")],
-    ])
+# Persian week starts on Saturday; date.weekday() has Monday == 0.
+_SATURDAY_FIRST = (5, 6, 0, 1, 2, 3, 4)
+_WEEK_HEADERS = ("ش", "ی", "د", "س", "چ", "پ", "ج")
+
+
+def schedule_calendar_keyboard(jy: int, jm: int, today) -> InlineKeyboardMarkup:
+    """A full Jalali month grid.
+
+    Days before today are rendered as inert dots rather than tappable buttons,
+    so a past date cannot be selected at all.
+    """
+    import jalali
+    from datetime import date
+
+    rows = [[InlineKeyboardButton(h, callback_data="schedule_noop") for h in _WEEK_HEADERS]]
+
+    first = jalali.from_jalali(jy, jm, 1)
+    # Column of the 1st, counting from Saturday.
+    lead = _SATURDAY_FIRST.index(first.weekday())
+    total = jalali.days_in_jalali_month(jy, jm)
+
+    cells = [None] * lead
+    for day in range(1, total + 1):
+        cells.append(day)
+    while len(cells) % 7:
+        cells.append(None)
+
+    for i in range(0, len(cells), 7):
+        row = []
+        for cell in cells[i:i + 7]:
+            if cell is None:
+                row.append(InlineKeyboardButton(" ", callback_data="schedule_noop"))
+                continue
+            g = jalali.from_jalali(jy, jm, cell)
+            if g < today:
+                row.append(InlineKeyboardButton("·", callback_data="schedule_noop"))
+            else:
+                mark = "🔸" if g == today else ""
+                row.append(InlineKeyboardButton(
+                    f"{mark}{jalali.to_persian_digits(cell)}",
+                    callback_data=f"schedule_date_{g.isoformat()}",
+                ))
+        rows.append(row)
+
+    prev_y, prev_m = (jy, jm - 1) if jm > 1 else (jy - 1, 12)
+    next_y, next_m = (jy, jm + 1) if jm < 12 else (jy + 1, 1)
+    # Never offer a month that is entirely in the past.
+    last_of_prev = jalali.from_jalali(prev_y, prev_m, jalali.days_in_jalali_month(prev_y, prev_m))
+    nav = []
+    if last_of_prev >= today:
+        nav.append(InlineKeyboardButton("‹ ماه قبل", callback_data=f"schedule_cal_{prev_y}_{prev_m}"))
+    nav.append(InlineKeyboardButton(
+        f"{jalali.MONTH_NAMES[jm]} {jalali.to_persian_digits(jy)}",
+        callback_data="schedule_noop",
+    ))
+    nav.append(InlineKeyboardButton("ماه بعد ›", callback_data=f"schedule_cal_{next_y}_{next_m}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("◀️ روزهای نزدیک", callback_data="schedule_back_date")])
+    rows.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_post")])
+    return InlineKeyboardMarkup(rows)
+
+
+def schedule_hour_keyboard(date_iso: str, min_hour: int = 0) -> InlineKeyboardMarkup:
+    """Hours for the chosen day, hiding hours that have already passed today."""
+    import jalali
+    from utils import USE_JALALI
+
+    def _n(v):
+        return jalali.to_persian_digits(f"{v:02d}") if USE_JALALI else f"{v:02d}"
+
+    rows, row = [], []
+    for hour in range(min_hour, 24):
+        row.append(InlineKeyboardButton(_n(hour), callback_data=f"schedule_hour_{date_iso}_{hour}"))
+        if len(row) == 6:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if not rows:
+        rows.append([InlineKeyboardButton("امروز ساعتی باقی نمانده", callback_data="schedule_noop")])
+    rows.append([InlineKeyboardButton("◀️ تغییر تاریخ", callback_data="schedule_back_date")])
+    rows.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_post")])
+    return InlineKeyboardMarkup(rows)
+
+
+def schedule_minute_keyboard(date_iso: str, hour: int, allowed_minutes=None) -> InlineKeyboardMarkup:
+    """Five-minute granularity, restricted to minutes still in the future."""
+    import jalali
+    from utils import USE_JALALI
+
+    minutes = allowed_minutes if allowed_minutes is not None else range(0, 60, 5)
+    rows, row = [], []
+    for minute in minutes:
+        label = f"{hour:02d}:{minute:02d}"
+        row.append(InlineKeyboardButton(
+            jalali.to_persian_digits(label) if USE_JALALI else label,
+            callback_data=f"schedule_minute_{date_iso}_{hour}_{minute}",
+        ))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if not rows:
+        rows.append([InlineKeyboardButton("دقیقه‌ای باقی نمانده", callback_data="schedule_noop")])
+    rows.append([InlineKeyboardButton("◀️ تغییر ساعت", callback_data=f"schedule_back_hour_{date_iso}")])
+    rows.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_post")])
+    return InlineKeyboardMarkup(rows)
+
+
+def scheduled_list_keyboard(schedules: list[dict], format_time) -> InlineKeyboardMarkup:
+    """List of upcoming schedules; each row opens its detail view."""
+    buttons = []
+    for s in schedules:
+        preview = (s.get("text") or s.get("caption") or "").strip().replace("\n", " ")
+        if len(preview) > 24:
+            preview = preview[:24] + "…"
+        lock = "🔒 " if s.get("status") == "processing" else ""
+        buttons.append([InlineKeyboardButton(
+            f"{lock}🕒 {format_time(s['run_at'])} | {preview or '#' + str(s['post_id'])}",
+            callback_data=f"sched_view_{s['id']}",
+        )])
+    if not buttons:
+        buttons.append([InlineKeyboardButton("موردی وجود ندارد", callback_data="schedule_noop")])
+    buttons.append([InlineKeyboardButton("◀️ بازگشت", callback_data="back_main")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def scheduled_detail_keyboard(schedule_id: int, post_id: int, locked: bool = False) -> InlineKeyboardMarkup:
+    """Detail view. A claimed ('processing') schedule offers no destructive action."""
+    buttons = []
+    if not locked:
+        buttons.append([
+            InlineKeyboardButton("🕒 تغییر زمان", callback_data=f"sched_time_{schedule_id}"),
+            InlineKeyboardButton("🚫 لغو زمان‌بندی", callback_data=f"sched_cancel_{schedule_id}"),
+        ])
+        buttons.append([InlineKeyboardButton("⚡ انتشار فوری", callback_data=f"sched_now_{schedule_id}")])
+    buttons.append([InlineKeyboardButton("📄 مشاهده پست", callback_data=f"post_{post_id}")])
+    buttons.append([InlineKeyboardButton("◀️ بازگشت", callback_data="scheduled_list")])
+    return InlineKeyboardMarkup(buttons)
 
 
 def approval_settings_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     label = "🔴 خاموش کردن تأیید" if enabled else "🟢 روشن کردن تأیید"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(label, callback_data="toggle_approval")],
+        [InlineKeyboardButton("◀️ بازگشت به تنظیمات", callback_data="settings")],
+    ])
+
+
+def calendar_settings_keyboard(use_jalali: bool) -> InlineKeyboardMarkup:
+    label = "🌍 نمایش میلادی" if use_jalali else "📅 نمایش شمسی"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data="toggle_calendar")],
         [InlineKeyboardButton("◀️ بازگشت به تنظیمات", callback_data="settings")],
     ])
 
@@ -89,6 +249,7 @@ def settings_keyboard(is_sudo_user: bool = False) -> list[list[InlineKeyboardBut
     buttons = [
         [InlineKeyboardButton("📢 مدیریت کانال‌ها", callback_data="manage_channels")],
         [InlineKeyboardButton("🔐 تنظیم تأیید پست‌ها", callback_data="approval_settings")],
+        [InlineKeyboardButton("📅 تقویم نمایش تاریخ", callback_data="calendar_settings")],
     ]
     if is_sudo_user:
         buttons.append([InlineKeyboardButton("🗄️ پشتیبان‌گیری", callback_data="backup_project"), InlineKeyboardButton("♻️ بازیابی", callback_data="restore_project")])
@@ -136,7 +297,8 @@ def users_list_keyboard(users: list[dict]) -> InlineKeyboardMarkup:
     role_labels = {"sudo": "👑 ادمین اصلی", "owner": "⭐ مالک", "writer": "✏️ نویسنده"}
     for u in users:
         role_label = role_labels.get(u["role"], u["role"])
-        name = u.get("name") or str(u["user_id"])
+        from utils import display_name
+        name = display_name(u)
         buttons.append([
             InlineKeyboardButton(f"{name} ({role_label})", callback_data=f"user_info_{u['user_id']}"),
         ])
@@ -173,7 +335,10 @@ def history_keyboard(posts: list[dict], page: int = 1, total_pages: int = 1, is_
         preview = post.get("text") or post.get("caption") or ""
         if len(preview) > 30:
             preview = preview[:30] + "..."
-        date = post["created_at"].strftime("%m/%d %H:%M") if post["created_at"] else ""
+        # Stored UTC -> display timezone. Rendering the raw value here showed
+        # history entries in the DB server's zone instead of the user's.
+        from utils import format_local_short
+        date = format_local_short(post["created_at"])
         label = f"{type_icon} {date} | {preview}"
         if is_admin and post.get("user_id"):
             label = f"{type_icon} {date} | {preview}"
@@ -191,9 +356,17 @@ def history_keyboard(posts: list[dict], page: int = 1, total_pages: int = 1, is_
     return InlineKeyboardMarkup(buttons)
 
 
-def post_detail_keyboard(post_id: int, status: str = "completed") -> InlineKeyboardMarkup:
+def post_detail_keyboard(post_id: int, status: str = "completed", schedule_id: int = None) -> InlineKeyboardMarkup:
     if status == "draft":
         buttons = [[InlineKeyboardButton("✅ انتشار پیش‌نویس", callback_data=f"publish_draft_{post_id}")]]
+    elif status == "scheduled":
+        # A scheduled post must never offer "publish now" here: doing so would
+        # send it once immediately and again when the job fires. Management
+        # goes through the schedule itself.
+        buttons = []
+        if schedule_id:
+            buttons.append([InlineKeyboardButton("🕒 مدیریت زمان‌بندی", callback_data=f"sched_view_{schedule_id}")])
+        buttons.append([InlineKeyboardButton("🗑️ حذف", callback_data=f"delete_{post_id}")])
     elif status == "pending_approval":
         buttons = [[InlineKeyboardButton("✅ تأیید انتشار", callback_data=f"approve_{post_id}")]]
     else:

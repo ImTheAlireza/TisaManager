@@ -8,10 +8,10 @@ from telegram.error import BadRequest
 
 from database import (
     is_sudo, is_owner, add_user, remove_user, get_all_users,
-    get_user_role, update_user_role,
+    get_user_role, update_user_role, get_user,
 )
 from keyboards import users_menu_keyboard, users_list_keyboard, user_detail_keyboard, role_select_keyboard, main_menu_keyboard
-from utils import state_is_expired
+from utils import state_is_expired, display_name, html_text
 
 logger = logging.getLogger(__name__)
 
@@ -158,8 +158,15 @@ async def handle_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role_labels = {"sudo": "👑 ادمین اصلی", "owner": "⭐ مالک", "writer": "✏️ نویسنده"}
     for u in users:
         role_label = role_labels.get(u["role"], u["role"])
-        name = u.get("name") or str(u["user_id"])
-        text += f"• <code>{u['user_id']}</code> — {name} ({role_label})\n"
+        label = display_name(u)
+        # When the bot has never seen the user act, display_name() falls back
+        # to "#id"; printing the id again underneath would just repeat it.
+        if label == f"#{u['user_id']}":
+            text += f"• <code>{u['user_id']}</code> ({role_label})\n"
+            text += "  <i>هنوز نامی ثبت نشده</i>\n"
+        else:
+            text += f"• {html_text(label)} ({role_label})\n"
+            text += f"  <code>{u['user_id']}</code>\n"
 
     await _safe_edit(query, text, reply_markup=users_list_keyboard(users))
 
@@ -186,7 +193,9 @@ async def handle_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role_labels = {"sudo": "👑 ادمین اصلی", "owner": "⭐ مالک", "writer": "✏️ نویسنده"}
     role_label = role_labels.get(role, role)
 
+    profile = await get_user(target_id)
     text = f"<b>اطلاعات کاربر:</b>\n\n"
+    text += f"👤 نام: {html_text(display_name(profile or {'user_id': target_id}))}\n"
     text += f"شناسه: <code>{target_id}</code>\n"
     text += f"نقش: {role_label}\n"
 
