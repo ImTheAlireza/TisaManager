@@ -8,10 +8,10 @@ from telegram.error import BadRequest
 
 from database import (
     is_sudo, is_owner, add_user, remove_user, get_all_users,
-    get_user_role, update_user_role,
+    get_user_role, update_user_role, get_user,
 )
 from keyboards import users_menu_keyboard, users_list_keyboard, user_detail_keyboard, role_select_keyboard, main_menu_keyboard
-from utils import state_is_expired
+from utils import state_is_expired, display_name, html_text
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +186,9 @@ async def handle_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role_labels = {"sudo": "👑 ادمین اصلی", "owner": "⭐ مالک", "writer": "✏️ نویسنده"}
     role_label = role_labels.get(role, role)
 
+    profile = await get_user(target_id)
     text = f"<b>اطلاعات کاربر:</b>\n\n"
+    text += f"👤 نام: {html_text(display_name(profile or {'user_id': target_id}))}\n"
     text += f"شناسه: <code>{target_id}</code>\n"
     text += f"نقش: {role_label}\n"
 

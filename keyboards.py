@@ -297,7 +297,8 @@ def users_list_keyboard(users: list[dict]) -> InlineKeyboardMarkup:
     role_labels = {"sudo": "👑 ادمین اصلی", "owner": "⭐ مالک", "writer": "✏️ نویسنده"}
     for u in users:
         role_label = role_labels.get(u["role"], u["role"])
-        name = u.get("name") or str(u["user_id"])
+        from utils import display_name
+        name = display_name(u)
         buttons.append([
             InlineKeyboardButton(f"{name} ({role_label})", callback_data=f"user_info_{u['user_id']}"),
         ])

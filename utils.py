@@ -183,6 +183,40 @@ def private_actor(update):
     return getattr(update, "effective_user", None)
 
 
+def display_name(row) -> str:
+    """Best human label for a user row: name, then @username, then id.
+
+    Accepts a dict (DB row) or an object with the same attributes. Users are
+    added by numeric id, so ``name`` may be NULL until the bot has seen that
+    person act; falling back through username to id keeps every screen
+    readable instead of showing a bare number.
+    """
+    if row is None:
+        return "—"
+    get = row.get if isinstance(row, dict) else lambda k, d=None: getattr(row, k, d)
+    name = (get("name") or "").strip()
+    username = (get("username") or "").strip().lstrip("@")
+    user_id = get("user_id") or get("id")
+    if name and username:
+        return f"{name} (@{username})"
+    if name:
+        return name
+    if username:
+        return f"@{username}"
+    return f"#{user_id}" if user_id is not None else "—"
+
+
+def telegram_display_name(user) -> str:
+    """Full name from a Telegram User, falling back to @username."""
+    if user is None:
+        return ""
+    full = getattr(user, "full_name", None)
+    if not full:
+        parts = [getattr(user, "first_name", "") or "", getattr(user, "last_name", "") or ""]
+        full = " ".join(p for p in parts if p).strip()
+    return full or (getattr(user, "username", "") or "")
+
+
 GROUP_NOTICE = "⛔️ این ربات فقط در چت خصوصی کار می‌کند."
 
 

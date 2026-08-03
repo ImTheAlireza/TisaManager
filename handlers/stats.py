@@ -21,7 +21,7 @@ from database import (
     get_author_stats, get_schedule_stats, get_failure_breakdown,
     get_channel_health, is_owner, is_writer_or_above, get_user_role,
 )
-from utils import html_text, format_local, format_local_date, now_local
+from utils import html_text, format_local, format_local_date, now_local, display_name
 import jalali
 
 logger = logging.getLogger(__name__)
@@ -142,9 +142,15 @@ def stats_menu_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _back_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
+def _back_keyboard(is_admin: bool, refresh: str = "stats_summary") -> InlineKeyboardMarkup:
+    """Footer for a stats screen.
+
+    ``refresh`` must be the callback of the screen being rendered, otherwise
+    the button silently navigates the user to the summary instead of
+    reloading what they are looking at.
+    """
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 بروزرسانی", callback_data="stats_summary")],
+        [InlineKeyboardButton("🔄 بروزرسانی", callback_data=refresh)],
         [InlineKeyboardButton("◀️ آمار", callback_data="tools_stats")],
     ])
 
@@ -213,13 +219,22 @@ def summary_text(data: dict, is_admin: bool) -> str:
     # per-channel rows rather than the coarse post-level status.
     attempted = int(deliveries.get("attempted") or 0)
     delivered = int(deliveries.get("delivered") or 0)
+    tracked_posts = int(deliveries.get("tracked_posts") or 0)
     if attempted:
-        rate = pct(delivered, attempted)
         lines.append("🎯 <b>کیفیت ارسال</b>")
-        lines.append(f"{bar(delivered, attempted)} {rate}")
-        lines.append(f"موفق: {_fa(delivered)} از {_fa(attempted)} مقصد")
+        lines.append(f"{bar(delivered, attempted)} {pct(delivered, attempted)}")
+        lines.append(f"موفق: {_fa(delivered)} از {_fa(attempted)} ارسال"
+                     f" — در {_fa(tracked_posts)} پست")
+        # Per-destination tracking only began with the retry system, so this
+        # covers fewer posts than the status counts below. Saying so prevents
+        # a confusing "100%" sitting directly above "۴ ناقص".
+        untracked = total - tracked_posts
+        if untracked > 0:
+            lines.append(f"<i>ثبت جزئیات ارسال از زمان فعال‌سازی این قابلیت است؛"
+                         f" {_fa(untracked)} پست قدیمی‌تر در این نسبت نیستند.</i>")
     else:
-        lines.append("🎯 هنوز ارسالی ثبت نشده است.")
+        lines.append("🎯 <b>کیفیت ارسال</b>")
+        lines.append("<i>هنوز ارسالی با جزئیات ثبت نشده است.</i>")
     lines.append("")
 
     lines.append("📋 <b>وضعیت پست‌ها</b>")
@@ -298,7 +313,7 @@ async def handle_stats_summary(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.callback_query.answer()
     scope, is_admin = await _scope_for(user_id)
     data = await get_analytics(scope)
-    await _render(update, summary_text(data, is_admin), _back_keyboard(is_admin))
+    await _render(update, summary_text(data, is_admin), _back_keyboard(is_admin, "stats_summary"))
 
 
 # --- Trend -------------------------------------------------------------------
@@ -368,7 +383,7 @@ async def handle_stats_trend(update: Update, context: ContextTypes.DEFAULT_TYPE)
     scope, is_admin = await _scope_for(user_id)
     daily = await get_daily_counts(14, scope)
     hourly = await get_hourly_distribution(30, scope)
-    await _render(update, trend_text(daily, hourly, is_admin), _back_keyboard(is_admin))
+    await _render(update, trend_text(daily, hourly, is_admin), _back_keyboard(is_admin, "stats_trend"))
 
 
 # --- Channels (admin only) ---------------------------------------------------
@@ -378,6 +393,11 @@ def channels_text(rows, failures, health) -> str:
     if not rows:
         lines.append("هنوز ارسالی ثبت نشده است.")
         return "\n".join(lines)
+
+    # Without this the bar and the "۲/۲" are unexplained; readers assumed the
+    # numbers were posts rather than delivery attempts.
+    lines.append("<i>نوار = نسبت ارسال موفق. عدد = موفق از کل تلاش ارسال.</i>")
+    lines.append("")
 
     health_by_id = {h["id"]: h for h in health}
     # Worst-first ordering from the query means the interesting rows come
@@ -398,8 +418,9 @@ def channels_text(rows, failures, health) -> str:
             status += "⏸"
 
         lines.append(f"{status} {icon} <b>{html_text(row['name'])}</b>")
-        lines.append(f"   <code>{bar(delivered, attempted)}</code> {pct(delivered, attempted)}"
-                     f" — {_fa(delivered)}/{_fa(attempted)}")
+        lines.append(f"   <code>{bar(delivered, attempted)}</code> {pct(delivered, attempted)} موفق")
+        lines.append(f"   ✅ {_fa(delivered)} موفق از {_fa(attempted)} ارسال"
+                     + (f" · ❌ {_fa(failing)} ناموفق" if failing else ""))
 
         # Retries per delivery exposes a channel that "works" but only after
         # repeated attempts, which a success rate alone would hide.
@@ -437,7 +458,7 @@ async def handle_stats_channels(update: Update, context: ContextTypes.DEFAULT_TY
     rows = await get_channel_stats(30)
     failures = await get_failure_breakdown(30)
     health = await get_channel_health()
-    await _render(update, channels_text(rows, failures, health), _back_keyboard(True))
+    await _render(update, channels_text(rows, failures, health), _back_keyboard(True, "stats_channels"))
 
 
 # --- Authors (admin only) ----------------------------------------------------
@@ -456,7 +477,7 @@ def authors_text(rows) -> str:
         total = int(row["total"] or 0)
         completed = int(row["completed"] or 0)
         role = _ROLE_LABELS.get(row.get("role"), "•")
-        lines.append(f"{_fa(i)}. {role} <b>{html_text(row['name'])}</b>")
+        lines.append(f"{_fa(i)}. {role} <b>{html_text(display_name(row))}</b>")
         lines.append(f"   <code>{bar(total, top)}</code> {_fa(total)} پست"
                      f" — موفق {pct(completed, total)}")
         problems = int(row.get("problems") or 0)
@@ -477,7 +498,7 @@ async def handle_stats_authors(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     await update.callback_query.answer()
     rows = await get_author_stats(30)
-    await _render(update, authors_text(rows), _back_keyboard(True))
+    await _render(update, authors_text(rows), _back_keyboard(True, "stats_authors"))
 
 
 # --- Scheduling --------------------------------------------------------------
@@ -533,7 +554,7 @@ async def handle_stats_schedule(update: Update, context: ContextTypes.DEFAULT_TY
         await update.callback_query.answer()
     scope, is_admin = await _scope_for(user_id)
     stats = await get_schedule_stats(30, scope)
-    await _render(update, schedule_text(stats, is_admin), _back_keyboard(is_admin))
+    await _render(update, schedule_text(stats, is_admin), _back_keyboard(is_admin, "stats_schedule"))
 
 
 # --- Daily digest ------------------------------------------------------------

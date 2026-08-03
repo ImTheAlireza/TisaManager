@@ -401,3 +401,177 @@ class RoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefreshButtonTests(unittest.TestCase):
+    """The refresh button must reload the current screen, not jump to summary."""
+
+    def test_each_screen_refreshes_itself(self):
+        for callback in ("stats_summary", "stats_trend", "stats_channels",
+                         "stats_authors", "stats_schedule"):
+            with self.subTest(screen=callback):
+                markup = stats._back_keyboard(True, callback)
+                payloads = [b.callback_data
+                            for row in markup.inline_keyboard for b in row]
+                self.assertIn(callback, payloads)
+
+    def test_handlers_pass_their_own_callback(self):
+        # Guards against a handler falling back to the default and silently
+        # navigating the user away from the page they were reading.
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        source = open(os.path.join(root, "handlers", "stats.py"), encoding="utf-8").read()
+        # Admin-only screens pass True; scoped screens pass is_admin.
+        for callback in ("stats_summary", "stats_trend", "stats_channels",
+                         "stats_authors", "stats_schedule"):
+            with self.subTest(screen=callback):
+                self.assertTrue(
+                    f'_back_keyboard(True, "{callback}")' in source
+                    or f'_back_keyboard(is_admin, "{callback}")' in source,
+                    f"{callback} does not refresh itself")
+
+
+class DeliveryCoverageTests(unittest.TestCase):
+    """A 100% delivery rate must not silently contradict the status counts.
+
+    post_deliveries only has rows for posts published after per-channel
+    tracking was added, so it describes a smaller population than
+    post_history. The UI has to say so.
+    """
+
+    def _data(self, tracked_posts, total, **over):
+        base = {
+            "posts": {"total": total, "completed": 56, "partial": 4, "failed": 0,
+                      "drafts": 0, "scheduled": 0, "approvals": 0},
+            "windows": {"last_24h": 3, "prev_24h": 5, "last_7d": 20,
+                        "prev_7d": 18, "last_30d": 55},
+            "types": [], "pending_retries": 0, "channels": {}, "platforms": [],
+            "deliveries": {"attempted": 12, "delivered": 12, "failing": 0,
+                           "tracked_posts": tracked_posts},
+        }
+        base.update(over)
+        return base
+
+    def test_explains_untracked_posts(self):
+        out = stats.summary_text(self._data(6, 60), True)
+        self.assertIn("۵۴", out)          # 60 - 6 untracked
+        self.assertIn("قدیمی‌تر", out)
+
+    def test_no_note_when_everything_is_tracked(self):
+        out = stats.summary_text(self._data(60, 60), True)
+        self.assertNotIn("قدیمی‌تر", out)
+
+    def test_labels_deliveries_not_posts(self):
+        # "۱۲ از ۱۲ مقصد" read as posts; it is delivery attempts.
+        out = stats.summary_text(self._data(6, 60), True)
+        self.assertIn("ارسال", out)
+
+    def test_empty_delivery_table_is_explained(self):
+        data = self._data(0, 60, deliveries={})
+        out = stats.summary_text(data, True)
+        self.assertIn("کیفیت ارسال", out)
+        self.assertIn("ثبت نشده", out)
+
+
+class ChannelLegendTests(unittest.TestCase):
+    """The bar and the bare "2/2" needed explaining."""
+
+    def _row(self, **over):
+        base = {"channel_id": 1, "platform": "telegram", "name": "کانال",
+                "is_active": 1, "last_health_status": "healthy",
+                "attempted": 2, "delivered": 2, "failing": 0,
+                "total_attempts": 2, "last_error": None,
+                "last_activity": datetime(2026, 8, 3)}
+        base.update(over)
+        return base
+
+    def test_legend_is_present(self):
+        out = stats.channels_text([self._row()], [], [])
+        self.assertIn("نوار = نسبت ارسال موفق", out)
+
+    def test_numbers_are_labelled(self):
+        out = stats.channels_text([self._row()], [], [])
+        self.assertIn("موفق از", out)
+        self.assertIn("ارسال", out)
+
+    def test_failures_are_called_out(self):
+        out = stats.channels_text(
+            [self._row(attempted=10, delivered=8, failing=2)], [], [])
+        self.assertIn("۲ ناموفق", out)
+
+
+class DisplayNameTests(unittest.TestCase):
+    """Users are added by id, so every screen must degrade gracefully."""
+
+    def setUp(self):
+        from utils import display_name
+        self.display_name = display_name
+
+    def test_name_and_username(self):
+        self.assertEqual(
+            self.display_name({"name": "علی", "username": "ali", "user_id": 7}),
+            "علی (@ali)")
+
+    def test_name_only(self):
+        self.assertEqual(
+            self.display_name({"name": "علی", "username": None, "user_id": 7}), "علی")
+
+    def test_username_only(self):
+        self.assertEqual(
+            self.display_name({"name": None, "username": "ali", "user_id": 7}), "@ali")
+
+    def test_falls_back_to_id(self):
+        self.assertEqual(
+            self.display_name({"name": None, "username": None, "user_id": 7}), "#7")
+
+    def test_handles_none_row(self):
+        self.assertEqual(self.display_name(None), "—")
+
+    def test_strips_leading_at_from_username(self):
+        self.assertEqual(
+            self.display_name({"name": None, "username": "@ali", "user_id": 7}), "@ali")
+
+    def test_ignores_blank_strings(self):
+        self.assertEqual(
+            self.display_name({"name": "  ", "username": "", "user_id": 7}), "#7")
+
+    def test_accepts_object_rows(self):
+        import types as _t
+        row = _t.SimpleNamespace(name="مریم", username=None, user_id=9)
+        self.assertEqual(self.display_name(row), "مریم")
+
+    def test_authors_screen_uses_display_name(self):
+        rows = [{"user_id": 7, "name": None, "username": "ali", "role": "writer",
+                 "total": 3, "completed": 3, "problems": 0, "last_post": None}]
+        self.assertIn("@ali", stats.authors_text(rows))
+
+    def test_authors_screen_falls_back_to_id(self):
+        rows = [{"user_id": 7, "name": None, "username": None, "role": "writer",
+                 "total": 3, "completed": 3, "problems": 0, "last_post": None}]
+        self.assertIn("#7", stats.authors_text(rows))
+
+
+class TelegramNameTests(unittest.TestCase):
+    def setUp(self):
+        from utils import telegram_display_name
+        self.fn = telegram_display_name
+
+    def test_prefers_full_name(self):
+        import types as _t
+        self.assertEqual(
+            self.fn(_t.SimpleNamespace(full_name="علی رضایی", username="ali")),
+            "علی رضایی")
+
+    def test_builds_from_parts(self):
+        import types as _t
+        user = _t.SimpleNamespace(full_name=None, first_name="علی",
+                                  last_name="رضایی", username=None)
+        self.assertEqual(self.fn(user), "علی رضایی")
+
+    def test_falls_back_to_username(self):
+        import types as _t
+        user = _t.SimpleNamespace(full_name=None, first_name=None,
+                                  last_name=None, username="ali")
+        self.assertEqual(self.fn(user), "ali")
+
+    def test_handles_none(self):
+        self.assertEqual(self.fn(None), "")

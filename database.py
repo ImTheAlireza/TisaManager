@@ -150,10 +150,22 @@ async def init_db():
                     user_id BIGINT NOT NULL UNIQUE,
                     role VARCHAR(20) NOT NULL DEFAULT 'writer',
                     name VARCHAR(255),
+                    username VARCHAR(255),
                     added_by BIGINT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """)
+            # Migration: profile fields. Users were added by numeric id only,
+            # so every screen showed a bare number; these columns let the bot
+            # cache the Telegram profile name and @username.
+            for column, definition in (("name", "VARCHAR(255)"), ("username", "VARCHAR(255)")):
+                await cur.execute("""
+                    SELECT COUNT(*) FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = 'users' AND column_name = %s
+                """, (DB_NAME, column))
+                if not (await cur.fetchone())[0]:
+                    await cur.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+
             # Migration: migrate admins table to users
             await cur.execute("SHOW TABLES LIKE 'admins'")
             if await cur.fetchone():
@@ -423,8 +435,45 @@ async def get_all_users() -> list[dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute("SELECT user_id, role, name, created_at FROM users ORDER BY FIELD(role, 'sudo', 'owner', 'writer')")
+            await cur.execute("SELECT user_id, role, name, username, created_at FROM users ORDER BY FIELD(role, 'sudo', 'owner', 'writer')")
             return list(await cur.fetchall())
+
+
+async def get_user(user_id: int) -> dict | None:
+    """Full user row, for screens that want a display name."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT user_id, role, name, username, added_by, created_at "
+                "FROM users WHERE user_id = %s", (user_id,),
+            )
+            return await cur.fetchone()
+
+
+async def update_user_profile(user_id: int, name: str = None, username: str = None):
+    """Cache a Telegram profile on an existing user row.
+
+    Called opportunistically whenever we see the user act, so display names
+    stay current without an extra API call per render. Only overwrites with
+    non-empty values so a transient blank never wipes a good name.
+    """
+    sets, params = [], []
+    if name:
+        sets.append("name = %s")
+        params.append(name[:255])
+    if username:
+        sets.append("username = %s")
+        params.append(username[:255])
+    if not sets:
+        return
+    params.append(user_id)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"UPDATE users SET {', '.join(sets)} WHERE user_id = %s", params,
+            )
 
 
 async def get_user_name(user_id: int) -> str | None:
@@ -673,7 +722,11 @@ async def get_analytics(user_id: int = None):
             await cur.execute(
                 "SELECT COUNT(*) AS attempted, "
                 "SUM(d.status = 'completed') AS delivered, "
-                "SUM(d.status IN ('failed', 'retrying')) AS failing "
+                "SUM(d.status IN ('failed', 'retrying')) AS failing, "
+                # How many distinct posts have per-destination rows at all.
+                # Per-channel tracking started with the retry system, so this
+                # is smaller than the post count and the UI must say so.
+                "COUNT(DISTINCT d.post_id) AS tracked_posts "
                 "FROM post_deliveries d JOIN post_history p ON p.id = d.post_id "
                 f"WHERE 1=1{scope}", params,
             )
@@ -766,14 +819,13 @@ async def get_author_stats(days: int = 30, limit: int = 10) -> list[dict]:
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
-                "SELECT p.user_id, COALESCE(u.name, CONCAT('#', p.user_id)) AS name, "
-                "u.role, COUNT(*) AS total, "
+                "SELECT p.user_id, u.name, u.username, u.role, COUNT(*) AS total, "
                 "SUM(p.delivery_status = 'completed') AS completed, "
                 "SUM(p.delivery_status IN ('failed', 'partial')) AS problems, "
                 "MAX(p.created_at) AS last_post "
                 "FROM post_history p LEFT JOIN users u ON u.user_id = p.user_id "
                 "WHERE p.created_at >= UTC_TIMESTAMP() - INTERVAL %s DAY "
-                "GROUP BY p.user_id, u.name, u.role ORDER BY total DESC LIMIT %s",
+                "GROUP BY p.user_id, u.name, u.username, u.role ORDER BY total DESC LIMIT %s",
                 (days, limit),
             )
             return list(await cur.fetchall())

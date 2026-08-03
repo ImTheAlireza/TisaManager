@@ -79,7 +79,7 @@ from telegram.constants import ParseMode
 
 from config import BOT_TOKEN as _CONFIRM_TOKEN, DISPLAY_TIMEZONE  # noqa: F811
 from database import init_db, close_pool
-from utils import GROUP_NOTICE, is_private_chat, private_actor
+from utils import GROUP_NOTICE, is_private_chat, private_actor, telegram_display_name
 from handlers.start import start
 from handlers.post import (
     handle_confirm_post,
@@ -193,6 +193,32 @@ async def block_non_private(update, context):
     raise ApplicationHandlerStop
 
 
+async def remember_profile(update, context):
+    """Cache the acting user's Telegram profile.
+
+    Users are added by numeric id, so without this every screen shows a bare
+    number. Runs in its own handler group so it never blocks real handlers,
+    and only touches the DB when the cached values are actually stale.
+    """
+    user = getattr(update, "effective_user", None)
+    if user is None or user.is_bot:
+        return
+    name = telegram_display_name(user)
+    username = getattr(user, "username", None)
+    if not name and not username:
+        return
+    cache = context.application.bot_data.setdefault("_profile_cache", {})
+    if cache.get(user.id) == (name, username):
+        return
+    cache[user.id] = (name, username)
+    try:
+        from database import update_user_profile
+        await update_user_profile(user.id, name=name, username=username)
+    except Exception:
+        logger.debug("Could not cache profile for %s", user.id, exc_info=True)
+
+
+
 async def notify_online(context):
     try:
         from config import SUDO_USER_ID
@@ -265,6 +291,9 @@ def main():
     # handler raises ApplicationHandlerStop, so nothing below can ever be reached
     # from a group, supergroup or channel — commands and inline buttons included.
     app.add_handler(TypeHandler(Update, block_non_private), group=-1)
+    # Group -2 runs before the private-chat gate's ApplicationHandlerStop, but
+    # profile capture is harmless for group updates and keeps names fresh.
+    app.add_handler(TypeHandler(Update, remember_profile), group=-2)
 
     # Command handlers
     app.add_handler(CommandHandler("start", start))
