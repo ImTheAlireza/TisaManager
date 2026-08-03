@@ -304,3 +304,66 @@ bot restarts on the new code, every read still returns server-local time.
 
 10 regression tests, verified to fail when the pin is removed.
 Full suite: **128 passed**.
+
+---
+
+## Part 5 — statistics
+
+### What was there
+
+A single flat block of all-time counters, identical for `/stats` and the daily
+report — so the "daily" report said nothing about the day.
+
+Problems found:
+
+- **A dead query.** `get_analytics()` fetched the top-5 authors on every call
+  and `_analytics_text()` never rendered it.
+- **Owner-only**, so writers had no feedback on their own posts.
+- **All-time totals only.** `142 posts` only ever grows; no window, no trend.
+- **`post_deliveries` was invisible** — the per-channel table built during the
+  retry work, and the only place that knows *which* destination fails and why.
+- **`scheduled_posts` was invisible** — no on-time rate, no missed count.
+- `NOW()` in the 24h query while everything else used `UTC_TIMESTAMP()`.
+
+### What it is now
+
+A menu — خلاصه / روند / کانال‌ها / نویسندگان / زمان‌بندی — in `handlers/stats.py`.
+
+- **خلاصه** — today/7d/30d each with a delta against the previous period, a
+  delivery-quality bar computed from per-channel rows, content-type breakdown,
+  and a "نیازمند توجه" section collecting anything actionable.
+- **روند** — 14-day sparkline, per-day volume bars for the last week, quiet-day
+  count, daily average, and an hour-of-day histogram. Block characters only, so
+  no image dependency.
+- **کانال‌ها** — per-channel success rate, worst first, with the real error
+  text and an average-attempts figure that exposes a channel which only
+  delivers after repeated retries. Plus the most common failure reasons.
+- **نویسندگان** — finally renders the previously dead query, with per-author
+  success rates.
+- **زمان‌بندی** — on-time rate, missed/expired/cancelled, and average execution
+  delay (annotated as normal when it is within the 60s tick).
+
+**Scoped access:** owners and sudo see everything; writers see only their own
+posts. Enforced by passing `user_id` into the SQL, not by hiding buttons, since
+callback data can be replayed.
+
+**Daily report** is now a real digest: today vs yesterday, a 7-day sparkline,
+channels that failed today, and what is queued.
+
+### Bugs found and fixed while building
+
+- **Bars overstated success.** `round()` made 96% render as a full bar, reading
+  as "everything is fine" while 16 destinations had failed. The last block is
+  now reserved until the ratio is genuinely 100%.
+- **Weekly bars encoded the wrong dimension.** They showed completion ratio, so
+  a 15-post day and a 3-post day looked identical. They now scale to volume,
+  with failures annotated separately.
+- **Messages could exceed Telegram's 4096-character limit** and raise
+  `BadRequest` — a 25-channel install produced 5211 characters. Lists are now
+  capped with an "and N more" line and every render is clipped on a line
+  boundary as a backstop.
+- **An RTL-ambiguous axis label** (`۰۰ ← → ۲۳`) was replaced with explicit text.
+- `NOW()` replaced with `UTC_TIMESTAMP()` for consistency with the pinned
+  sessions.
+
+`tests/test_stats.py` adds 59 cases. Full suite: **187 passed**.

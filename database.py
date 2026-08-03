@@ -586,31 +586,252 @@ async def update_channel_health(channel_id: int, status: str, error: str = None)
             await cur.execute("UPDATE channels SET last_health_status = %s, last_health_error = %s, last_health_check = CURRENT_TIMESTAMP WHERE id = %s", (status, error, channel_id))
 
 
-async def get_analytics():
+def _scope_clause(user_id, alias="p"):
+    """WHERE fragment restricting rows to one author, or everything.
+
+    ``user_id=None`` means an owner/sudo view. Returns (sql, params) so callers
+    can splice it into a larger query without string-formatting user input.
+    """
+    if user_id is None:
+        return "", []
+    return f" AND {alias}.user_id = %s", [user_id]
+
+
+async def get_analytics(user_id: int = None):
+    """Headline counters. ``user_id`` scopes everything to one author.
+
+    All windows are computed against UTC_TIMESTAMP(): sessions are pinned to
+    UTC (see get_pool), so mixing in NOW() would silently drift if that ever
+    changed.
+    """
+    scope, params = _scope_clause(user_id)
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             result = {}
             await cur.execute(
-                "SELECT COUNT(*) AS total, SUM(delivery_status = 'completed') AS completed, "
-                "SUM(delivery_status = 'partial') AS partial, SUM(delivery_status = 'failed') AS failed, "
-                "SUM(delivery_status = 'draft') AS drafts, SUM(delivery_status = 'pending_approval') AS approvals, "
-                "SUM(delivery_status = 'scheduled') AS scheduled FROM post_history"
+                "SELECT COUNT(*) AS total, "
+                "SUM(delivery_status = 'completed') AS completed, "
+                "SUM(delivery_status = 'partial') AS partial, "
+                "SUM(delivery_status = 'failed') AS failed, "
+                "SUM(delivery_status = 'draft') AS drafts, "
+                "SUM(delivery_status = 'pending_approval') AS approvals, "
+                "SUM(delivery_status = 'scheduled') AS scheduled "
+                f"FROM post_history p WHERE 1=1{scope}", params,
             )
             result["posts"] = await cur.fetchone()
+
+            # Rolling windows, plus the previous period so the UI can show a
+            # delta instead of a context-free number.
             await cur.execute(
-                "SELECT COUNT(*) AS total FROM post_deliveries WHERE status = 'failed' AND next_retry_at IS NOT NULL"
+                "SELECT "
+                "SUM(created_at >= UTC_TIMESTAMP() - INTERVAL 24 HOUR) AS last_24h, "
+                "SUM(created_at >= UTC_TIMESTAMP() - INTERVAL 48 HOUR "
+                "    AND created_at < UTC_TIMESTAMP() - INTERVAL 24 HOUR) AS prev_24h, "
+                "SUM(created_at >= UTC_TIMESTAMP() - INTERVAL 7 DAY) AS last_7d, "
+                "SUM(created_at >= UTC_TIMESTAMP() - INTERVAL 14 DAY "
+                "    AND created_at < UTC_TIMESTAMP() - INTERVAL 7 DAY) AS prev_7d, "
+                "SUM(created_at >= UTC_TIMESTAMP() - INTERVAL 30 DAY) AS last_30d "
+                f"FROM post_history p WHERE 1=1{scope}", params,
             )
-            result["pending_retries"] = (await cur.fetchone())["total"]
-            await cur.execute("SELECT COUNT(*) AS total, SUM(is_active = TRUE) AS active FROM channels")
-            result["channels"] = await cur.fetchone()
-            await cur.execute("SELECT platform, COUNT(*) AS total FROM channels WHERE is_active = TRUE GROUP BY platform")
-            result["platforms"] = list(await cur.fetchall())
-            await cur.execute("SELECT user_id, COUNT(*) AS total FROM post_history GROUP BY user_id ORDER BY total DESC LIMIT 5")
-            result["authors"] = list(await cur.fetchall())
-            await cur.execute("SELECT COUNT(*) AS total FROM post_history WHERE created_at >= NOW() - INTERVAL 24 HOUR")
-            result["last_24h"] = (await cur.fetchone())["total"]
+            windows = await cur.fetchone() or {}
+            result["windows"] = {k: int(v or 0) for k, v in windows.items()}
+            result["last_24h"] = result["windows"].get("last_24h", 0)
+
+            await cur.execute(
+                "SELECT post_type, COUNT(*) AS total FROM post_history p "
+                f"WHERE 1=1{scope} GROUP BY post_type ORDER BY total DESC", params,
+            )
+            result["types"] = list(await cur.fetchall())
+
+            if user_id is None:
+                await cur.execute(
+                    "SELECT COUNT(*) AS total FROM post_deliveries "
+                    "WHERE status = 'failed' AND next_retry_at IS NOT NULL"
+                )
+                result["pending_retries"] = (await cur.fetchone())["total"]
+                await cur.execute("SELECT COUNT(*) AS total, SUM(is_active = TRUE) AS active FROM channels")
+                result["channels"] = await cur.fetchone()
+                await cur.execute(
+                    "SELECT platform, COUNT(*) AS total FROM channels "
+                    "WHERE is_active = TRUE GROUP BY platform"
+                )
+                result["platforms"] = list(await cur.fetchall())
+            else:
+                await cur.execute(
+                    "SELECT COUNT(*) AS total FROM post_deliveries d "
+                    "JOIN post_history p ON p.id = d.post_id "
+                    "WHERE d.status = 'failed' AND d.next_retry_at IS NOT NULL "
+                    "AND p.user_id = %s", (user_id,),
+                )
+                result["pending_retries"] = (await cur.fetchone())["total"]
+                result["channels"] = {}
+                result["platforms"] = []
+
+            # Per-channel delivery truth, aggregated. This is the table that
+            # actually knows which destination is unhealthy.
+            await cur.execute(
+                "SELECT COUNT(*) AS attempted, "
+                "SUM(d.status = 'completed') AS delivered, "
+                "SUM(d.status IN ('failed', 'retrying')) AS failing "
+                "FROM post_deliveries d JOIN post_history p ON p.id = d.post_id "
+                f"WHERE 1=1{scope}", params,
+            )
+            result["deliveries"] = await cur.fetchone() or {}
             return result
+
+
+async def get_daily_counts(days: int = 14, user_id: int = None) -> list[dict]:
+    """Posts per calendar day (UTC), oldest first, with gaps filled as zero.
+
+    Gap filling matters: a sparkline built from only the days that have rows
+    would silently compress quiet periods and misrepresent the trend.
+    """
+    from datetime import datetime, timedelta
+
+    scope, params = _scope_clause(user_id)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT DATE(created_at) AS day, COUNT(*) AS total, "
+                "SUM(delivery_status = 'completed') AS completed "
+                "FROM post_history p "
+                f"WHERE created_at >= UTC_TIMESTAMP() - INTERVAL %s DAY{scope} "
+                "GROUP BY DATE(created_at) ORDER BY day",
+                [days] + params,
+            )
+            rows = {r["day"]: r for r in await cur.fetchall()}
+
+    today = datetime.utcnow().date()
+    out = []
+    for offset in range(days - 1, -1, -1):
+        day = today - timedelta(days=offset)
+        row = rows.get(day)
+        out.append({
+            "day": day,
+            "total": int(row["total"]) if row else 0,
+            "completed": int(row["completed"] or 0) if row else 0,
+        })
+    return out
+
+
+async def get_hourly_distribution(days: int = 30, user_id: int = None) -> list[int]:
+    """Posts per hour-of-day (UTC) over the window; 24 buckets."""
+    scope, params = _scope_clause(user_id)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT HOUR(created_at) AS h, COUNT(*) AS total FROM post_history p "
+                f"WHERE created_at >= UTC_TIMESTAMP() - INTERVAL %s DAY{scope} "
+                "GROUP BY HOUR(created_at)",
+                [days] + params,
+            )
+            rows = {int(r["h"]): int(r["total"]) for r in await cur.fetchall()}
+    return [rows.get(h, 0) for h in range(24)]
+
+
+async def get_channel_stats(days: int = 30) -> list[dict]:
+    """Per-channel delivery performance, worst first.
+
+    Joins post_deliveries (the per-destination record written by the publisher)
+    against channels so a removed channel still reports under a readable name.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT d.channel_id, d.platform, "
+                "COALESCE(c.name, CONCAT('#', d.channel_id)) AS name, "
+                "c.is_active, c.last_health_status, "
+                "COUNT(*) AS attempted, "
+                "SUM(d.status = 'completed') AS delivered, "
+                "SUM(d.status IN ('failed', 'retrying')) AS failing, "
+                "SUM(d.attempts) AS total_attempts, "
+                "MAX(CASE WHEN d.status IN ('failed', 'retrying') THEN d.error END) AS last_error, "
+                "MAX(d.updated_at) AS last_activity "
+                "FROM post_deliveries d LEFT JOIN channels c ON c.id = d.channel_id "
+                "WHERE d.updated_at >= UTC_TIMESTAMP() - INTERVAL %s DAY "
+                "GROUP BY d.channel_id, d.platform, c.name, c.is_active, c.last_health_status "
+                "ORDER BY failing DESC, attempted DESC",
+                (days,),
+            )
+            return list(await cur.fetchall())
+
+
+async def get_author_stats(days: int = 30, limit: int = 10) -> list[dict]:
+    """Per-author volume and success rate over the window."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT p.user_id, COALESCE(u.name, CONCAT('#', p.user_id)) AS name, "
+                "u.role, COUNT(*) AS total, "
+                "SUM(p.delivery_status = 'completed') AS completed, "
+                "SUM(p.delivery_status IN ('failed', 'partial')) AS problems, "
+                "MAX(p.created_at) AS last_post "
+                "FROM post_history p LEFT JOIN users u ON u.user_id = p.user_id "
+                "WHERE p.created_at >= UTC_TIMESTAMP() - INTERVAL %s DAY "
+                "GROUP BY p.user_id, u.name, u.role ORDER BY total DESC LIMIT %s",
+                (days, limit),
+            )
+            return list(await cur.fetchall())
+
+
+async def get_schedule_stats(days: int = 30, user_id: int = None) -> dict:
+    """Scheduling reliability: how many fired, missed, or are still queued."""
+    scope, params = _scope_clause(user_id, alias="s")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(s.status = 'completed') AS completed, "
+                "SUM(s.status = 'failed') AS failed, "
+                "SUM(s.status = 'cancelled') AS cancelled, "
+                "SUM(s.status = 'expired') AS expired, "
+                "SUM(s.status IN ('scheduled', 'processing')) AS pending "
+                "FROM scheduled_posts s "
+                f"WHERE s.created_at >= UTC_TIMESTAMP() - INTERVAL %s DAY{scope}",
+                [days] + params,
+            )
+            stats = await cur.fetchone() or {}
+
+            # Median lateness of schedules that actually ran, in seconds.
+            await cur.execute(
+                "SELECT AVG(TIMESTAMPDIFF(SECOND, s.run_at, s.processed_at)) AS avg_delay "
+                "FROM scheduled_posts s WHERE s.status = 'completed' "
+                "AND s.processed_at IS NOT NULL "
+                f"AND s.created_at >= UTC_TIMESTAMP() - INTERVAL %s DAY{scope}",
+                [days] + params,
+            )
+            row = await cur.fetchone()
+            stats["avg_delay_seconds"] = float(row["avg_delay"]) if row and row["avg_delay"] is not None else None
+
+            await cur.execute(
+                "SELECT s.id, s.post_id, s.run_at FROM scheduled_posts s "
+                f"WHERE s.status = 'scheduled'{scope} ORDER BY s.run_at LIMIT 5",
+                params,
+            )
+            stats["upcoming"] = list(await cur.fetchall())
+            return stats
+
+
+async def get_failure_breakdown(days: int = 30, limit: int = 5) -> list[dict]:
+    """Most common delivery errors, so a recurring cause is obvious."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT LEFT(error, 120) AS reason, COUNT(*) AS total "
+                "FROM post_deliveries WHERE status IN ('failed', 'retrying') "
+                "AND error IS NOT NULL "
+                "AND updated_at >= UTC_TIMESTAMP() - INTERVAL %s DAY "
+                "GROUP BY LEFT(error, 120) ORDER BY total DESC LIMIT %s",
+                (days, limit),
+            )
+            return list(await cur.fetchall())
 
 
 async def get_channel_health():

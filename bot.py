@@ -146,7 +146,12 @@ from handlers.history import (
     handle_publish_draft,
     handle_approve,
 )
-from handlers.admin import handle_stats, handle_health, handle_tools_menu, run_channel_health_checks, daily_report
+from handlers.admin import handle_health, handle_tools_menu, run_channel_health_checks
+from handlers.stats import (
+    handle_stats_menu, handle_stats_summary, handle_stats_trend,
+    handle_stats_channels, handle_stats_authors, handle_stats_schedule,
+    daily_report,
+)
 from handlers.help import handle_help, handle_help_section
 from backup import handle_backup, handle_restore, handle_restore_document, nightly_backup
 from handlers.users import (
@@ -267,7 +272,7 @@ def main():
     app.add_handler(CommandHandler("group", handle_group_command))
     app.add_handler(CommandHandler("groups", handle_groups_command))
     app.add_handler(CommandHandler("help", handle_help))
-    app.add_handler(CommandHandler("stats", handle_stats))
+    app.add_handler(CommandHandler("stats", handle_stats_menu))
     app.add_handler(CommandHandler("health", handle_health))
 
     # Callback query handlers (inline buttons)
@@ -327,7 +332,12 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_tools_menu, pattern="^tools_menu$"))
     app.add_handler(CallbackQueryHandler(handle_groups_menu, pattern="^tools_groups$"))
     app.add_handler(CallbackQueryHandler(handle_create_group, pattern="^create_group$"))
-    app.add_handler(CallbackQueryHandler(handle_stats, pattern="^tools_stats$"))
+    app.add_handler(CallbackQueryHandler(handle_stats_menu, pattern="^tools_stats$"))
+    app.add_handler(CallbackQueryHandler(handle_stats_summary, pattern="^stats_summary$"))
+    app.add_handler(CallbackQueryHandler(handle_stats_trend, pattern="^stats_trend$"))
+    app.add_handler(CallbackQueryHandler(handle_stats_channels, pattern="^stats_channels$"))
+    app.add_handler(CallbackQueryHandler(handle_stats_authors, pattern="^stats_authors$"))
+    app.add_handler(CallbackQueryHandler(handle_stats_schedule, pattern="^stats_schedule$"))
     app.add_handler(CallbackQueryHandler(handle_health, pattern="^tools_health$"))
     app.add_handler(CallbackQueryHandler(handle_help, pattern="^help$"))
     app.add_handler(CallbackQueryHandler(handle_help_section, pattern="^help_(publish|schedule|roles|settings|tools)$"))
