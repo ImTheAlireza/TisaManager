@@ -1,3 +1,0 @@
-- Intervals: 1h, 3h, 6h (max 3 retries)
-- DB: add retry_count / retry_until to post_history
-- Notify via Telegram message with inline cancel button (callback cancel_retry)
