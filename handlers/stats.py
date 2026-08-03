@@ -394,11 +394,8 @@ def channels_text(rows, failures, health) -> str:
         lines.append("هنوز ارسالی ثبت نشده است.")
         return "\n".join(lines)
 
-    # Without this the bar and the "۲/۲" are unexplained; readers assumed the
-    # numbers were posts rather than delivery attempts.
-    lines.append("<i>نوار = نسبت ارسال موفق. عدد = موفق از کل تلاش ارسال.</i>")
-    lines.append("")
-
+    # The per-row lines spell out "N موفق از M ارسال", so the figures are
+    # self-explanatory without a legend header.
     health_by_id = {h["id"]: h for h in health}
     # Worst-first ordering from the query means the interesting rows come
     # first; cap the rest so the message stays inside Telegram's limit.

@@ -484,9 +484,10 @@ class ChannelLegendTests(unittest.TestCase):
         base.update(over)
         return base
 
-    def test_legend_is_present(self):
+    def test_no_legend_header(self):
+        # The per-row wording carries the meaning; the header was noise.
         out = stats.channels_text([self._row()], [], [])
-        self.assertIn("نوار = نسبت ارسال موفق", out)
+        self.assertNotIn("نوار = نسبت", out)
 
     def test_numbers_are_labelled(self):
         out = stats.channels_text([self._row()], [], [])
