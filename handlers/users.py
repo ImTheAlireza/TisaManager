@@ -158,8 +158,15 @@ async def handle_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role_labels = {"sudo": "👑 ادمین اصلی", "owner": "⭐ مالک", "writer": "✏️ نویسنده"}
     for u in users:
         role_label = role_labels.get(u["role"], u["role"])
-        name = u.get("name") or str(u["user_id"])
-        text += f"• <code>{u['user_id']}</code> — {name} ({role_label})\n"
+        label = display_name(u)
+        # When the bot has never seen the user act, display_name() falls back
+        # to "#id"; printing the id again underneath would just repeat it.
+        if label == f"#{u['user_id']}":
+            text += f"• <code>{u['user_id']}</code> ({role_label})\n"
+            text += "  <i>هنوز نامی ثبت نشده</i>\n"
+        else:
+            text += f"• {html_text(label)} ({role_label})\n"
+            text += f"  <code>{u['user_id']}</code>\n"
 
     await _safe_edit(query, text, reply_markup=users_list_keyboard(users))
 

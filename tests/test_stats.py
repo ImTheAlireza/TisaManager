@@ -576,3 +576,41 @@ class TelegramNameTests(unittest.TestCase):
 
     def test_handles_none(self):
         self.assertEqual(self.fn(None), "")
+
+
+class UserListTextTests(unittest.TestCase):
+    """The users list *message text* must use display names, not raw ids.
+
+    The button labels were fixed earlier but this screen built its own text
+    with `name or str(user_id)`, so a user whose profile had never been seen
+    rendered their id twice.
+    """
+
+    def setUp(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.source = open(os.path.join(root, "handlers", "users.py"),
+                           encoding="utf-8").read()
+
+    def test_no_raw_name_fallback_remains(self):
+        self.assertNotIn('u.get("name") or str(u["user_id"])', self.source,
+                         "list screen bypasses display_name()")
+
+    def test_uses_display_name(self):
+        self.assertIn("display_name(u)", self.source)
+
+    def test_named_user_is_not_shown_as_id(self):
+        from utils import display_name
+        row = {"user_id": 1038991065, "role": "sudo",
+               "name": "Alireza", "username": "imthealireza"}
+        label = display_name(row)
+        self.assertIn("Alireza", label)
+        self.assertNotEqual(label, str(row["user_id"]))
+
+    def test_unknown_user_id_is_not_duplicated(self):
+        # Renders "#id" from display_name(); the screen must then omit the
+        # separate id line rather than printing the number twice.
+        from utils import display_name
+        row = {"user_id": 5484684731, "role": "owner",
+               "name": None, "username": None}
+        self.assertEqual(display_name(row), "#5484684731")
+        self.assertIn("هنوز نامی ثبت نشده", self.source)
