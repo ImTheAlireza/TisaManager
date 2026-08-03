@@ -471,3 +471,49 @@ async def handle_back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 ربات مدیریت پست\n\nیک گزینه را انتخاب کنید:",
         reply_markup=main_menu_keyboard(is_sudo=await is_sudo(user_id), is_owner=await is_owner(user_id)),
     )
+
+
+async def handle_calendar_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_owner(query.from_user.id):
+        await query.answer("❌ فقط sudo یا owner دسترسی دارد.", show_alert=True)
+        return
+    import utils
+    from keyboards import calendar_settings_keyboard
+    from utils import format_local_date, now_local
+
+    current = "شمسی 📅" if utils.USE_JALALI else "میلادی 🌍"
+    await query.edit_message_text(
+        f"📅 <b>تقویم نمایش تاریخ</b>\n\n"
+        f"حالت فعلی: <b>{current}</b>\n"
+        f"نمونه امروز: {format_local_date(now_local().date(), long_form=True)}\n\n"
+        "این تنظیم فقط روی <b>نمایش</b> تأثیر دارد؛ زمان‌ها همیشه به‌صورت "
+        "میلادی/UTC ذخیره می‌شوند و زمان‌بندی‌های موجود تغییر نمی‌کنند.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=calendar_settings_keyboard(utils.USE_JALALI),
+    )
+
+
+async def handle_toggle_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_owner(query.from_user.id):
+        await query.answer("❌ فقط sudo یا owner دسترسی دارد.", show_alert=True)
+        return
+    import utils
+    new_value = not utils.USE_JALALI
+    utils.set_calendar(new_value)
+    await set_setting("use_jalali", "1" if new_value else "0", query.from_user.id)
+    await handle_calendar_settings(update, context)
+
+
+async def load_calendar_preference():
+    """Apply the stored calendar preference at startup.
+
+    Falls back to the USE_JALALI env default when the setting was never saved.
+    """
+    import utils
+    stored = await get_setting("use_jalali", None)
+    if stored is not None:
+        utils.set_calendar(stored == "1")

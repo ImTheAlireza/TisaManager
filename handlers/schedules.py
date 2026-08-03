@@ -23,7 +23,10 @@ from keyboards import (
     main_menu_keyboard, scheduled_list_keyboard, scheduled_detail_keyboard,
     schedule_date_keyboard,
 )
-from utils import html_text, format_local, now_local, local_to_utc_naive, private_actor
+from utils import (
+    html_text, format_local, format_local_date, now_local, local_to_utc_naive,
+    date_example, parse_user_datetime, private_actor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +242,7 @@ async def handle_schedule_time_change(update: Update, context: ContextTypes.DEFA
         query,
         f"🕒 <b>تغییر زمان زمان‌بندی #{schedule_id}</b>\n\n"
         f"زمان فعلی: {format_local(schedule['run_at'])}\n\n"
-        f"زمان جدید را بفرستید، نمونه:\n<code>{now_local():%Y-%m-%d} 14:30</code>",
+        f"زمان جدید را بفرستید، نمونه:\n<code>{html_text(date_example())}</code>",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("◀️ بازگشت", callback_data=f"sched_view_{schedule_id}")],
         ]),
@@ -261,17 +264,11 @@ async def handle_reschedule_input(update: Update, context: ContextTypes.DEFAULT_
     if not update.message.text:
         return False
 
-    raw = update.message.text.strip()
-    local_time = None
-    for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M:%S"):
-        try:
-            local_time = datetime.strptime(raw, fmt)
-            break
-        except ValueError:
-            continue
-    if local_time is None:
+    try:
+        local_time = parse_user_datetime(update.message.text)
+    except ValueError as exc:
         await update.message.reply_text(
-            f"❌ فرمت نامعتبر است. نمونه:\n<code>{now_local():%Y-%m-%d} 14:30</code>",
+            f"❌ {html_text(exc)}\n\nنمونه درست:\n<code>{html_text(date_example())}</code>",
             parse_mode=ParseMode.HTML,
         )
         return True
@@ -296,7 +293,9 @@ async def handle_reschedule_input(update: Update, context: ContextTypes.DEFAULT_
 
     _reschedule_states.pop(user_id, None)
     await update.message.reply_text(
-        f"✅ زمان‌بندی #{schedule_id} به {local_time:%Y-%m-%d %H:%M} منتقل شد.",
+        f"✅ زمان‌بندی #{schedule_id} به "
+        f"{format_local_date(local_time.date(), long_form=True)} "
+        f"ساعت {local_time:%H:%M} منتقل شد.",
         reply_markup=await _menu_kb(user_id),
     )
     return True

@@ -102,8 +102,8 @@ hours hidden for today; 5-minute granularity with past minutes filtered.
 
 **18.** Dead `state["schedule_hour"]` — now genuinely used by the minute step.
 
-**19.** Manual entry is documented in the prompt itself and accepts three
-formats. (Jalali dates remain a possible future addition — noted, not done.)
+**19.** Manual entry is documented in the prompt itself. **Jalali dates are now
+implemented** — see the section below.
 
 **21.** `Asia/Tehran` no longer hardcoded: `DISPLAY_TIMEZONE` in `config.py`,
 consumed everywhere including the nightly-backup job.
@@ -187,5 +187,59 @@ Built now:
   `SCHEDULE_GRACE_SECONDS`, `SCHEDULE_CLAIM_TIMEOUT_SECONDS`,
   `SCHEDULE_MAX_ATTEMPTS`, `RETRY_DELAYS_HOURS`, `WORKFLOW_TTL_SECONDS`,
   `RESTART_DRAIN_TIMEOUT_SECONDS`.
-- **Not done / worth considering later:** Jalali date input, per-user
-  timezones, and recurring schedules.
+- **Not done / worth considering later:** per-user timezones and recurring
+  schedules.
+
+
+---
+
+## Part 3 — Jalali (Persian) calendar
+
+The UI was entirely Persian but every date was Gregorian with Latin digits.
+Dates are now shown on the Solar Hijri calendar by default.
+
+**Storage is untouched.** `run_at`, `created_at` and every other column remain
+Gregorian UTC, and callback payloads remain ISO Gregorian
+(`schedule_date_2026-08-06`). Only labels, prompts and parsing changed — so
+existing schedules keep firing at exactly the same instant, and no migration is
+required for this part.
+
+### What changed
+
+- **`jalali.py`** — conversion, month/weekday names, digit translation and
+  parsing. Written in-house because the project deliberately avoids third-party
+  dependencies (`bale_client` speaks HTTP over `urllib` for the same reason);
+  the algorithm is closed-form integer arithmetic with no lookup data.
+- **Display** — `format_local`, plus new `format_local_date`, `format_clock`
+  and `date_example` helpers, all honouring a single `USE_JALALI` switch.
+  Persian-Indic digits throughout (`۱۴۰۵-۰۵-۱۲ ۱۴:۳۰`, `۱۲ مرداد ۱۴۰۵`).
+- **Pickers** — quick-pick buttons are labelled `پنجشنبه ۱۵ مرداد`, and a new
+  **📅 انتخاب از تقویم** opens a full Jalali month grid: Saturday-first columns,
+  today marked 🔸, past days rendered as inert dots, month paging that refuses
+  to go back into a fully past month.
+- **Input** — `parse_user_datetime` accepts Jalali (`۱۴۰۵-۰۵-۱۵ ۱۴:۳۰`,
+  `1405/5/15 14:30`) and still accepts Gregorian, disambiguated by year: `>=1700`
+  can only be Gregorian, so no guessing. Persian *and* Arabic-Indic digits are
+  normalised, since phone keyboards emit both. Two-digit years are rejected
+  rather than assumed — silently turning `05` into `1405` would schedule to the
+  wrong day.
+- **Settings toggle** — «📅 تقویم نمایش تاریخ» flips between Persian and
+  Gregorian at runtime, persisted in `bot_settings` and reloaded at startup.
+  `USE_JALALI=0` sets the default for a fresh install.
+
+### Verification
+
+- Every day from **1990-01-01 to 2100-12-31** (40,542 days) converts identically
+  to the `jdatetime` reference library, and round-trips back exactly. Leap years
+  agree across 1300-1499; month lengths agree across 1390-1459.
+- **4,382 calendar cells** across 144 months were checked to sit in the column
+  matching their real weekday — an off-by-one here would silently schedule posts
+  to the wrong day.
+- An end-to-end walk confirms tapping «۱۵» in Mordad 1405 with 14:30 stores
+  `2026-08-06 11:00` UTC (Tehran is UTC+3:30) and renders back as
+  `۱۴۰۵-۰۵-۱۵ ۱۴:۳۰`.
+
+`tests/test_jalali.py` adds 46 cases. Full suite: **115 passed**.
+
+Note: `jdatetime` is used *only* by the test cross-check and is skipped when not
+installed — it is not a runtime dependency and is not in `requirements.txt`.

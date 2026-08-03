@@ -21,10 +21,16 @@ from database import (
     save_workflow_session, delete_workflow_session, load_workflow_sessions,
     purge_workflow_sessions, get_user_role, get_post,
 )
-from keyboards import confirm_keyboard, main_menu_keyboard, channel_selection_keyboard, schedule_date_keyboard, schedule_hour_keyboard, schedule_minute_keyboard
+import jalali
+from keyboards import (
+    confirm_keyboard, main_menu_keyboard, channel_selection_keyboard,
+    schedule_date_keyboard, schedule_hour_keyboard, schedule_minute_keyboard,
+    schedule_calendar_keyboard,
+)
 from utils import (
     html_text, is_private_chat, private_actor,
-    now_local, local_to_utc_naive, format_local, LOCAL_TZ,
+    now_local, local_to_utc_naive, format_local, format_local_date,
+    format_clock, date_example, parse_user_datetime, LOCAL_TZ,
 )
 
 logger = logging.getLogger(__name__)
@@ -991,11 +997,13 @@ async def handle_schedule_post(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def _schedule_prompt(headline: str) -> str:
     tzname = LOCAL_TZ.key if hasattr(LOCAL_TZ, "key") else str(LOCAL_TZ)
+    today = now_local().date()
     return (
         f"\U0001f552 <b>{html_text(headline)}</b>\n"
-        f"منطقه زمانی: {html_text(tzname)}\n\n"
+        f"امروز: {html_text(format_local_date(today, long_form=True))}"
+        f" — منطقه زمانی: {html_text(tzname)}\n\n"
         f"می‌توانید زمان را دستی هم بفرستید، نمونه:\n"
-        f"<code>{now_local():%Y-%m-%d} 14:30</code>"
+        f"<code>{html_text(date_example())}</code>"
     )
 
 
@@ -1012,9 +1020,11 @@ async def _finish_schedule(user_id: int, state: dict, local_time: datetime, upda
     schedule_id = await create_schedule(user_id, post_id, utc_time)
     await forget_state(user_id)
 
+    tzname = LOCAL_TZ.key if hasattr(LOCAL_TZ, "key") else str(LOCAL_TZ)
     text = (
         f"\u2705 پست #{post_id} زمان‌بندی شد.\n"
-        f"\U0001f552 {local_time:%Y-%m-%d %H:%M} ({LOCAL_TZ.key if hasattr(LOCAL_TZ, 'key') else LOCAL_TZ})\n"
+        f"\U0001f552 {format_local_date(local_time.date(), long_form=True)}"
+        f" ساعت {format_clock(local_time.hour, local_time.minute)} ({tzname})\n"
         f"\U0001f194 شناسه زمان‌بندی: #{schedule_id}\n\n"
         f"از «\U0001f552 پست‌های زمان‌بندی‌شده» می‌توانید آن را ببینید، تغییر دهید یا لغو کنید."
     )
@@ -1037,6 +1047,42 @@ async def handle_schedule_back_date(update: Update, context: ContextTypes.DEFAUL
         _schedule_prompt("تاریخ انتشار را انتخاب کنید:"),
         parse_mode=ParseMode.HTML,
         reply_markup=schedule_date_keyboard(now_local().date()),
+    )
+
+
+async def handle_schedule_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show a full Jalali month grid.
+
+    Payload is either "schedule_cal" (current month) or
+    "schedule_cal_<jy>_<jm>" when paging between months.
+    """
+    query = update.callback_query
+    await query.answer()
+    state = await _require_phase(query, _SCHEDULE_PHASES)
+    if not state:
+        return
+
+    today = now_local().date()
+    payload = query.data.removeprefix("schedule_cal")
+    if payload.startswith("_"):
+        try:
+            jy_str, jm_str = payload.lstrip("_").split("_")
+            jy, jm = int(jy_str), int(jm_str)
+        except ValueError:
+            await query.answer(_STALE_BUTTON_MSG, show_alert=True)
+            return
+        if not 1 <= jm <= 12:
+            await query.answer(_STALE_BUTTON_MSG, show_alert=True)
+            return
+    else:
+        jy, jm, _ = jalali.to_jalali(today)
+
+    state["state"] = "awaiting_schedule_date"
+    await persist_state(query.from_user.id, state)
+    await query.edit_message_text(
+        _schedule_prompt("روز انتشار را از تقویم انتخاب کنید:"),
+        parse_mode=ParseMode.HTML,
+        reply_markup=schedule_calendar_keyboard(jy, jm, today),
     )
 
 
@@ -1063,7 +1109,7 @@ async def handle_schedule_date(update: Update, context: ContextTypes.DEFAULT_TYP
     # Hide hours that have already passed when the user picks today.
     min_hour = now.hour if chosen == now.date() else 0
     await query.edit_message_text(
-        _schedule_prompt(f"ساعت انتشار برای {chosen:%Y-%m-%d}:"),
+        _schedule_prompt(f"ساعت انتشار برای {format_local_date(chosen, long_form=True)}:"),
         parse_mode=ParseMode.HTML,
         reply_markup=schedule_hour_keyboard(chosen.isoformat(), min_hour=min_hour),
     )
@@ -1086,7 +1132,7 @@ async def handle_schedule_back_hour(update: Update, context: ContextTypes.DEFAUL
     await persist_state(query.from_user.id, state)
     min_hour = now.hour if chosen == now.date() else 0
     await query.edit_message_text(
-        _schedule_prompt(f"ساعت انتشار برای {chosen:%Y-%m-%d}:"),
+        _schedule_prompt(f"ساعت انتشار برای {format_local_date(chosen, long_form=True)}:"),
         parse_mode=ParseMode.HTML,
         reply_markup=schedule_hour_keyboard(chosen.isoformat(), min_hour=min_hour),
     )
@@ -1122,7 +1168,10 @@ async def handle_schedule_hour(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         allowed = list(range(0, 60, 5))
     await query.edit_message_text(
-        _schedule_prompt(f"دقیقه انتشار برای {chosen:%Y-%m-%d} ساعت {hour:02d}:"),
+        _schedule_prompt(
+            f"دقیقه انتشار برای {format_local_date(chosen, long_form=True)}"
+            f" ساعت {jalali.to_persian_digits(f'{hour:02d}')}:"
+        ),
         parse_mode=ParseMode.HTML,
         reply_markup=schedule_minute_keyboard(chosen.isoformat(), hour, allowed_minutes=allowed),
     )
@@ -1164,17 +1213,11 @@ async def handle_schedule_input(update: Update, context: ContextTypes.DEFAULT_TY
     if not update.message.text:
         return False
 
-    raw = update.message.text.strip()
-    local_time = None
-    for fmt in ("%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M:%S"):
-        try:
-            local_time = datetime.strptime(raw, fmt)
-            break
-        except ValueError:
-            continue
-    if local_time is None:
+    try:
+        local_time = parse_user_datetime(update.message.text)
+    except ValueError as exc:
         await update.message.reply_text(
-            f"\u274c فرمت نامعتبر است. نمونه:\n<code>{now_local():%Y-%m-%d} 14:30</code>",
+            f"\u274c {html_text(exc)}\n\nنمونه درست:\n<code>{html_text(date_example())}</code>",
             parse_mode=ParseMode.HTML,
         )
         return True

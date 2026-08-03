@@ -45,37 +45,110 @@ def channel_selection_keyboard(channels: list[dict], selected: set[int]) -> Inli
     return InlineKeyboardMarkup(buttons)
 
 
-_WEEKDAYS_FA = ("دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه", "یکشنبه")
-
-
 def schedule_date_keyboard(today) -> InlineKeyboardMarkup:
-    """Seven selectable days starting today.
+    """Seven selectable days starting today, labelled on the Persian calendar.
 
-    Dates travel in the callback data as an ISO string, so the choice can never
-    be misread from a stale in-memory state.
+    The callback payload stays an ISO *Gregorian* date, so storage and routing
+    are unaffected by the display calendar — only the label is localised.
     """
     from datetime import timedelta
+    import jalali
+    from utils import USE_JALALI
 
     labels = {0: "امروز", 1: "فردا", 2: "پس‌فردا"}
     rows, row = [], []
     for offset in range(7):
         day = today + timedelta(days=offset)
-        label = labels.get(offset) or f"{_WEEKDAYS_FA[day.weekday()]} {day:%m/%d}"
+        if USE_JALALI:
+            jy, jm, jd = jalali.to_jalali(day)
+            pretty = f"{jalali.to_persian_digits(jd)} {jalali.MONTH_NAMES[jm]}"
+        else:
+            pretty = f"{day:%m/%d}"
+        label = labels.get(offset) or f"{jalali.weekday_name(day)} {pretty}"
         row.append(InlineKeyboardButton(label, callback_data=f"schedule_date_{day.isoformat()}"))
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton("📅 انتخاب از تقویم", callback_data="schedule_cal")])
+    rows.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_post")])
+    return InlineKeyboardMarkup(rows)
+
+
+# Persian week starts on Saturday; date.weekday() has Monday == 0.
+_SATURDAY_FIRST = (5, 6, 0, 1, 2, 3, 4)
+_WEEK_HEADERS = ("ش", "ی", "د", "س", "چ", "پ", "ج")
+
+
+def schedule_calendar_keyboard(jy: int, jm: int, today) -> InlineKeyboardMarkup:
+    """A full Jalali month grid.
+
+    Days before today are rendered as inert dots rather than tappable buttons,
+    so a past date cannot be selected at all.
+    """
+    import jalali
+    from datetime import date
+
+    rows = [[InlineKeyboardButton(h, callback_data="schedule_noop") for h in _WEEK_HEADERS]]
+
+    first = jalali.from_jalali(jy, jm, 1)
+    # Column of the 1st, counting from Saturday.
+    lead = _SATURDAY_FIRST.index(first.weekday())
+    total = jalali.days_in_jalali_month(jy, jm)
+
+    cells = [None] * lead
+    for day in range(1, total + 1):
+        cells.append(day)
+    while len(cells) % 7:
+        cells.append(None)
+
+    for i in range(0, len(cells), 7):
+        row = []
+        for cell in cells[i:i + 7]:
+            if cell is None:
+                row.append(InlineKeyboardButton(" ", callback_data="schedule_noop"))
+                continue
+            g = jalali.from_jalali(jy, jm, cell)
+            if g < today:
+                row.append(InlineKeyboardButton("·", callback_data="schedule_noop"))
+            else:
+                mark = "🔸" if g == today else ""
+                row.append(InlineKeyboardButton(
+                    f"{mark}{jalali.to_persian_digits(cell)}",
+                    callback_data=f"schedule_date_{g.isoformat()}",
+                ))
+        rows.append(row)
+
+    prev_y, prev_m = (jy, jm - 1) if jm > 1 else (jy - 1, 12)
+    next_y, next_m = (jy, jm + 1) if jm < 12 else (jy + 1, 1)
+    # Never offer a month that is entirely in the past.
+    last_of_prev = jalali.from_jalali(prev_y, prev_m, jalali.days_in_jalali_month(prev_y, prev_m))
+    nav = []
+    if last_of_prev >= today:
+        nav.append(InlineKeyboardButton("‹ ماه قبل", callback_data=f"schedule_cal_{prev_y}_{prev_m}"))
+    nav.append(InlineKeyboardButton(
+        f"{jalali.MONTH_NAMES[jm]} {jalali.to_persian_digits(jy)}",
+        callback_data="schedule_noop",
+    ))
+    nav.append(InlineKeyboardButton("ماه بعد ›", callback_data=f"schedule_cal_{next_y}_{next_m}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("◀️ روزهای نزدیک", callback_data="schedule_back_date")])
     rows.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_post")])
     return InlineKeyboardMarkup(rows)
 
 
 def schedule_hour_keyboard(date_iso: str, min_hour: int = 0) -> InlineKeyboardMarkup:
     """Hours for the chosen day, hiding hours that have already passed today."""
+    import jalali
+    from utils import USE_JALALI
+
+    def _n(v):
+        return jalali.to_persian_digits(f"{v:02d}") if USE_JALALI else f"{v:02d}"
+
     rows, row = [], []
     for hour in range(min_hour, 24):
-        row.append(InlineKeyboardButton(f"{hour:02d}", callback_data=f"schedule_hour_{date_iso}_{hour}"))
+        row.append(InlineKeyboardButton(_n(hour), callback_data=f"schedule_hour_{date_iso}_{hour}"))
         if len(row) == 6:
             rows.append(row)
             row = []
@@ -90,11 +163,15 @@ def schedule_hour_keyboard(date_iso: str, min_hour: int = 0) -> InlineKeyboardMa
 
 def schedule_minute_keyboard(date_iso: str, hour: int, allowed_minutes=None) -> InlineKeyboardMarkup:
     """Five-minute granularity, restricted to minutes still in the future."""
+    import jalali
+    from utils import USE_JALALI
+
     minutes = allowed_minutes if allowed_minutes is not None else range(0, 60, 5)
     rows, row = [], []
     for minute in minutes:
+        label = f"{hour:02d}:{minute:02d}"
         row.append(InlineKeyboardButton(
-            f"{hour:02d}:{minute:02d}",
+            jalali.to_persian_digits(label) if USE_JALALI else label,
             callback_data=f"schedule_minute_{date_iso}_{hour}_{minute}",
         ))
         if len(row) == 4:
@@ -149,6 +226,14 @@ def approval_settings_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     ])
 
 
+def calendar_settings_keyboard(use_jalali: bool) -> InlineKeyboardMarkup:
+    label = "🌍 نمایش میلادی" if use_jalali else "📅 نمایش شمسی"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data="toggle_calendar")],
+        [InlineKeyboardButton("◀️ بازگشت به تنظیمات", callback_data="settings")],
+    ])
+
+
 def restart_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -164,6 +249,7 @@ def settings_keyboard(is_sudo_user: bool = False) -> list[list[InlineKeyboardBut
     buttons = [
         [InlineKeyboardButton("📢 مدیریت کانال‌ها", callback_data="manage_channels")],
         [InlineKeyboardButton("🔐 تنظیم تأیید پست‌ها", callback_data="approval_settings")],
+        [InlineKeyboardButton("📅 تقویم نمایش تاریخ", callback_data="calendar_settings")],
     ]
     if is_sudo_user:
         buttons.append([InlineKeyboardButton("🗄️ پشتیبان‌گیری", callback_data="backup_project"), InlineKeyboardButton("♻️ بازیابی", callback_data="restore_project")])
@@ -248,7 +334,18 @@ def history_keyboard(posts: list[dict], page: int = 1, total_pages: int = 1, is_
         preview = post.get("text") or post.get("caption") or ""
         if len(preview) > 30:
             preview = preview[:30] + "..."
-        date = post["created_at"].strftime("%m/%d %H:%M") if post["created_at"] else ""
+        if post["created_at"]:
+            import jalali
+            from utils import USE_JALALI
+            if USE_JALALI:
+                _, jm, jd = jalali.to_jalali(post["created_at"])
+                date = jalali.to_persian_digits(
+                    f"{jm:02d}/{jd:02d} {post['created_at']:%H:%M}"
+                )
+            else:
+                date = post["created_at"].strftime("%m/%d %H:%M")
+        else:
+            date = ""
         label = f"{type_icon} {date} | {preview}"
         if is_admin and post.get("user_id"):
             label = f"{type_icon} {date} | {preview}"

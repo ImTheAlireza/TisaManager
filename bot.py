@@ -97,6 +97,7 @@ from handlers.post import (
     handle_schedule_minute,
     handle_schedule_back_date,
     handle_schedule_back_hour,
+    handle_schedule_calendar,
     handle_schedule_noop,
     handle_legacy_schedule_button,
     process_scheduled_posts,
@@ -129,6 +130,9 @@ from handlers.settings import (
     handle_groups_command,
     handle_groups_menu,
     handle_create_group,
+    handle_calendar_settings,
+    handle_toggle_calendar,
+    load_calendar_preference,
 )
 from handlers.history import (
     handle_history,
@@ -293,6 +297,7 @@ def main():
     # in-memory state has moved on. Order matters: the more specific
     # "schedule_back_hour_" pattern must be registered before "schedule_hour_".
     app.add_handler(CallbackQueryHandler(handle_schedule_back_date, pattern="^schedule_back_date$"))
+    app.add_handler(CallbackQueryHandler(handle_schedule_calendar, pattern=r"^schedule_cal(_\d{3,4}_\d{1,2})?$"))
     app.add_handler(CallbackQueryHandler(handle_schedule_back_hour, pattern=r"^schedule_back_hour_\d{4}-\d{2}-\d{2}$"))
     app.add_handler(CallbackQueryHandler(handle_schedule_date, pattern=r"^schedule_date_\d{4}-\d{2}-\d{2}$"))
     app.add_handler(CallbackQueryHandler(handle_schedule_hour, pattern=r"^schedule_hour_\d{4}-\d{2}-\d{2}_\d{1,2}$"))
@@ -328,6 +333,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_help_section, pattern="^help_(publish|schedule|roles|settings|tools)$"))
     app.add_handler(CallbackQueryHandler(handle_approval_settings, pattern="^approval_settings$"))
     app.add_handler(CallbackQueryHandler(handle_toggle_approval, pattern="^toggle_approval$"))
+    app.add_handler(CallbackQueryHandler(handle_calendar_settings, pattern="^calendar_settings$"))
+    app.add_handler(CallbackQueryHandler(handle_toggle_calendar, pattern="^toggle_calendar$"))
     # User management handlers
     app.add_handler(CallbackQueryHandler(handle_users_menu, pattern="^users_menu$"))
     app.add_handler(CallbackQueryHandler(handle_add_user, pattern="^add_user$"))
@@ -384,6 +391,12 @@ def main():
     # or a slow/retrying MySQL used to race the first scheduler tick.
     async def initialize_database(context):
         await init_db()
+
+        # Apply the owner's saved calendar preference before anything renders.
+        try:
+            await load_calendar_preference()
+        except Exception:
+            logger.exception("Could not load calendar preference")
 
         # Recover interactive workflows that a restart interrupted.
         try:

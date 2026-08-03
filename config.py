@@ -16,6 +16,11 @@ DB_NAME = os.getenv("DB_NAME", "post_manager_bot")
 # Every user-facing time is rendered in this zone; every stored time is UTC.
 DISPLAY_TIMEZONE = os.getenv("DISPLAY_TIMEZONE", "Asia/Tehran")
 
+# Show dates on the Persian (Jalali) calendar. The whole UI is Persian, so this
+# defaults on; set USE_JALALI=0 for a Gregorian UI. Storage is always Gregorian
+# UTC either way.
+USE_JALALI = os.getenv("USE_JALALI", "1") not in ("0", "false", "False", "")
+
 # How long a schedule may be overdue and still be published. Anything older is
 # marked "expired" instead of being blasted out after a long outage.
 SCHEDULE_GRACE_SECONDS = int(os.getenv("SCHEDULE_GRACE_SECONDS", 6 * 3600))

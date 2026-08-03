@@ -733,9 +733,27 @@ class KeyboardTests(SchedulingTestCase):
     def test_hour_keyboard_hides_past_hours(self):
         from keyboards import schedule_hour_keyboard
         markup = schedule_hour_keyboard("2030-01-01", min_hour=20)
-        labels = [b.text for row in markup.inline_keyboard for b in row]
-        self.assertNotIn("19", labels)
-        self.assertIn("20", labels)
+        # Labels are localised, so assert on the payloads, which are stable.
+        payloads = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertNotIn("schedule_hour_2030-01-01_19", payloads)
+        self.assertIn("schedule_hour_2030-01-01_20", payloads)
+        self.assertIn("schedule_hour_2030-01-01_23", payloads)
+
+    def test_hour_keyboard_labels_follow_the_display_calendar(self):
+        import utils
+        from keyboards import schedule_hour_keyboard
+        original = utils.USE_JALALI
+        try:
+            utils.USE_JALALI = True
+            labels = [b.text for row in schedule_hour_keyboard("2030-01-01", 20).inline_keyboard
+                      for b in row]
+            self.assertIn("۲۰", labels)
+            utils.USE_JALALI = False
+            labels = [b.text for row in schedule_hour_keyboard("2030-01-01", 20).inline_keyboard
+                      for b in row]
+            self.assertIn("20", labels)
+        finally:
+            utils.USE_JALALI = original
 
     def test_minute_keyboard_respects_allowed_minutes(self):
         from keyboards import schedule_minute_keyboard
