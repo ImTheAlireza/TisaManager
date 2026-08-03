@@ -55,12 +55,38 @@ async def get_pool() -> aiomysql.Pool:
                 # UTC, matching the explicit UTC_TIMESTAMP() writes elsewhere.
                 init_command="SET time_zone = '+00:00'",
             )
+            # init_command runs per connection, but a pooled connection that
+            # was reset (or a driver that quietly drops init_command) would
+            # silently reintroduce the timezone bug. Verify once, loudly.
+            await _assert_session_is_utc(_pool)
             return _pool
         except Exception as exc:
             last_error = exc
             if attempt < 2:
                 await asyncio.sleep(2 ** attempt)
     raise RuntimeError("Could not connect to MySQL after 3 attempts") from last_error
+
+
+async def _assert_session_is_utc(pool):
+    """Fail loudly if pooled sessions are not on UTC.
+
+    Every stored timestamp is interpreted as UTC by the display layer, so a
+    session on any other zone silently shifts every time the user sees. This
+    is the exact bug that made history read 90 minutes early on a UTC+2 server,
+    so it is checked rather than assumed.
+    """
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT @@session.time_zone, TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW())")
+            row = await cur.fetchone()
+    session_tz, drift = (row[0], int(row[1] or 0)) if row else ("?", 0)
+    if drift:
+        raise RuntimeError(
+            f"Database session is not on UTC (time_zone={session_tz!r}, "
+            f"{drift:+d}s from UTC). Every displayed time would be wrong. "
+            "Check that the MySQL driver honours init_command."
+        )
+    logger.info("Database sessions pinned to UTC (time_zone=%s)", session_tz)
 
 
 async def close_pool():
@@ -287,70 +313,23 @@ async def init_db():
             """)
             await cur.execute("INSERT IGNORE INTO bot_settings (setting_key, setting_value, updated_by) VALUES ('approval_required', '0', %s)", (SUDO_USER_ID,))
             await cur.execute("DROP TABLE IF EXISTS templates")
-            # One-time: rebase TIMESTAMP columns written before the pool pinned
-            # sessions to UTC. Those rows hold wall-clock time in the server's
-            # own zone, so they render shifted (a Tehran server showed history
-            # 3.5h off; a UTC+2 one, 95 minutes off). MySQL stores TIMESTAMP as
-            # an epoch and converts on read, so with the session now pinned to
-            # UTC the fix is to add back the offset the old session applied.
-            await cur.execute("SELECT setting_value FROM bot_settings WHERE setting_key = 'timestamps_utc_migrated'")
-            if not await cur.fetchone():
-                # Measure the server's own offset by asking a connection that is
-                # NOT pinned to UTC — that is the zone legacy rows were written
-                # in. CONVERT_TZ needs the mysql.time_zone tables, which are
-                # often not loaded, so fall back to a plain session query.
-                await cur.execute("SELECT @@system_time_zone")
-                server_tz = (await cur.fetchone())[0]
-                shift = 0
-                probe = await aiomysql.connect(
-                    host=DB_HOST, port=DB_PORT, user=DB_USER,
-                    password=DB_PASSWORD, db=DB_NAME, autocommit=True,
-                    charset="utf8mb4",
-                )
-                try:
-                    async with probe.cursor() as pc:
-                        # SYSTEM session tz == the zone the old pool used.
-                        await pc.execute("SELECT TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW())")
-                        result = await pc.fetchone()
-                        server_offset = int(result[0] or 0) if result else 0
-                finally:
-                    probe.close()
-                # Legacy rows hold server-local wall clock. To turn that into
-                # real UTC we SUBTRACT the server's offset: a UTC+2 server
-                # stored 16:13 for a 14:13 UTC event, so the shift is -7200.
-                shift = -server_offset
-                if shift:
-                    logger.warning(
-                        "Rebasing legacy timestamps: server tz %s is %+d seconds from UTC",
-                        server_tz, shift,
-                    )
-                    for table, columns in (
-                        ("post_history", ("created_at", "delivery_completed_at")),
-                        ("channels", ("created_at", "last_health_check")),
-                        ("users", ("created_at",)),
-                        ("post_versions", ("created_at",)),
-                        ("channel_groups", ("created_at",)),
-                    ):
-                        for column in columns:
-                            await cur.execute(
-                                "SELECT COUNT(*) FROM information_schema.columns "
-                                "WHERE table_schema = %s AND table_name = %s AND column_name = %s",
-                                (DB_NAME, table, column),
-                            )
-                            if not (await cur.fetchone())[0]:
-                                continue
-                            await cur.execute(
-                                f"UPDATE {table} SET {column} = "
-                                f"DATE_ADD({column}, INTERVAL %s SECOND) WHERE {column} IS NOT NULL",
-                                (shift,),
-                            )
-                else:
-                    logger.info("Server timezone is UTC; no timestamp rebase needed")
-                await cur.execute(
-                    "INSERT INTO bot_settings (setting_key, setting_value, updated_by) "
-                    "VALUES ('timestamps_utc_migrated', '1', %s)",
-                    (SUDO_USER_ID,),
-                )
+            # NOTE: no timestamp rebase is needed or wanted here.
+            #
+            # post_history.created_at, post_history.delivery_completed_at and
+            # channels.last_health_check are TIMESTAMP columns, and MySQL
+            # stores TIMESTAMP as a UTC epoch: it converts from the session
+            # timezone on write and back to it on read. The stored instant was
+            # therefore always correct, even before the pool pinned sessions to
+            # UTC — the old bug was purely that the code treated the
+            # server-local value it read back as if it were UTC.
+            #
+            # Pinning the session (see get_pool) fixes existing rows on its
+            # own. Rewriting them with DATE_ADD would shift an already-correct
+            # epoch and corrupt the data.
+            #
+            # DATETIME columns behave differently (literal wall clock, no
+            # conversion), which is why scheduled_posts/post_deliveries/
+            # workflow_sessions write UTC_TIMESTAMP() explicitly.
 
             await cur.execute("SELECT setting_value FROM bot_settings WHERE setting_key = 'legacy_delivery_migrated'")
             if not await cur.fetchone():

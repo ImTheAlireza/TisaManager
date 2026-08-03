@@ -246,50 +246,61 @@ installed — it is not a runtime dependency and is not in `requirements.txt`.
 
 ---
 
-## Part 4 — timestamp bug (reported: history showed 16:08 at 17:43)
+## Part 4 — timestamp bug (reported twice)
 
-### What was wrong
+**Report 1:** history showed `16:08` when the clock read `17:43`.
+**Report 2:** history showed `11:06` when the clock read `12:37`.
 
-Two independent bugs, both visible in the reported output
-(`📅 ۱۴۰۵-۰۵-۱۲ 16:08` — Persian date, Latin clock):
+### Diagnosis
 
-**A. `TIMESTAMP` columns were never really UTC.** The pool opened connections
-without pinning a timezone, so MySQL wrote and read `created_at`,
-`delivery_completed_at` and `last_health_check` in the *server's* zone. The code
-then treated those values as UTC. This is issue #14 from Part 1 — I fixed the
-columns I added (`scheduled_posts`, `post_deliveries`, `workflow_sessions` all
-use explicit `UTC_TIMESTAMP()`), but left the pre-existing `TIMESTAMP` columns
-inconsistent.
+The two reports together were decisive. The gaps (95 and 91 minutes) differ by
+the few minutes that had elapsed since each post was made, so the *constant*
+component is 90 minutes — and 90 minutes is exactly Tehran (UTC+3:30) minus
+**UTC+2**. Both displayed values equal the raw wall clock of a CEST database
+server, with no sign of partial correction.
+
+### Two real bugs
+
+**A. `TIMESTAMP` columns were read in the server's timezone.** The pool never
+pinned a session timezone, so MySQL returned `created_at` as a server-local
+wall clock while the code treated it as UTC. Fixed by
+`init_command="SET time_zone = '+00:00'"`.
 
 **B. `created_at` was rendered without conversion.** `handlers/history.py` and
-`keyboards.py` formatted the raw value instead of calling `format_local`,
-which is also why the clock kept Latin digits while the date did not.
+`keyboards.py` formatted the raw value instead of calling `format_local` —
+which is also why the date used Persian digits while the clock stayed Latin.
+All display now routes through `format_local` / the new `format_local_short`.
 
-The 95-minute gap identifies the cause precisely: 17:43 Tehran is 14:13 UTC, and
-16:08 is 1h55m ahead of that — consistent with a **UTC+2 (CEST)** database
-server, whose wall clock was being shown as if it were Tehran time.
+### A third bug: my own "fix" was wrong and would have corrupted data
 
-### Fixes
+The previous round added a migration that rebased legacy rows with `DATE_ADD`.
+That was based on a misreading of MySQL semantics. From the manual:
 
-- **Pool pins every session to UTC** (`init_command="SET time_zone = '+00:00'"`),
-  making every column in the schema unambiguously UTC.
-- **All display goes through `format_local` / `format_local_short`** (the latter
-  is new, for compact list rows). No handler formats a raw DB value any more —
-  verified by grep.
-- **One-time migration** rebases legacy rows. It measures the server offset on a
-  deliberately *unpinned* probe connection (that being the zone the old rows
-  were written in) and **subtracts** it. `CONVERT_TZ` is avoided because it
-  silently returns NULL unless `mysql.time_zone` is populated. Guarded by a
-  `timestamps_utc_migrated` flag, and it deliberately skips the three tables
-  that were already UTC-native.
+> "MySQL converts `TIMESTAMP` values from the current time zone to UTC for
+> storage, and back from UTC to the current time zone for retrieval. (This does
+> not occur for other types such as `DATETIME`.)"
 
-### Verification
+`TIMESTAMP` is stored as a **UTC epoch** and converted on write *and* read. The
+stored instant was therefore always correct — the old bug was purely in
+interpretation. **Pinning the session fixes existing rows on its own**, and
+subtracting two hours from an already-correct epoch is corruption, not repair.
+Simulated: pin-only yields the expected `۱۲:۳۷`; the migration would have
+produced `۱۰:۳۷`.
 
-The sign of that shift is the dangerous part — getting it backwards would double
-the error rather than remove it. Confirmed against a real SQL engine that
-`+TIMESTAMPDIFF` produced 18:13 (wrong) and `-TIMESTAMPDIFF` produced 14:13
-(correct), and covered it for offsets 0, +2, +3.5, −5 and +5.5.
+The migration has been removed, with a comment explaining why, and a test
+asserts it is not reintroduced. It never ran against the database, so no data
+was harmed. `DATETIME` columns are unaffected by all of this, which is why the
+scheduling tables write `UTC_TIMESTAMP()` explicitly.
 
-10 new regression tests. I verified they genuinely catch the bug by
-reintroducing it — 6 fail, including one asserting no Latin digits leak into a
-Persian timestamp. Full suite: **125 passed**.
+### Hardening
+
+`_assert_session_is_utc()` runs at pool creation and raises if a session is not
+on UTC, rather than letting a silent driver failure reintroduce the bug.
+
+### Why it appeared unfixed after the previous push
+
+The session pin only applies to connections opened after a restart. Until the
+bot restarts on the new code, every read still returns server-local time.
+
+10 regression tests, verified to fail when the pin is removed.
+Full suite: **128 passed**.

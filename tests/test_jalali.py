@@ -450,41 +450,67 @@ class StoredTimeRenderingTests(unittest.TestCase):
                         "list and detail views disagree about the time")
 
 
-class LegacyTimestampRebaseTests(unittest.TestCase):
-    """The one-time migration that rebases pre-UTC-pinning rows.
+class TimestampStorageSemanticsTests(unittest.TestCase):
+    """MySQL TIMESTAMP is a UTC epoch converted via the SESSION timezone.
 
-    Legacy rows hold the DB server's wall clock, so the correction is to
-    SUBTRACT the server's UTC offset. Getting the sign wrong would double the
-    error instead of removing it.
+    Because MySQL converts on write *and* on read, the stored instant was
+    always correct; the bug was that the code treated the server-local value
+    it read back as UTC. Pinning sessions to UTC therefore fixes historical
+    rows on its own.
+
+    An earlier attempt added a DATE_ADD "rebase" migration. That was wrong: it
+    shifts an already-correct epoch and corrupts the data. These tests encode
+    the reasoning so it does not get reintroduced.
     """
 
-    def test_shift_sign_recovers_true_utc(self):
-        true_utc = datetime(2026, 8, 3, 14, 13)
-        for offset_hours in (0, 2, 3.5, -5, 5.5):
-            with self.subTest(offset=offset_hours):
-                # What MySQL handed back under the old, unpinned session.
-                legacy = true_utc + timedelta(hours=offset_hours)
-                # TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW()) on that server.
-                server_offset = int(offset_hours * 3600)
-                shift = -server_offset          # what init_db applies
-                migrated = legacy + timedelta(seconds=shift)
-                self.assertEqual(migrated, true_utc)
+    SERVER_OFFSET_HOURS = 2                  # e.g. a CEST database server
+    TRUE_UTC = datetime(2026, 8, 3, 9, 7)    # == 12:37 Tehran
 
-    def test_utc_server_needs_no_shift(self):
-        self.assertEqual(-0, 0)
-        true_utc = datetime(2026, 8, 3, 14, 13)
-        self.assertEqual(true_utc + timedelta(seconds=-0), true_utc)
-
-    def test_migrated_rows_render_correctly(self):
+    def setUp(self):
         import utils
-        orig = utils.USE_JALALI
+        self.utils = utils
+        self._orig = utils.USE_JALALI
         utils.set_calendar(True)
-        try:
-            true_utc = datetime(2026, 8, 3, 14, 13)
-            for offset_hours in (0, 2, 3.5):
-                with self.subTest(offset=offset_hours):
-                    legacy = true_utc + timedelta(hours=offset_hours)
-                    migrated = legacy + timedelta(seconds=-int(offset_hours * 3600))
-                    self.assertEqual(utils.format_local(migrated), "۱۴۰۵-۰۵-۱۲ ۱۷:۴۳")
-        finally:
-            utils.set_calendar(orig)
+
+    def tearDown(self):
+        self.utils.set_calendar(self._orig)
+
+    def _read_with_session_offset(self, hours):
+        """What MySQL returns for a TIMESTAMP under a given session timezone."""
+        return self.TRUE_UTC + timedelta(hours=hours)
+
+    def test_utc_pinned_session_reads_the_true_instant(self):
+        read = self._read_with_session_offset(0)
+        self.assertEqual(read, self.TRUE_UTC)
+        self.assertEqual(self.utils.format_local(read), "۱۴۰۵-۰۵-۱۲ ۱۲:۳۷")
+
+    def test_unpinned_session_reproduces_the_reported_bug(self):
+        read = self._read_with_session_offset(self.SERVER_OFFSET_HOURS)
+        self.assertEqual(self.utils.format_local(read), "۱۴۰۵-۰۵-۱۲ ۱۴:۳۷")
+
+    def test_rebasing_a_timestamp_column_would_corrupt_it(self):
+        correct = self._read_with_session_offset(0)
+        rebased = correct - timedelta(hours=self.SERVER_OFFSET_HOURS)
+        self.assertNotEqual(rebased, self.TRUE_UTC)
+        self.assertEqual(self.utils.format_local(rebased), "۱۴۰۵-۰۵-۱۲ ۱۰:۳۷")
+
+    def test_no_rebase_migration_remains_in_the_schema(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        source = open(os.path.join(root, "database.py"), encoding="utf-8").read()
+        self.assertNotIn("timestamps_utc_migrated", source,
+                         "the corrupting rebase migration was reintroduced")
+        self.assertIn("SET time_zone = '+00:00'", source,
+                      "the UTC session pin is missing")
+
+    def test_datetime_columns_are_written_as_explicit_utc(self):
+        # DATETIME gets no implicit conversion, so those writes must be UTC.
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        source = open(os.path.join(root, "database.py"), encoding="utf-8").read()
+        self.assertIn("run_at <= UTC_TIMESTAMP()", source)
+        self.assertIn("claimed_at = UTC_TIMESTAMP()", source)
+
+    def test_session_pin_is_verified_at_startup(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        source = open(os.path.join(root, "database.py"), encoding="utf-8").read()
+        self.assertIn("_assert_session_is_utc", source,
+                      "startup must fail loudly if sessions are not on UTC")
