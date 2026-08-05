@@ -9,7 +9,7 @@ from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
 from config import (
-    RETRY_DELAYS_HOURS, SCHEDULE_GRACE_SECONDS, WORKFLOW_TTL_SECONDS,
+    RETRY_INTERVAL_MINUTES, SCHEDULE_GRACE_SECONDS, WORKFLOW_TTL_SECONDS,
 )
 from database import (
     get_active_channels, is_writer_or_above, is_sudo, is_owner, save_post,
@@ -463,29 +463,28 @@ async def _post_to_bale(channels, state, bot):
     return sent, failed, message_ids, errors
 
 
-def _next_retry_at(attempts: int):
-    """Naive-UTC time of the next automatic retry, or None when exhausted.
+def _next_retry_at():
+    """Naive-UTC time of the next automatic retry, or None when disabled.
 
-    ``attempts`` is how many deliveries have already been tried, so attempt 1
-    schedules RETRY_DELAYS_HOURS[0] (1h), then 3h, then 6h, then gives up.
+    Failed channels are retried on a fixed RETRY_INTERVAL_MINUTES cadence
+    until they succeed or the retries are stopped from the post history —
+    there is no attempt cap.
     """
-    index = max(0, attempts - 1)
-    if index >= len(RETRY_DELAYS_HOURS):
+    if RETRY_INTERVAL_MINUTES <= 0:
         return None
-    return datetime.utcnow() + timedelta(hours=RETRY_DELAYS_HOURS[index])
+    return datetime.utcnow() + timedelta(minutes=RETRY_INTERVAL_MINUTES)
 
 
-async def _record_channel_results(post_id: int, channels, failures: dict, attempt_no: int = 1):
+async def _record_channel_results(post_id: int, channels, failures: dict):
     """Persist one row per channel and arm retries for the failures."""
     for ch in channels:
         error = failures.get(ch["id"])
         if error is None:
             await record_delivery(post_id, ch["id"], ch.get("platform", "telegram"), "completed")
         else:
-            retry_at = _next_retry_at(attempt_no)
             await record_delivery(
                 post_id, ch["id"], ch.get("platform", "telegram"), "failed",
-                error=str(error)[:1000], next_retry_at=retry_at,
+                error=str(error)[:1000], next_retry_at=_next_retry_at(),
             )
 
 
@@ -513,8 +512,20 @@ async def _resolve_targets(post: dict, only_channel_ids: set = None):
     return tg, bale
 
 
-async def publish_existing_post(post: dict, bot, only_channel_ids: set = None,
-                                attempt_no: int = 1) -> tuple[int, int]:
+async def split_live_targets(post: dict, channel_ids: set) -> tuple[set, set]:
+    """Split ``channel_ids`` into (live, dead) against the post's targets.
+
+    A channel is dead when it no longer exists or is inactive. Retrying a
+    dead channel can never succeed, so callers must finalise those rows
+    instead of re-queueing them forever.
+    """
+    tg, bale = await _resolve_targets(post)
+    alive = {c["id"] for c in tg + bale}
+    live = {i for i in channel_ids if i in alive}
+    return live, channel_ids - live
+
+
+async def publish_existing_post(post: dict, bot, only_channel_ids: set = None) -> tuple[int, int]:
     """Publish a stored post, used by scheduled jobs and retry actions.
 
     Registers itself as in-flight so a restart can wait for it to finish.
@@ -542,7 +553,7 @@ async def publish_existing_post(post: dict, bot, only_channel_ids: set = None,
         await update_post_message_ids(post_id, json.dumps(existing + tg_ids + bale_ids), None)
 
         failures = {**tg_errors, **bale_errors}
-        await _record_channel_results(post_id, tg + bale, failures, attempt_no)
+        await _record_channel_results(post_id, tg + bale, failures)
 
         total = len(tg) + len(bale)
         sent = tg_sent + bale_sent
@@ -569,6 +580,17 @@ async def _aggregate_status(post_id: int) -> str:
     if done == len(rows):
         return "completed"
     return "partial" if done else "failed"
+
+
+async def refresh_delivery_status(post_id: int) -> str:
+    """Recompute and persist the post-level status from its per-channel rows.
+
+    Used after retries are cancelled so the post settles on its final,
+    incomplete status (partial/failed) instead of staying "pending"-ish.
+    """
+    status = await _aggregate_status(post_id)
+    await update_post_delivery(post_id, status, None)
+    return status
 
 
 async def _notify(bot, user_id: int, text: str):
@@ -654,8 +676,8 @@ async def process_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
 
             if failed:
                 retry_note = ""
-                if RETRY_DELAYS_HOURS:
-                    retry_note = f"\n🔁 تلاش مجدد خودکار تا {RETRY_DELAYS_HOURS[0]} ساعت دیگر انجام می‌شود."
+                if RETRY_INTERVAL_MINUTES:
+                    retry_note = f"\n🔁 تلاش مجدد خودکار تا {RETRY_INTERVAL_MINUTES} دقیقه دیگر انجام می‌شود."
                 await _notify(
                     context.bot, schedule["user_id"],
                     f"⚠️ پست زمان‌بندی‌شده #{post['id']} ناقص ارسال شد.\n"
@@ -677,10 +699,10 @@ async def process_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def process_delivery_retries(context: ContextTypes.DEFAULT_TYPE):
-    """Re-send only the channels that failed, at 1h / 3h / 6h.
+    """Re-send only the channels that failed, every RETRY_INTERVAL_MINUTES.
 
-    Retries are grouped per post so a post failing on three channels produces
-    one notification, not three.
+    Retries repeat on the fixed interval until every channel succeeds or they
+    are stopped from the post history — there is no attempt cap.
     """
     try:
         await reclaim_stale_retries()
@@ -691,16 +713,18 @@ async def process_delivery_retries(context: ContextTypes.DEFAULT_TYPE):
     if not due:
         return
 
-    # Group by (post, attempt count): channels that have failed a different
-    # number of times sit on different rungs of the 1h/3h/6h ladder and must
-    # not be merged, or a first-time failure would jump straight to 6h.
-    by_group: dict[tuple, list[dict]] = {}
+    # Group by post so a post failing on three channels produces one publish
+    # and one notification, not three. (With a fixed retry cadence there are
+    # no ladder rungs to keep apart, so attempt counts need not be separated.)
+    by_post: dict[int, list[dict]] = {}
     for row in due:
         if await claim_delivery_retry(row["id"]):
-            by_group.setdefault((row["post_id"], row["attempts"]), []).append(row)
+            by_post.setdefault(row["post_id"], []).append(row)
 
-    for (post_id, attempt_no), rows in by_group.items():
-        channel_ids = {r["channel_id"] for r in rows}
+    for post_id, rows in by_post.items():
+        # Updated by the try-block; the except must only re-arm rows that are
+        # still live — dead channels were finalised and must stay that way.
+        live_ids = {r["channel_id"] for r in rows}
         try:
             post = await get_post(post_id)
             if not post:
@@ -709,32 +733,45 @@ async def process_delivery_retries(context: ContextTypes.DEFAULT_TYPE):
                     await record_delivery(post_id, r["channel_id"], r["platform"],
                                           "cancelled", "post deleted", None)
                 continue
+
+            # Channels that were removed/deactivated since the failure can
+            # never be delivered; finalise them instead of retrying forever.
+            live_ids, dead_ids = await split_live_targets(post, live_ids)
+            for r in rows:
+                if r["channel_id"] in dead_ids:
+                    await record_delivery(post_id, r["channel_id"], r["platform"],
+                                          "cancelled", "channel no longer available", None)
+            if not live_ids:
+                continue
+
             sent, failed = await publish_existing_post(
-                post, context.bot, only_channel_ids=channel_ids, attempt_no=attempt_no + 1,
+                post, context.bot, only_channel_ids=live_ids,
             )
-            exhausted = _next_retry_at(attempt_no + 1) is None
-            if failed and exhausted:
-                await _notify(
-                    context.bot, post["user_id"],
-                    f"❌ تلاش‌های خودکار برای ارسال پست #{post_id} به {failed} مقصد ناموفق بود "
-                    f"و دیگر تکرار نمی‌شود.\nبرای ارسال دستی از «🔁 ارسال مجدد» استفاده کنید.",
-                )
-            elif failed:
-                nxt = RETRY_DELAYS_HOURS[min(attempt_no, len(RETRY_DELAYS_HOURS) - 1)]
+            if failed:
                 await _notify(
                     context.bot, post["user_id"],
                     f"⚠️ تلاش مجدد پست #{post_id} برای {failed} مقصد ناموفق بود. "
-                    f"تلاش بعدی تا {nxt} ساعت دیگر.",
+                    f"تلاش بعدی {RETRY_INTERVAL_MINUTES} دقیقه دیگر انجام می‌شود.",
                 )
             else:
-                await _notify(
-                    context.bot, post["user_id"],
-                    f"✅ تلاش مجدد موفق بود: پست #{post_id} به {sent} مقصد باقی‌مانده ارسال شد.",
-                )
+                final_status = await _aggregate_status(post_id)
+                if final_status == "completed":
+                    await _notify(
+                        context.bot, post["user_id"],
+                        f"✅ تلاش مجدد موفق بود: پست #{post_id} به {sent} مقصد باقی‌مانده ارسال شد "
+                        "و کامل شد.",
+                    )
+                else:
+                    await _notify(
+                        context.bot, post["user_id"],
+                        f"✅ تلاش مجدد موفق بود: {sent} مقصد باقی‌ماندهٔ پست #{post_id} ارسال شد.",
+                    )
         except Exception as exc:
             logger.exception("Delivery retry for post %s failed", post_id)
-            retry_at = _next_retry_at(attempt_no + 1)
+            retry_at = _next_retry_at()
             for r in rows:
+                if r["channel_id"] not in live_ids:
+                    continue
                 await record_delivery(post_id, r["channel_id"], r["platform"], "failed",
                                       str(exc)[:1000], retry_at)
 
@@ -802,9 +839,9 @@ async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         delivery_status = "completed" if total_sent == total else ("partial" if total_sent else "failed")
         delivery_errors = {"telegram_failed": tg_failed, "bale_failed": bale_failed}
         await update_post_delivery(post_id, delivery_status, json.dumps(delivery_errors))
-        # Per-channel rows arm the automatic 1h/3h/6h retries.
+        # Per-channel rows arm the automatic retries.
         await _record_channel_results(
-            post_id, tg_channels + bale_channels, {**tg_errors, **bale_errors}, attempt_no=1,
+            post_id, tg_channels + bale_channels, {**tg_errors, **bale_errors},
         )
     finally:
         async with _inflight_lock:
@@ -821,8 +858,8 @@ async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         result += f"\n🔵 بله: {bale_sent}/{len(bale_channels)}"
     if total_failed:
         result += f"\n❌ ناموفق: {total_failed}"
-        if RETRY_DELAYS_HOURS:
-            result += f"\n🔁 تلاش مجدد خودکار تا {RETRY_DELAYS_HOURS[0]} ساعت دیگر."
+        if RETRY_INTERVAL_MINUTES:
+            result += f"\n🔁 تلاش مجدد خودکار تا {RETRY_INTERVAL_MINUTES} دقیقه دیگر."
 
     from database import is_sudo as _is_sudo, is_owner as _is_owner
     await context.bot.send_message(

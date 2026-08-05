@@ -356,7 +356,8 @@ def history_keyboard(posts: list[dict], page: int = 1, total_pages: int = 1, is_
     return InlineKeyboardMarkup(buttons)
 
 
-def post_detail_keyboard(post_id: int, status: str = "completed", schedule_id: int = None) -> InlineKeyboardMarkup:
+def post_detail_keyboard(post_id: int, status: str = "completed", schedule_id: int = None,
+                         can_manage_retries: bool = False, has_active_retries: bool = False) -> InlineKeyboardMarkup:
     if status == "draft":
         buttons = [[InlineKeyboardButton("✅ انتشار پیش‌نویس", callback_data=f"publish_draft_{post_id}")]]
     elif status == "scheduled":
@@ -374,5 +375,16 @@ def post_detail_keyboard(post_id: int, status: str = "completed", schedule_id: i
             [InlineKeyboardButton("✏️ ویرایش", callback_data=f"edit_{post_id}"), InlineKeyboardButton("🗑️ حذف", callback_data=f"delete_{post_id}")],
             [InlineKeyboardButton("📄 کپی", callback_data=f"duplicate_{post_id}"), InlineKeyboardButton("🔁 ارسال مجدد", callback_data=f"retry_{post_id}")],
         ]
+        # Retry management belongs to whoever may edit the post (writers for
+        # their own posts, sudo/owner for all). The buttons are only offered
+        # while automatic attempts are actually queued — they disappear once
+        # the post is fully sent or the retries have been stopped. Labels
+        # deliberately avoid «ارسال مجدد» so they are not mistaken for the
+        # full-resend button above, which copies the post as a new entry.
+        if can_manage_retries and has_active_retries:
+            buttons.append([
+                InlineKeyboardButton("⚡ ارسال فوری مقصدهای ناموفق", callback_data=f"retry_now_{post_id}"),
+                InlineKeyboardButton("🚫 توقف تلاش‌های خودکار", callback_data=f"cancel_retries_{post_id}"),
+            ])
     buttons.append([InlineKeyboardButton("◀️ بازگشت", callback_data="history")])
     return InlineKeyboardMarkup(buttons)

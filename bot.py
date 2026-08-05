@@ -143,6 +143,8 @@ from handlers.history import (
     handle_delete,
     handle_duplicate,
     handle_retry,
+    handle_retry_now,
+    handle_cancel_retries,
     handle_publish_draft,
     handle_approve,
 )
@@ -314,6 +316,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_delete, pattern="^delete_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_duplicate, pattern="^duplicate_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_retry, pattern="^retry_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_retry_now, pattern="^retry_now_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_cancel_retries, pattern="^cancel_retries_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_publish_draft, pattern="^publish_draft_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_approve, pattern="^approve_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_settings, pattern="^settings$"))
@@ -449,8 +453,10 @@ def main():
             process_scheduled_posts, interval=60, first=5, name="scheduled_posts",
             job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
         )
+        # Check every minute: retries now fire on a 10-minute cadence, so a
+        # slower sweep would drift noticeably past each due time.
         context.job_queue.run_repeating(
-            process_delivery_retries, interval=300, first=60, name="delivery_retries",
+            process_delivery_retries, interval=60, first=30, name="delivery_retries",
             job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 600},
         )
         context.job_queue.run_repeating(

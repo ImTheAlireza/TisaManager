@@ -32,11 +32,12 @@ SCHEDULE_CLAIM_TIMEOUT_SECONDS = int(os.getenv("SCHEDULE_CLAIM_TIMEOUT_SECONDS",
 # A schedule that keeps dying mid-publish is abandoned after this many claims.
 SCHEDULE_MAX_ATTEMPTS = int(os.getenv("SCHEDULE_MAX_ATTEMPTS", 3))
 
-# Automatic re-delivery offsets (hours after the first failure) for channels
-# that failed. Empty string disables automatic retries.
-RETRY_DELAYS_HOURS = tuple(
-    int(x) for x in os.getenv("RETRY_DELAYS_HOURS", "1,3,6").split(",") if x.strip()
-)
+# Automatic re-delivery cadence (minutes) for channels that failed. Failed
+# channels are retried on this fixed interval until they succeed or the
+# retries are stopped from the post history (writers for their own posts,
+# sudo/owner for all) — there is no attempt cap. Set to 0 to disable
+# automatic retries.
+RETRY_INTERVAL_MINUTES = int(os.getenv("RETRY_INTERVAL_MINUTES", 10))
 
 # An interactive workflow (composing a post, picking a time) is remembered for
 # this long, and survives a restart.

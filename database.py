@@ -1194,6 +1194,32 @@ async def reclaim_stale_retries():
             return cur.rowcount
 
 
+async def cancel_post_retries(post_id: int) -> int:
+    """Stop every automatic retry queued for a post.
+
+    Failed channels keep their final 'failed' status but lose their scheduled
+    next attempt, so the post's delivery result is accepted as incomplete.
+    Rows claimed by a retry tick ('retrying', next_retry_at already NULL) are
+    finalised too, so the stale-retry recovery cannot re-arm them after a
+    crash. Returns how many rows had a pending attempt cleared.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE post_deliveries SET next_retry_at = NULL "
+                "WHERE post_id = %s AND status = 'failed' AND next_retry_at IS NOT NULL",
+                (post_id,),
+            )
+            cleared = cur.rowcount
+            await cur.execute(
+                "UPDATE post_deliveries SET status = 'failed' "
+                "WHERE post_id = %s AND status = 'retrying'",
+                (post_id,),
+            )
+            return cleared
+
+
 async def get_post_deliveries(post_id: int) -> list[dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:

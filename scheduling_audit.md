@@ -146,10 +146,10 @@ Built now:
 - **`notify_online`** releases the users it asked to wait.
 *Tests: `WorkflowPersistenceTests` (4), `InflightTrackingTests` (2).*
 
-### "Retry in 1/3/6 hours with notification"
+### "Retry every 10 minutes until sent, with notification"
 
 **Also not implemented.** No retry table, no scheduling of retries, no
-`timedelta(hours=...)` anywhere. The only retry was the manual "🔁 ارسال مجدد"
+`timedelta(...)` anywhere. The only retry was the manual "🔁 ارسال مجدد"
 button, and `get_pool`'s 3-attempt connection loop. Worse, the old failure path
 recorded only *counts* (`{"telegram_failed": 2}`) — no record of *which*
 channels failed, so a retry was impossible even in principle. And a Bale
@@ -159,19 +159,42 @@ Built now:
 
 - **`post_deliveries`** — one row per (post, channel) with `status`, `error`,
   `attempts`, `next_retry_at`.
-- **`_next_retry_at()`** implements the 1h → 3h → 6h ladder from
-  `RETRY_DELAYS_HOURS` and returns `None` when exhausted.
-- **`process_delivery_retries`** (every 5 min) claims due rows atomically and
+- **`_next_retry_at()`** returns now + `RETRY_INTERVAL_MINUTES` (default 10).
+  There is **no attempt cap**: a failed channel is retried every 10 minutes
+  until it succeeds or a sudo/owner cancels the retries. (`RETRY_DELAYS_HOURS`,
+  the old 1h → 3h → 6h ladder, was replaced by this fixed cadence.)
+- **`process_delivery_retries`** (every minute) claims due rows atomically and
   re-sends **only the failed channels**, preserving the message ids of channels
-  that already succeeded. Grouped by `(post, attempt)` so channels on different
-  rungs aren't merged.
-- **Notifications** at every transition: partial failure with next-attempt time,
-  retry success, and final give-up pointing at the manual button.
+  that already succeeded. All due channels of a post go out in one batch.
+- **Notifications** at every transition: partial failure with next-attempt time
+  and retry success.
+- **Retry management in the post detail view** (post history), available to
+  sudo/owner for every post and to writers for their own posts (the same rule
+  as `can_edit_post`):
+  - **⚡ ارسال فوری مقصدهای ناموفق** (`retry_now_<id>`) re-sends only the
+    failed channels immediately — it completes the same post rather than
+    copying it like «🔁 ارسال مجدد». Success marks the post complete; failure
+    arms the next automatic attempt 10 minutes from that moment.
+  - **🚫 توقف تلاش‌های خودکار** (`cancel_retries_<id>`) clears every queued
+    attempt (`cancel_post_retries`, which also finalises in-flight `retrying`
+    rows so the stale-recovery sweep cannot re-arm them) and settles the post
+    on its final incomplete status via `refresh_delivery_status`. With nothing
+    queued it is a no-op that never touches the post status, so a stale button
+    cannot flip a healthy post to "failed".
+  - Both buttons are rendered only while an automatic attempt is actually
+    queued (`next_retry_at` set or a row mid-retry); they disappear once the
+    post is fully sent or the retries are stopped.
+  - Channels removed/deactivated after a failure can never be delivered:
+    `split_live_targets` separates them, both the retry job and retry-now
+    finalise those rows as `cancelled` instead of retrying/reporting them
+    forever.
 - Bale `ok: false` is now correctly treated as a failure.
 - Failed channels and their next retry time are shown in the post detail view;
   `/stats` gained "🔁 در صف تلاش مجدد".
-*Tests: `RetryScheduleTests` (2), `RetryTargetingTests` (2),
-`RetryLadderGroupingTests`, `PartialRetryPreservationTests`.*
+*Tests: `RetryScheduleTests` (3), `RetryTargetingTests` (3),
+`RetryGroupingTests`, `RetryCancelButtonTests` (10),
+`DeadChannelRetryLoopTests`, `RetryButtonKeyboardTests` (4),
+`PartialRetryPreservationTests`.*
 
 ---
 
@@ -185,8 +208,8 @@ Built now:
   answers them with "this button is from the previous version".
 - **New env knobs** (all optional, defaults in `config.py`): `DISPLAY_TIMEZONE`,
   `SCHEDULE_GRACE_SECONDS`, `SCHEDULE_CLAIM_TIMEOUT_SECONDS`,
-  `SCHEDULE_MAX_ATTEMPTS`, `RETRY_DELAYS_HOURS`, `WORKFLOW_TTL_SECONDS`,
-  `RESTART_DRAIN_TIMEOUT_SECONDS`.
+  `SCHEDULE_MAX_ATTEMPTS`, `RETRY_INTERVAL_MINUTES` (0 disables automatic
+  retries), `WORKFLOW_TTL_SECONDS`, `RESTART_DRAIN_TIMEOUT_SECONDS`.
 - **Not done / worth considering later:** per-user timezones and recurring
   schedules.
 
