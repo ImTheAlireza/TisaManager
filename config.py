@@ -5,6 +5,12 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BALE_TOKEN = os.getenv("BALE_TOKEN")
+# Optional second Bale bot used as a backup sender. Delivery attempts
+# alternate between the two bots (attempt 1 -> bot 1, attempt 2 -> bot 2,
+# attempt 3 -> bot 1, ...) so a rate-limited or blocked bot is swapped for a
+# fresh one on the next try. Leave unset to send every attempt with the
+# primary bot.
+BALE_TOKEN_2 = os.getenv("BALE_TOKEN_2") or None
 SUDO_USER_ID = int(os.getenv("SUDO_USER_ID", 0))
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", 3306))

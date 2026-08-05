@@ -157,6 +157,16 @@ response with `ok: false` was silently counted as a success.
 
 Built now:
 
+- **Backup Bale bot (`BALE_TOKEN_2`)** — delivery attempts alternate between
+  two Bale bots: attempt 1 goes through bot 1, attempt 2 through bot 2,
+  attempt 3 through bot 1, and so on (`bale_client.client_for_attempt`), so a
+  rate-limited or blocked bot is swapped for a fresh one on the next try.
+  `bale_client` is now a `BaleClient` class per token; the old module-level
+  functions still exist and use the primary bot. Unset `BALE_TOKEN_2` keeps
+  the previous single-bot behaviour. Because either bot may have posted a
+  message, post edits/deletes try every configured bot, and the channel
+  health check verifies every bot can reach the channel. The retry job and
+  retry-now batch channels by attempt parity so one publish never mixes bots.
 - **`post_deliveries`** — one row per (post, channel) with `status`, `error`,
   `attempts`, `next_retry_at`.
 - **`_next_retry_at()`** returns now + `RETRY_INTERVAL_MINUTES` (default 10).
@@ -192,7 +202,8 @@ Built now:
 - Failed channels and their next retry time are shown in the post detail view;
   `/stats` gained "🔁 در صف تلاش مجدد".
 *Tests: `RetryScheduleTests` (3), `RetryTargetingTests` (3),
-`RetryGroupingTests`, `RetryCancelButtonTests` (10),
+`RetryGroupingTests` (2), `RetryCancelButtonTests` (11),
+`BaleBotAlternationTests` (4),
 `DeadChannelRetryLoopTests`, `RetryButtonKeyboardTests` (4),
 `PartialRetryPreservationTests`.*
 
@@ -209,7 +220,8 @@ Built now:
 - **New env knobs** (all optional, defaults in `config.py`): `DISPLAY_TIMEZONE`,
   `SCHEDULE_GRACE_SECONDS`, `SCHEDULE_CLAIM_TIMEOUT_SECONDS`,
   `SCHEDULE_MAX_ATTEMPTS`, `RETRY_INTERVAL_MINUTES` (0 disables automatic
-  retries), `WORKFLOW_TTL_SECONDS`, `RESTART_DRAIN_TIMEOUT_SECONDS`.
+  retries), `BALE_TOKEN_2` (backup Bale bot; attempts alternate between the
+  two bots), `WORKFLOW_TTL_SECONDS`, `RESTART_DRAIN_TIMEOUT_SECONDS`.
 - **Not done / worth considering later:** per-user timezones and recurring
   schedules.
 

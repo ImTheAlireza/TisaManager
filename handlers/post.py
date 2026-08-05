@@ -396,8 +396,13 @@ async def _post_to_telegram(channels, state, bot):
     return sent, failed, message_ids, errors
 
 
-async def _post_to_bale(channels, state, bot):
-    """Returns (sent, failed, message_ids, errors_by_channel_id)."""
+async def _post_to_bale(channels, state, bot, attempt_no: int = 1):
+    """Returns (sent, failed, message_ids, errors_by_channel_id).
+
+    ``attempt_no`` selects which Bale bot sends: attempts alternate between
+    the primary bot and the backup bot (if configured), so a rate-limited or
+    blocked bot is swapped for a fresh one on the next try.
+    """
     import bale_client
     import tempfile
     import os
@@ -405,6 +410,12 @@ async def _post_to_bale(channels, state, bot):
     failed = 0
     message_ids = []
     errors: dict[int, str] = {}
+    client = bale_client.client_for_attempt(attempt_no)
+    if client is None:
+        # No Bale token configured at all; report every channel as failed.
+        for ch in channels:
+            errors[ch["id"]] = "Bale token not configured"
+        return 0, len(channels), [], errors
     post_type = state.get("type")
     tmp_dir = tempfile.mkdtemp(prefix="bale_post_")
     try:
@@ -412,25 +423,25 @@ async def _post_to_bale(channels, state, bot):
             try:
                 result = None
                 if post_type == "text":
-                    result = await bale_client.send_message(ch["chat_id"], state["text"])
+                    result = await client.send_message(ch["chat_id"], state["text"])
                 elif post_type == "photo":
                     path = os.path.join(tmp_dir, f"photo_{ch['id']}.jpg")
                     file = await bot.get_file(state["file_id"])
                     await file.download_to_drive(path)
                     with open(path, "rb") as f:
-                        result = await bale_client.send_photo(ch["chat_id"], f.read(), caption=state.get("caption"))
+                        result = await client.send_photo(ch["chat_id"], f.read(), caption=state.get("caption"))
                 elif post_type == "video":
                     path = os.path.join(tmp_dir, f"video_{ch['id']}.mp4")
                     file = await bot.get_file(state["file_id"])
                     await file.download_to_drive(path)
                     with open(path, "rb") as f:
-                        result = await bale_client.send_video(ch["chat_id"], f.read(), caption=state.get("caption"))
+                        result = await client.send_video(ch["chat_id"], f.read(), caption=state.get("caption"))
                 elif post_type == "document":
                     path = os.path.join(tmp_dir, f"doc_{ch['id']}.bin")
                     file = await bot.get_file(state["file_id"])
                     await file.download_to_drive(path)
                     with open(path, "rb") as f:
-                        result = await bale_client.send_document(ch["chat_id"], f.read(), caption=state.get("caption"))
+                        result = await client.send_document(ch["chat_id"], f.read(), caption=state.get("caption"))
                 elif post_type == "media_group":
                     caption = state.get("caption")
                     media_files = []
@@ -441,7 +452,7 @@ async def _post_to_bale(channels, state, bot):
                         await file.download_to_drive(path)
                         with open(path, "rb") as f:
                             media_files.append((m["type"], f.read()))
-                    result = await bale_client.send_media_group(ch["chat_id"], media_files, caption=caption)
+                    result = await client.send_media_group(ch["chat_id"], media_files, caption=caption)
                 if result and result.get("ok"):
                     msg = result["result"]
                     if isinstance(msg, list):
@@ -454,7 +465,7 @@ async def _post_to_bale(channels, state, bot):
                     raise RuntimeError(result.get("description", "Bale API error"))
                 sent += 1
             except Exception as e:
-                logger.error("Failed to post to Bale %s (%s): %s", ch["name"], ch["chat_id"], e)
+                logger.error("Failed to post to Bale %s (%s) via %s: %s", ch["name"], ch["chat_id"], client.name, e)
                 errors[ch["id"]] = str(e)
                 failed += 1
     finally:
@@ -525,10 +536,13 @@ async def split_live_targets(post: dict, channel_ids: set) -> tuple[set, set]:
     return live, channel_ids - live
 
 
-async def publish_existing_post(post: dict, bot, only_channel_ids: set = None) -> tuple[int, int]:
+async def publish_existing_post(post: dict, bot, only_channel_ids: set = None,
+                                attempt_no: int = 1) -> tuple[int, int]:
     """Publish a stored post, used by scheduled jobs and retry actions.
 
     Registers itself as in-flight so a restart can wait for it to finish.
+    ``attempt_no`` is this delivery's attempt number and only decides which
+    Bale bot sends (attempts alternate bots); scheduling is unaffected.
     """
     post_id = post["id"]
     async with _inflight_lock:
@@ -538,7 +552,7 @@ async def publish_existing_post(post: dict, bot, only_channel_ids: set = None) -
         state = {"type": post["post_type"], "text": post.get("text"), "file_id": post.get("file_id"),
                  "caption": post.get("caption"), "media": json.loads(post.get("media_json") or "[]")}
         tg_sent, tg_failed, tg_ids, tg_errors = await _post_to_telegram(tg, state, bot)
-        bale_sent, bale_failed, bale_ids, bale_errors = await _post_to_bale(bale, state, bot)
+        bale_sent, bale_failed, bale_ids, bale_errors = await _post_to_bale(bale, state, bot, attempt_no)
 
         # Merge with anything already delivered so a partial retry does not
         # erase the message ids of the channels that succeeded earlier.
@@ -714,14 +728,19 @@ async def process_delivery_retries(context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Group by post so a post failing on three channels produces one publish
-    # and one notification, not three. (With a fixed retry cadence there are
-    # no ladder rungs to keep apart, so attempt counts need not be separated.)
-    by_post: dict[int, list[dict]] = {}
+    # and one notification, not three. Channels are also split by attempt
+    # parity: Bale attempts alternate bots, so channels whose next attempt
+    # falls on different bots must not share a publish.
+    by_key: dict[tuple, list[dict]] = {}
     for row in due:
         if await claim_delivery_retry(row["id"]):
-            by_post.setdefault(row["post_id"], []).append(row)
+            by_key.setdefault((row["post_id"], row["attempts"] % 2), []).append(row)
 
-    for post_id, rows in by_post.items():
+    for (post_id, parity), rows in by_key.items():
+        # Rows carry how many attempts already happened; the next send is
+        # attempt attempts+1. Even attempts (2, 4, ...) go to the backup bot,
+        # odd ones (1, 3, ...) to the primary.
+        attempt_no = 2 if parity else 1
         # Updated by the try-block; the except must only re-arm rows that are
         # still live — dead channels were finalised and must stay that way.
         live_ids = {r["channel_id"] for r in rows}
@@ -745,7 +764,7 @@ async def process_delivery_retries(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             sent, failed = await publish_existing_post(
-                post, context.bot, only_channel_ids=live_ids,
+                post, context.bot, only_channel_ids=live_ids, attempt_no=attempt_no,
             )
             if failed:
                 await _notify(
@@ -829,7 +848,10 @@ async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         _inflight_publishes.add(post_id)
     try:
         tg_sent, tg_failed, tg_message_ids, tg_errors = await _post_to_telegram(tg_channels, state, context.bot)
-        bale_sent, bale_failed, bale_message_ids, bale_errors = await _post_to_bale(bale_channels, state, context.bot)
+        # First attempt: always the primary Bale bot.
+        bale_sent, bale_failed, bale_message_ids, bale_errors = await _post_to_bale(
+            bale_channels, state, context.bot, attempt_no=1,
+        )
 
         # Update history with all message IDs
         all_message_ids = tg_message_ids + bale_message_ids

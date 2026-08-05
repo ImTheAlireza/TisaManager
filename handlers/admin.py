@@ -31,9 +31,18 @@ async def run_channel_health_checks(context: ContextTypes.DEFAULT_TYPE):
         async with semaphore:
             try:
                 if channel["platform"] == "bale":
-                    result = await asyncio.wait_for(bale_client.get_chat(channel["chat_id"]), timeout=20)
-                    if not result.get("ok"):
-                        raise RuntimeError(result.get("description", "Bale API error"))
+                    # Delivery attempts alternate between the configured Bale
+                    # bots, so every bot must be able to reach the channel.
+                    clients = bale_client.all_clients()
+                    if not clients:
+                        raise RuntimeError("no Bale bot configured")
+                    errors = []
+                    for client in clients:
+                        result = await asyncio.wait_for(client.get_chat(channel["chat_id"]), timeout=20)
+                        if not result.get("ok"):
+                            errors.append(f"{client.name}: {result.get('description', 'Bale API error')}")
+                    if errors:
+                        raise RuntimeError("؛ ".join(errors))
                 else:
                     await asyncio.wait_for(context.bot.get_chat(channel["chat_id"]), timeout=20)
                 await update_channel_health(channel["id"], "healthy")

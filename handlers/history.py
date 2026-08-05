@@ -46,11 +46,16 @@ async def _try_edit_message(context, chat_id, message_id, platform, post, new_te
     try:
         if platform == "bale":
             import bale_client
-            if post_type == "text":
-                result = await bale_client.edit_message_text(chat_id, message_id, new_text)
-            else:
-                result = await bale_client.edit_message_caption(chat_id, message_id, new_text)
-            return result.get("ok", False)
+            # The message may have been posted by either Bale bot (attempts
+            # alternate), so try each bot until one owns the message.
+            for client in bale_client.all_clients():
+                if post_type == "text":
+                    result = await client.edit_message_text(chat_id, message_id, new_text)
+                else:
+                    result = await client.edit_message_caption(chat_id, message_id, new_text)
+                if result.get("ok", False):
+                    return True
+            return False
         else:
             if post_type == "text":
                 await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=new_text)
@@ -103,8 +108,13 @@ async def _try_delete_message(context, chat_id, message_id, platform):
     try:
         if platform == "bale":
             import bale_client
-            result = await bale_client.delete_message(chat_id, message_id)
-            return result.get("ok", False)
+            # The message may have been posted by either Bale bot (attempts
+            # alternate), so try each bot until one owns the message.
+            for client in bale_client.all_clients():
+                result = await client.delete_message(chat_id, message_id)
+                if result.get("ok", False):
+                    return True
+            return False
         else:
             await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
             return True
@@ -559,7 +569,22 @@ async def handle_retry_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.edit_message_text("⏳ در حال ارسال به مقصدهای ناموفق...")
-    sent, failed = await publish_existing_post(post, context.bot, only_channel_ids=live_ids)
+    # Bale attempts alternate bots, and each claimed row carries its own
+    # attempt count; publish one batch per attempt parity so every channel
+    # goes out on the bot its attempt number says.
+    parity_groups: dict[int, set] = {}
+    for d in claimed:
+        if d["channel_id"] in live_ids:
+            parity_groups.setdefault(d["attempts"] % 2, set()).add(d["channel_id"])
+    sent = 0
+    failed = 0
+    for parity, ids in sorted(parity_groups.items()):
+        batch_sent, batch_failed = await publish_existing_post(
+            post, context.bot, only_channel_ids=ids,
+            attempt_no=2 if parity else 1,
+        )
+        sent += batch_sent
+        failed += batch_failed
     final_status = await refresh_delivery_status(post_id)
     if failed == 0 and final_status == "completed":
         result = f"✅ پست #{post_id} کامل شد: {sent} مقصد باقی‌مانده با موفقیت ارسال شد."

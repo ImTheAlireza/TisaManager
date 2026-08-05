@@ -355,7 +355,7 @@ class ClaimingTests(SchedulingTestCase):
 
         calls = []
 
-        async def fake_publish(p, bot, only_channel_ids=None):
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
             calls.append(p["id"])
             await asyncio.sleep(0.05)
             return 1, 0
@@ -387,7 +387,7 @@ class ExpiryTests(SchedulingTestCase):
 
         calls = []
 
-        async def fake_publish(p, bot, only_channel_ids=None):
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
             calls.append(p["id"])
             return 1, 0
 
@@ -417,7 +417,7 @@ class ApprovalBypassTests(SchedulingTestCase):
 
         calls = []
 
-        async def fake_publish(p, bot, only_channel_ids=None):
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
             calls.append(p["id"])
             return 1, 0
 
@@ -442,7 +442,7 @@ class ApprovalBypassTests(SchedulingTestCase):
 
         calls = []
 
-        async def fake_publish(p, bot, only_channel_ids=None):
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
             calls.append(p["id"])
             return 1, 0
 
@@ -496,7 +496,7 @@ class RetryTargetingTests(SchedulingTestCase):
 
         seen = {}
 
-        async def fake_publish(p, bot, only_channel_ids=None):
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
             seen["ids"] = only_channel_ids
             return 1, 0
 
@@ -521,7 +521,7 @@ class RetryTargetingTests(SchedulingTestCase):
         async def failing_send(channels, state, bot):
             return 0, len(channels), [], {c["id"]: "still broken" for c in channels}
 
-        async def no_bale(channels, state, bot):
+        async def no_bale(channels, state, bot, attempt_no=1):
             return 0, 0, [], {}
 
         o1, o2 = post._post_to_telegram, post._post_to_bale
@@ -740,7 +740,7 @@ class InflightTrackingTests(SchedulingTestCase):
         original_bale = post._post_to_bale
         post._post_to_telegram = slow_send
 
-        async def no_bale(channels, state, bot):
+        async def no_bale(channels, state, bot, attempt_no=1):
             return 0, 0, [], {}
         post._post_to_bale = no_bale
         try:
@@ -839,22 +839,22 @@ if __name__ == "__main__":
 
 
 class RetryGroupingTests(SchedulingTestCase):
-    """With a flat cadence, all due channels of a post retry in one batch."""
+    """Due channels batch per post — and per Bale-bot parity."""
 
-    def test_channels_with_different_attempts_are_merged(self):
+    def test_channels_with_same_attempt_parity_are_merged(self):
         pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 2]"))
         overdue = datetime.utcnow() - timedelta(minutes=1)
-        # Channel 1 has failed once; channel 2 has failed three times. On the
-        # old ladder they were separate batches; on the flat 10-minute cadence
-        # both are due together and must go out in a single publish.
+        # Channel 1 has failed once; channel 2 has failed three times. Both
+        # counts are odd, so both next attempts fall on the same Bale bot and
+        # must go out in a single publish.
         run(FAKE.record_delivery(pid, 1, "telegram", "failed", "e", overdue))
         for _ in range(3):
             run(FAKE.record_delivery(pid, 2, "telegram", "failed", "e", overdue))
 
         batches = []
 
-        async def fake_publish(p, bot, only_channel_ids=None):
-            batches.append(frozenset(only_channel_ids))
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
+            batches.append((frozenset(only_channel_ids), attempt_no))
             return 1, 0
 
         original = post.publish_existing_post
@@ -864,8 +864,134 @@ class RetryGroupingTests(SchedulingTestCase):
         finally:
             post.publish_existing_post = original
 
-        self.assertEqual(batches, [frozenset({1, 2})],
-                         "due channels of one post must be retried in a single batch")
+        self.assertEqual(len(batches), 1)
+        ids, attempt_no = batches[0]
+        self.assertEqual(ids, frozenset({1, 2}))
+        self.assertEqual(attempt_no % 2, 0,
+                         "odd attempt counts mean the next send is an even attempt (bot 2)")
+
+    def test_channels_with_different_attempt_parity_are_split(self):
+        # Bale attempts alternate bots, so channels whose next attempt lands
+        # on different bots must not share a publish.
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 2]"))
+        overdue = datetime.utcnow() - timedelta(minutes=1)
+        # Channel 1 failed once (next attempt even -> bot 2);
+        # channel 2 failed twice (next attempt odd -> bot 1).
+        run(FAKE.record_delivery(pid, 1, "telegram", "failed", "e", overdue))
+        for _ in range(2):
+            run(FAKE.record_delivery(pid, 2, "telegram", "failed", "e", overdue))
+
+        batches = []
+
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
+            batches.append((frozenset(only_channel_ids), attempt_no))
+            return 1, 0
+
+        original = post.publish_existing_post
+        post.publish_existing_post = fake_publish
+        try:
+            run(post.process_delivery_retries(make_context()))
+        finally:
+            post.publish_existing_post = original
+
+        self.assertEqual(len(batches), 2,
+                         "channels on different bots were merged into one batch")
+        by_ids = {ids: attempt_no for ids, attempt_no in batches}
+        self.assertEqual(by_ids[frozenset({1})] % 2, 0, "channel 1 needs the bot-2 attempt")
+        self.assertEqual(by_ids[frozenset({2})] % 2, 1, "channel 2 needs the bot-1 attempt")
+
+
+class BaleBotAlternationTests(SchedulingTestCase):
+    """Attempts alternate between the primary Bale bot and the backup."""
+
+    def test_odd_attempts_use_bot1_even_use_bot2(self):
+        import bale_client
+        fake_backup = object()
+        original = bale_client.BACKUP_CLIENT
+        bale_client.BACKUP_CLIENT = fake_backup
+        try:
+            self.assertIs(bale_client.client_for_attempt(1), bale_client.DEFAULT_CLIENT)
+            self.assertIs(bale_client.client_for_attempt(2), fake_backup)
+            self.assertIs(bale_client.client_for_attempt(3), bale_client.DEFAULT_CLIENT)
+            self.assertIs(bale_client.client_for_attempt(4), fake_backup)
+        finally:
+            bale_client.BACKUP_CLIENT = original
+
+    def test_without_backup_every_attempt_uses_bot1(self):
+        import bale_client
+        original = bale_client.BACKUP_CLIENT
+        bale_client.BACKUP_CLIENT = None
+        try:
+            for attempt in range(1, 6):
+                self.assertIs(bale_client.client_for_attempt(attempt),
+                              bale_client.DEFAULT_CLIENT)
+        finally:
+            bale_client.BACKUP_CLIENT = original
+
+    def test_post_to_bale_sends_through_the_attempt_bot(self):
+        import bale_client
+        used = []
+
+        class FakeClient:
+            def __init__(self, name):
+                self.name = name
+
+            async def send_message(self, chat_id, text, **kw):
+                used.append(self.name)
+                return {"ok": True, "result": {"message_id": 1}}
+
+        def pick(attempt_no):
+            return FakeClient("bot1" if attempt_no % 2 else "bot2")
+
+        original = bale_client.client_for_attempt
+        bale_client.client_for_attempt = pick
+        try:
+            chans = [{"id": 1, "chat_id": -100, "name": "B", "platform": "bale"}]
+            state = {"type": "text", "text": "hi"}
+            run(post._post_to_bale(chans, state, None, attempt_no=1))
+            run(post._post_to_bale(chans, state, None, attempt_no=2))
+            run(post._post_to_bale(chans, state, None, attempt_no=3))
+        finally:
+            bale_client.client_for_attempt = original
+
+        self.assertEqual(used, ["bot1", "bot2", "bot1"],
+                         "attempts must alternate bots, starting with bot 1")
+
+    def test_retry_now_splits_batches_by_bot(self):
+        FAKE.roles[1] = "owner"
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 2]"))
+        # ch1 failed once -> next attempt even -> bot 2;
+        # ch2 failed twice -> next attempt odd -> bot 1.
+        run(FAKE.record_delivery(pid, 1, "bale", "failed", "e",
+                                 datetime.utcnow() + timedelta(minutes=10)))
+        for _ in range(2):
+            run(FAKE.record_delivery(pid, 2, "bale", "failed", "e",
+                                     datetime.utcnow() + timedelta(minutes=10)))
+
+        batches = []
+        original_publish = post.publish_existing_post
+
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
+            batches.append((frozenset(only_channel_ids), attempt_no))
+            return len(only_channel_ids), 0
+
+        # history.py binds publish_existing_post at import time.
+        original_bound = history.publish_existing_post
+        post.publish_existing_post = fake_publish
+        history.publish_existing_post = fake_publish
+        try:
+            query = RetryCancelButtonTests()._query(f"retry_now_{pid}")
+            update = types.SimpleNamespace(callback_query=query)
+            run(history.handle_retry_now(update, make_context()))
+        finally:
+            post.publish_existing_post = original_publish
+            history.publish_existing_post = original_bound
+
+        self.assertEqual(len(batches), 2,
+                         "retry-now must publish one batch per bot")
+        by_ids = {ids: attempt_no for ids, attempt_no in batches}
+        self.assertEqual(by_ids[frozenset({1})] % 2, 0)
+        self.assertEqual(by_ids[frozenset({2})] % 2, 1)
 
 
 class RetryCancelButtonTests(SchedulingTestCase):
@@ -975,7 +1101,7 @@ class RetryCancelButtonTests(SchedulingTestCase):
         async def only_tg(channels, state, bot):
             return len(channels), 0, [], {}
 
-        async def no_bale(channels, state, bot):
+        async def no_bale(channels, state, bot, attempt_no=1):
             return 0, 0, [], {}
 
         o1, o2 = post._post_to_telegram, post._post_to_bale
@@ -1000,7 +1126,7 @@ class RetryCancelButtonTests(SchedulingTestCase):
         async def failing_send(channels, state, bot):
             return 0, len(channels), [], {c["id"]: "still broken" for c in channels}
 
-        async def no_bale(channels, state, bot):
+        async def no_bale(channels, state, bot, attempt_no=1):
             return 0, 0, [], {}
 
         o1, o2 = post._post_to_telegram, post._post_to_bale
@@ -1028,7 +1154,7 @@ class RetryCancelButtonTests(SchedulingTestCase):
         async def only_tg(channels, state, bot):
             return len(channels), 0, [], {}
 
-        async def no_bale(channels, state, bot):
+        async def no_bale(channels, state, bot, attempt_no=1):
             return 0, 0, [], {}
 
         o1, o2 = post._post_to_telegram, post._post_to_bale
@@ -1106,7 +1232,7 @@ class DeadChannelRetryLoopTests(SchedulingTestCase):
 
         batches = []
 
-        async def fake_publish(p, bot, only_channel_ids=None):
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
             batches.append(frozenset(only_channel_ids))
             return len(only_channel_ids), 0
 
@@ -1179,7 +1305,7 @@ class PartialRetryPreservationTests(SchedulingTestCase):
         async def only_tg(channels, state, bot):
             return len(channels), 0, [], {}
 
-        async def no_bale(channels, state, bot):
+        async def no_bale(channels, state, bot, attempt_no=1):
             return 0, 0, [], {}
 
         o1, o2 = post._post_to_telegram, post._post_to_bale
