@@ -11,6 +11,14 @@ BALE_TOKEN = os.getenv("BALE_TOKEN")
 # fresh one on the next try. Leave unset to send every attempt with the
 # primary bot.
 BALE_TOKEN_2 = os.getenv("BALE_TOKEN_2") or None
+
+# Bale network tuning. Small API calls use BALE_TIMEOUT; file uploads use the
+# much longer BALE_UPLOAD_TIMEOUT, because a short socket timeout kills large
+# video uploads the moment the connection stalls for a few seconds.
+BALE_TIMEOUT = int(os.getenv("BALE_TIMEOUT", 30))
+BALE_UPLOAD_TIMEOUT = int(os.getenv("BALE_UPLOAD_TIMEOUT", 120))
+# How many Bale channels may be uploaded in parallel during one publish.
+BALE_MAX_CONCURRENT = int(os.getenv("BALE_MAX_CONCURRENT", 3))
 SUDO_USER_ID = int(os.getenv("SUDO_USER_ID", 0))
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", 3306))

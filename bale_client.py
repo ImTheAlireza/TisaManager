@@ -10,10 +10,27 @@ Without BALE_TOKEN_2 every attempt uses the primary bot.
 import json
 import logging
 import asyncio
+import time
+import urllib.error
 
-from config import BALE_TOKEN, BALE_TOKEN_2
+from config import BALE_TOKEN, BALE_TOKEN_2, BALE_TIMEOUT, BALE_UPLOAD_TIMEOUT
 
 logger = logging.getLogger(__name__)
+
+
+def _is_retryable_network_error(exc: Exception) -> bool:
+    """Network-level failures that are safe to retry once.
+
+    Read timeouts are excluded: by the time a *read* times out the request
+    has already reached the server, so a retry could duplicate the post. A
+    connect or *write* failure means the server never received the full
+    request, and HTTP error responses mean it received and rejected it.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if "read operation timed out" in str(exc):
+        return False
+    return isinstance(exc, (urllib.error.URLError, ConnectionError, TimeoutError))
 
 
 def _build_multipart(data=None, files=None) -> tuple:
@@ -50,14 +67,20 @@ def _post(url, data=None, files=None):
         content_type, body = _build_multipart(data=data, files=files)
         req = Request(url, data=body, method="POST")
         req.add_header("Content-Type", content_type)
+        # File uploads get the long timeout: a short one kills a large video
+        # the moment the connection stalls, even though it would have
+        # finished seconds later.
+        resp_timeout = BALE_UPLOAD_TIMEOUT
     elif data:
         encoded = urlencode(data).encode()
         req = Request(url, data=encoded, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        resp_timeout = BALE_TIMEOUT
     else:
         req = Request(url, method="POST")
+        resp_timeout = BALE_TIMEOUT
 
-    resp = urlopen(req, timeout=30)
+    resp = urlopen(req, timeout=resp_timeout)
     return json.loads(resp.read().decode())
 
 
@@ -75,16 +98,27 @@ class BaleClient:
 
     def _request(self, method, data=None, files=None):
         url = f"{self.base_url}/{method}"
-        try:
-            result = _post(url, data=data, files=files)
-            if not result.get("ok"):
-                logger.error("Bale API error on %s (%s): %s", method, self.name, result)
-            else:
-                logger.info("Bale API success on %s (%s)", method, self.name)
-            return result
-        except Exception as e:
-            logger.error("Bale API request failed on %s (%s): %s", method, self.name, e)
-            return {"ok": False, "description": str(e)}
+        # One automatic retry for transient network failures (connect/write
+        # timeouts, resets). Doubles the odds a flaky line delivers the post
+        # without waiting a full 10-minute retry cycle.
+        for attempt in (1, 2):
+            try:
+                result = _post(url, data=data, files=files)
+                if not result.get("ok"):
+                    logger.error("Bale API error on %s (%s): %s", method, self.name, result)
+                else:
+                    logger.info("Bale API success on %s (%s)", method, self.name)
+                return result
+            except Exception as e:
+                if attempt == 1 and _is_retryable_network_error(e):
+                    logger.warning(
+                        "Bale API transient error on %s (%s): %s — retrying once",
+                        method, self.name, e,
+                    )
+                    time.sleep(2)
+                    continue
+                logger.error("Bale API request failed on %s (%s): %s", method, self.name, e)
+                return {"ok": False, "description": str(e)}
 
     async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
         data = {"chat_id": chat_id, "text": text}

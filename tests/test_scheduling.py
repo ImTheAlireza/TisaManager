@@ -994,6 +994,74 @@ class BaleBotAlternationTests(SchedulingTestCase):
         self.assertEqual(by_ids[frozenset({2})] % 2, 1)
 
 
+class BaleUploadOptimizationTests(SchedulingTestCase):
+    """Media is downloaded once per post and channels upload in parallel."""
+
+    def test_each_file_downloaded_once_across_many_channels(self):
+        import io as _io
+
+        downloads = []
+
+        class FakeFile:
+            async def download_to_memory(self, out=None):
+                downloads.append(1)
+                buf = out if out is not None else _io.BytesIO()
+                buf.write(b"fake-media-bytes")
+                buf.seek(0)
+                return buf
+
+        class FakeBot:
+            async def get_file(self, file_id):
+                return FakeFile()
+
+        class FakeClient:
+            name = "bale-test"
+
+            def __init__(self):
+                self.calls = []
+
+            async def send_media_group(self, chat_id, media_files, caption=None):
+                self.calls.append((chat_id, len(media_files)))
+                return {"ok": True, "result": [{"message_id": 1}, {"message_id": 2}]}
+
+        import bale_client
+        client = FakeClient()
+        original = bale_client.client_for_attempt
+        bale_client.client_for_attempt = lambda attempt_no: client
+        try:
+            state = {"type": "media_group", "caption": "c",
+                     "media": [{"type": "photo", "file_id": "a"},
+                               {"type": "video", "file_id": "b"}]}
+            channels = [
+                {"id": 1, "chat_id": -100, "name": "B1", "platform": "bale"},
+                {"id": 2, "chat_id": -200, "name": "B2", "platform": "bale"},
+                {"id": 3, "chat_id": -300, "name": "B3", "platform": "bale"},
+            ]
+            sent, failed, message_ids, errors = run(
+                post._post_to_bale(channels, state, FakeBot(), attempt_no=1))
+        finally:
+            bale_client.client_for_attempt = original
+
+        self.assertEqual(sent, 3)
+        self.assertEqual(failed, 0)
+        self.assertEqual(len(downloads), 2,
+                         "a 2-file album to 3 channels must download 2 files, not 6")
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(len(message_ids), 6, "two messages per channel recorded")
+
+    def test_prepare_failure_marks_every_channel_failed(self):
+        class BrokenBot:
+            async def get_file(self, file_id):
+                raise RuntimeError("file too big")
+
+        state = {"type": "photo", "file_id": "x", "caption": None}
+        channels = [{"id": 1, "chat_id": -100, "name": "B1", "platform": "bale"}]
+        sent, failed, message_ids, errors = run(
+            post._post_to_bale(channels, state, BrokenBot(), attempt_no=1))
+        self.assertEqual((sent, failed), (0, 1))
+        self.assertIn("file too big", errors[1])
+
+
 class RetryCancelButtonTests(SchedulingTestCase):
     """Cancel/retry-now: available to sudo/owner and to writers for their own posts."""
 

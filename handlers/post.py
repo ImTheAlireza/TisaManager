@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 import json
 import time
@@ -10,6 +11,7 @@ from telegram.constants import ParseMode
 
 from config import (
     RETRY_INTERVAL_MINUTES, SCHEDULE_GRACE_SECONDS, WORKFLOW_TTL_SECONDS,
+    BALE_MAX_CONCURRENT,
 )
 from database import (
     get_active_channels, is_writer_or_above, is_sudo, is_owner, save_post,
@@ -396,16 +398,80 @@ async def _post_to_telegram(channels, state, bot):
     return sent, failed, message_ids, errors
 
 
+async def _download_telegram_file(bot, file_id) -> bytes:
+    """Download one Telegram file fully into memory."""
+    file = await bot.get_file(file_id)
+    buf = io.BytesIO()
+    await file.download_to_memory(buf)
+    return buf.getvalue()
+
+
+async def _prepare_bale_payloads(state, bot) -> dict:
+    """Build the shared payload for this post, downloading each file once.
+
+    Previously every channel re-downloaded every file from Telegram, so an
+    N-file album to M channels meant N*M downloads. Now each file is fetched
+    a single time and reused for every destination.
+    """
+    post_type = state.get("type")
+    if post_type == "text":
+        return {"kind": "text"}
+    if post_type == "media_group":
+        items = []
+        for m in state.get("media") or []:
+            items.append((m["type"], await _download_telegram_file(bot, m["file_id"])))
+        return {"kind": "media_group", "items": items}
+    data = await _download_telegram_file(bot, state["file_id"])
+    return {"kind": post_type, "bytes": data}
+
+
+async def _send_bale_channel(client, ch, state, prepared):
+    """Send one Bale channel from the shared payload.
+
+    Returns (ok, message_ids, error).
+    """
+    kind = prepared.get("kind")
+    caption = state.get("caption")
+    if kind == "text":
+        result = await client.send_message(ch["chat_id"], state["text"])
+    elif kind == "photo":
+        result = await client.send_photo(ch["chat_id"], prepared["bytes"], caption=caption)
+    elif kind == "video":
+        result = await client.send_video(ch["chat_id"], prepared["bytes"], caption=caption)
+    elif kind == "document":
+        result = await client.send_document(ch["chat_id"], prepared["bytes"], caption=caption)
+    elif kind == "media_group":
+        result = await client.send_media_group(ch["chat_id"], prepared["items"], caption=caption)
+    else:
+        return False, [], f"unsupported post type: {kind}"
+
+    if result and result.get("ok"):
+        ids = []
+        msg = result["result"]
+        if isinstance(msg, list):
+            for m in msg:
+                ids.append({"chat_id": ch["chat_id"], "message_id": m["message_id"], "platform": "bale"})
+        else:
+            ids.append({"chat_id": ch["chat_id"], "message_id": msg["message_id"], "platform": "bale"})
+        return True, ids, None
+    if result and not result.get("ok"):
+        # A non-ok Bale response is a failure, not a success.
+        return False, [], result.get("description", "Bale API error")
+    return False, [], "empty Bale response"
+
+
 async def _post_to_bale(channels, state, bot, attempt_no: int = 1):
     """Returns (sent, failed, message_ids, errors_by_channel_id).
 
     ``attempt_no`` selects which Bale bot sends: attempts alternate between
     the primary bot and the backup bot (if configured), so a rate-limited or
     blocked bot is swapped for a fresh one on the next try.
+
+    Optimised for speed: media is downloaded from Telegram once per post and
+    the channels are uploaded in parallel (BALE_MAX_CONCURRENT), instead of
+    the old serial download-per-channel loop.
     """
     import bale_client
-    import tempfile
-    import os
     sent = 0
     failed = 0
     message_ids = []
@@ -416,61 +482,39 @@ async def _post_to_bale(channels, state, bot, attempt_no: int = 1):
         for ch in channels:
             errors[ch["id"]] = "Bale token not configured"
         return 0, len(channels), [], errors
-    post_type = state.get("type")
-    tmp_dir = tempfile.mkdtemp(prefix="bale_post_")
+
     try:
+        prepared = await _prepare_bale_payloads(state, bot)
+    except Exception as e:
+        logger.error("Could not prepare Bale media (%s): %s", state.get("type"), e)
         for ch in channels:
-            try:
-                result = None
-                if post_type == "text":
-                    result = await client.send_message(ch["chat_id"], state["text"])
-                elif post_type == "photo":
-                    path = os.path.join(tmp_dir, f"photo_{ch['id']}.jpg")
-                    file = await bot.get_file(state["file_id"])
-                    await file.download_to_drive(path)
-                    with open(path, "rb") as f:
-                        result = await client.send_photo(ch["chat_id"], f.read(), caption=state.get("caption"))
-                elif post_type == "video":
-                    path = os.path.join(tmp_dir, f"video_{ch['id']}.mp4")
-                    file = await bot.get_file(state["file_id"])
-                    await file.download_to_drive(path)
-                    with open(path, "rb") as f:
-                        result = await client.send_video(ch["chat_id"], f.read(), caption=state.get("caption"))
-                elif post_type == "document":
-                    path = os.path.join(tmp_dir, f"doc_{ch['id']}.bin")
-                    file = await bot.get_file(state["file_id"])
-                    await file.download_to_drive(path)
-                    with open(path, "rb") as f:
-                        result = await client.send_document(ch["chat_id"], f.read(), caption=state.get("caption"))
-                elif post_type == "media_group":
-                    caption = state.get("caption")
-                    media_files = []
-                    for i, m in enumerate(state["media"]):
-                        ext = "jpg" if m["type"] == "photo" else "mp4"
-                        path = os.path.join(tmp_dir, f"media_{i}.{ext}")
-                        file = await bot.get_file(m["file_id"])
-                        await file.download_to_drive(path)
-                        with open(path, "rb") as f:
-                            media_files.append((m["type"], f.read()))
-                    result = await client.send_media_group(ch["chat_id"], media_files, caption=caption)
-                if result and result.get("ok"):
-                    msg = result["result"]
-                    if isinstance(msg, list):
-                        for m in msg:
-                            message_ids.append({"chat_id": ch["chat_id"], "message_id": m["message_id"], "platform": "bale"})
-                    else:
-                        message_ids.append({"chat_id": ch["chat_id"], "message_id": msg["message_id"], "platform": "bale"})
-                if result and not result.get("ok"):
-                    # A non-ok Bale response is a failure, not a success.
-                    raise RuntimeError(result.get("description", "Bale API error"))
-                sent += 1
-            except Exception as e:
-                logger.error("Failed to post to Bale %s (%s) via %s: %s", ch["name"], ch["chat_id"], client.name, e)
-                errors[ch["id"]] = str(e)
-                failed += 1
-    finally:
-        import shutil
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+            errors[ch["id"]] = str(e)
+        return 0, len(channels), [], errors
+
+    semaphore = asyncio.Semaphore(max(1, BALE_MAX_CONCURRENT))
+
+    async def send_one(ch):
+        async with semaphore:
+            return await _send_bale_channel(client, ch, state, prepared)
+
+    results = await asyncio.gather(*(send_one(ch) for ch in channels), return_exceptions=True)
+
+    for ch, result in zip(channels, results):
+        if isinstance(result, Exception):
+            logger.error("Failed to post to Bale %s (%s) via %s: %s",
+                         ch["name"], ch["chat_id"], client.name, result)
+            errors[ch["id"]] = str(result)
+            failed += 1
+            continue
+        ok, ids, error = result
+        if ok:
+            sent += 1
+            message_ids.extend(ids)
+        else:
+            logger.error("Failed to post to Bale %s (%s) via %s: %s",
+                         ch["name"], ch["chat_id"], client.name, error)
+            errors[ch["id"]] = error
+            failed += 1
     return sent, failed, message_ids, errors
 
 

@@ -96,5 +96,59 @@ class SendMediaGroupTests(unittest.TestCase):
         self.assertTrue(result["ok"])
 
 
+class TransientNetworkRetryTests(unittest.TestCase):
+    """A flaky line gets one automatic retry — but only when it is safe."""
+
+    def test_classifier(self):
+        import urllib.error
+        write_timeout = urllib.error.URLError("The write operation timed out")
+        read_timeout = urllib.error.URLError("The read operation timed out")
+        reset = urllib.error.URLError("Connection reset by peer")
+        self.assertTrue(bale_client._is_retryable_network_error(write_timeout),
+                        "the server never got the full request; retry is safe")
+        self.assertTrue(bale_client._is_retryable_network_error(reset))
+        self.assertFalse(bale_client._is_retryable_network_error(read_timeout),
+                         "the request already reached the server; retry may duplicate")
+        self.assertFalse(bale_client._is_retryable_network_error(RuntimeError("Forbidden")))
+        self.assertFalse(bale_client._is_retryable_network_error(
+            urllib.error.HTTPError("u", 403, "Forbidden", {}, None)))
+
+    def _run_with(self, exc_or_result):
+        client = bale_client.BaleClient("t", "bale-test")
+        calls = []
+
+        def fake_post(url, data=None, files=None):
+            calls.append(1)
+            if len(calls) == 1 and isinstance(exc_or_result, Exception):
+                raise exc_or_result
+            return {"ok": True, "result": {"message_id": 1}}
+
+        original_post, original_sleep = bale_client._post, bale_client.time.sleep
+        bale_client._post = fake_post
+        bale_client.time.sleep = lambda s: None
+        try:
+            result = run(client.send_message(1, "hi"))
+        finally:
+            bale_client._post, bale_client.time.sleep = original_post, original_sleep
+        return result, len(calls)
+
+    def test_write_timeout_is_retried_once_and_recovers(self):
+        import urllib.error
+        result, calls = self._run_with(urllib.error.URLError("The write operation timed out"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, 2, "exactly one automatic retry")
+
+    def test_read_timeout_is_not_retried(self):
+        import urllib.error
+        result, calls = self._run_with(urllib.error.URLError("The read operation timed out"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(calls, 1, "retrying a read timeout could duplicate the post")
+
+    def test_upload_timeout_is_longer_than_api_timeout(self):
+        from config import BALE_TIMEOUT, BALE_UPLOAD_TIMEOUT
+        self.assertGreater(BALE_UPLOAD_TIMEOUT, BALE_TIMEOUT,
+                           "large media uploads need more headroom than getMe-style calls")
+
+
 if __name__ == "__main__":
     unittest.main()

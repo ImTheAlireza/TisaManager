@@ -213,6 +213,14 @@ Built now:
   line was appended to the bytes body without `.encode()`. Text posts worked;
   photos/videos/documents/media groups never did. The body builder is now
   `_build_multipart`, covered by `tests/test_bale_client.py`.
+- **Bale send speed & reliability** — media is downloaded from Telegram once
+  per post and reused for every channel (an N-file album to M channels used
+  to mean N*M serial downloads), channels upload in parallel
+  (`BALE_MAX_CONCURRENT`, default 3), file uploads use a longer socket
+  timeout (`BALE_UPLOAD_TIMEOUT`, default 120s vs `BALE_TIMEOUT` 30s) so a
+  brief connection stall no longer kills a large video, and a connect/write
+  timeout or reset is retried once in-process (read timeouts are not, to
+  avoid duplicate posts).
 - Failed channels and their next retry time are shown in the post detail view;
   `/stats` gained "🔁 در صف تلاش مجدد".
 *Tests: `RetryScheduleTests` (3), `RetryTargetingTests` (3),
@@ -235,7 +243,9 @@ Built now:
   `SCHEDULE_GRACE_SECONDS`, `SCHEDULE_CLAIM_TIMEOUT_SECONDS`,
   `SCHEDULE_MAX_ATTEMPTS`, `RETRY_INTERVAL_MINUTES` (0 disables automatic
   retries), `BALE_TOKEN_2` (backup Bale bot; attempts alternate between the
-  two bots), `WORKFLOW_TTL_SECONDS`, `RESTART_DRAIN_TIMEOUT_SECONDS`.
+  two bots), `BALE_TIMEOUT` / `BALE_UPLOAD_TIMEOUT` (Bale socket timeouts),
+  `BALE_MAX_CONCURRENT` (parallel Bale uploads per publish),
+  `WORKFLOW_TTL_SECONDS`, `RESTART_DRAIN_TIMEOUT_SECONDS`.
 - **Stats are bucketed in the display timezone.** `created_at` is stored naive
   UTC, but the per-day trend and per-hour activity charts shift it by
   `DISPLAY_TIMEZONE`'s offset before `DATE()`/`HOUR()`
