@@ -208,6 +208,11 @@ Built now:
     finalise those rows as `cancelled` instead of retrying/reporting them
     forever.
 - Bale `ok: false` is now correctly treated as a failure.
+- Fixed a multipart-encoding crash (`can't concat str to bytes`) that killed
+  **every Bale file upload** client-side before it reached the API — a header
+  line was appended to the bytes body without `.encode()`. Text posts worked;
+  photos/videos/documents/media groups never did. The body builder is now
+  `_build_multipart`, covered by `tests/test_bale_client.py`.
 - Failed channels and their next retry time are shown in the post detail view;
   `/stats` gained "🔁 در صف تلاش مجدد".
 *Tests: `RetryScheduleTests` (3), `RetryTargetingTests` (3),

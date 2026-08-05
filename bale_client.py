@@ -16,30 +16,40 @@ from config import BALE_TOKEN, BALE_TOKEN_2
 logger = logging.getLogger(__name__)
 
 
+def _build_multipart(data=None, files=None) -> tuple:
+    """Build a multipart/form-data body. Returns (content_type, body bytes).
+
+    Kept separate from the HTTP layer so the encoding can be unit-tested —
+    a missed .encode() here once crashed every Bale file upload client-side
+    with 'can't concat str to bytes' before the request ever left the bot.
+    """
+    boundary = "----FormBoundary7MA4YWxkTrZu0gW"
+    body = b""
+    if data:
+        for key, val in data.items():
+            body += f"--{boundary}\r\n".encode()
+            body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
+            body += str(val).encode()
+            body += b"\r\n"
+    for key, (filename, filedata, content_type) in (files or {}).items():
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{key}"; filename="{filename}"\r\n'.encode()
+        body += f"Content-Type: {content_type}\r\n\r\n".encode()
+        body += filedata
+        body += b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    return f"multipart/form-data; boundary={boundary}", body
+
+
 def _post(url, data=None, files=None):
     """Synchronous HTTP POST using urllib (no external deps)."""
     from urllib.request import Request, urlopen
     from urllib.parse import urlencode
 
     if files:
-        # Multipart form-data: data fields first, then files
-        boundary = "----FormBoundary7MA4YWxkTrZu0gW"
-        body = b""
-        if data:
-            for key, val in data.items():
-                body += f"--{boundary}\r\n".encode()
-                body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
-                body += str(val).encode()
-                body += b"\r\n"
-        for key, (filename, filedata, content_type) in files.items():
-            body += f"--{boundary}\r\n".encode()
-            body += f'Content-Disposition: form-data; name="{key}"; filename="{filename}"\r\n'.encode()
-            body += f"Content-Type: {content_type}\r\n\r\n"
-            body += filedata
-            body += b"\r\n"
-        body += f"--{boundary}--\r\n".encode()
+        content_type, body = _build_multipart(data=data, files=files)
         req = Request(url, data=body, method="POST")
-        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        req.add_header("Content-Type", content_type)
     elif data:
         encoded = urlencode(data).encode()
         req = Request(url, data=encoded, method="POST")
