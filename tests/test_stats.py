@@ -203,6 +203,15 @@ class TrendTests(unittest.TestCase):
         self.assertIn("پرکارترین ساعت", out)
         self.assertNotIn("←", out)  # RTL-ambiguous arrow axis was removed
 
+    def test_activity_hours_are_labelled_with_the_display_timezone(self):
+        # Users read the chart in their own timezone; a "UTC" label on hours
+        # bucketed in UTC (or local hours mislabelled as UTC) misleads them.
+        hourly = [0] * 24
+        hourly[8] = 5
+        out = stats.trend_text(self._daily([1] * 7), hourly, True)
+        self.assertNotIn("UTC", out)
+        self.assertIn("Asia/Tehran", out)
+
     def test_fits_telegram_limit(self):
         out = stats.trend_text(self._daily(list(range(14))), list(range(24)), True)
         self.assertLessEqual(len(out), stats.TELEGRAM_LIMIT)

@@ -1,7 +1,7 @@
 """Small helpers shared by handlers."""
 
 from html import escape
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import time
@@ -36,6 +36,19 @@ def set_calendar(use_jalali: bool):
 def now_local() -> datetime:
     """Timezone-aware 'now' in the display timezone."""
     return datetime.now(LOCAL_TZ)
+
+
+def local_utc_offset_minutes() -> int:
+    """The display timezone's current UTC offset, in minutes.
+
+    Lets SQL bucket stored UTC timestamps into *local* calendar days and
+    hours via TIMESTAMPADD(MINUTE, offset, ts) without depending on MySQL's
+    timezone tables. Zones with DST use the current offset for the whole
+    window — the standard trade-off for aggregate charts (Asia/Tehran has no
+    DST, so there it is exact).
+    """
+    offset = datetime.now(LOCAL_TZ).utcoffset()
+    return int((offset or timedelta(0)).total_seconds() // 60)
 
 
 def local_to_utc_naive(local_dt: datetime) -> datetime:

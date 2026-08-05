@@ -231,6 +231,13 @@ Built now:
   `SCHEDULE_MAX_ATTEMPTS`, `RETRY_INTERVAL_MINUTES` (0 disables automatic
   retries), `BALE_TOKEN_2` (backup Bale bot; attempts alternate between the
   two bots), `WORKFLOW_TTL_SECONDS`, `RESTART_DRAIN_TIMEOUT_SECONDS`.
+- **Stats are bucketed in the display timezone.** `created_at` is stored naive
+  UTC, but the per-day trend and per-hour activity charts shift it by
+  `DISPLAY_TIMEZONE`'s offset before `DATE()`/`HOUR()`
+  (`utils.local_utc_offset_minutes`), and the activity header names the zone
+  (e.g. "به وقت Asia/Tehran") instead of the old "به وقت UTC". Every displayed
+  timestamp goes through `format_local`/`format_local_date`, so all times the
+  user sees are in their zone; only the stored values remain UTC.
 - **Not done / worth considering later:** per-user timezones and recurring
   schedules.
 
