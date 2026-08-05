@@ -7,16 +7,20 @@ from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
+from config import RETRY_INTERVAL_MINUTES
 from database import (
     get_user_posts, get_all_posts, get_user_posts_paginated, get_all_posts_paginated,
     count_user_posts, count_all_posts, get_post, update_post_text, update_post_caption,
     delete_post, is_writer_or_above, is_owner, is_sudo, can_edit_post, can_delete_post,
     get_user_role, has_permission, update_post_status, save_post_version, save_post,
     get_active_schedule_for_post, cancel_schedule, get_post_deliveries,
+    cancel_post_retries, record_delivery, claim_delivery_retry,
 )
 from keyboards import main_menu_keyboard, history_keyboard, post_detail_keyboard, confirm_keyboard
 from utils import html_text, state_is_expired, format_local, format_local_date
-from handlers.post import publish_existing_post, user_states
+from handlers.post import (
+    publish_existing_post, user_states, refresh_delivery_status, split_live_targets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +46,16 @@ async def _try_edit_message(context, chat_id, message_id, platform, post, new_te
     try:
         if platform == "bale":
             import bale_client
-            if post_type == "text":
-                result = await bale_client.edit_message_text(chat_id, message_id, new_text)
-            else:
-                result = await bale_client.edit_message_caption(chat_id, message_id, new_text)
-            return result.get("ok", False)
+            # The message may have been posted by either Bale bot (attempts
+            # alternate), so try each bot until one owns the message.
+            for client in bale_client.all_clients():
+                if post_type == "text":
+                    result = await client.edit_message_text(chat_id, message_id, new_text)
+                else:
+                    result = await client.edit_message_caption(chat_id, message_id, new_text)
+                if result.get("ok", False):
+                    return True
+            return False
         else:
             if post_type == "text":
                 await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=new_text)
@@ -99,8 +108,13 @@ async def _try_delete_message(context, chat_id, message_id, platform):
     try:
         if platform == "bale":
             import bale_client
-            result = await bale_client.delete_message(chat_id, message_id)
-            return result.get("ok", False)
+            # The message may have been posted by either Bale bot (attempts
+            # alternate), so try each bot until one owns the message.
+            for client in bale_client.all_clients():
+                result = await client.delete_message(chat_id, message_id)
+                if result.get("ok", False):
+                    return True
+            return False
         else:
             await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
             return True
@@ -175,26 +189,16 @@ async def handle_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-async def handle_post_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def _post_detail_parts(post_id: int, viewer_id: int):
+    """Build (text, markup) for the post detail view.
 
-    if not await is_writer_or_above(query.from_user.id):
-        await query.edit_message_text("❌ غیرمجاز.")
-        return
-
-    try:
-        post_id = int(query.data.removeprefix("post_"))
-    except (IndexError, ValueError):
-        return
-
+    Returns (None, None) when the post does not exist. The retry-management
+    buttons are included only for viewers who may edit the post, and only
+    while an automatic retry is actually queued.
+    """
     post = await get_post(post_id)
     if not post:
-        try:
-            await query.edit_message_text("❌ پست یافت نشد.", reply_markup=await _menu_kb(query.from_user.id))
-        except BadRequest:
-            await query.message.reply_text("❌ پست یافت نشد.", reply_markup=await _menu_kb(query.from_user.id))
-        return
+        return None, None
 
     type_labels = {"text": "📝 متن", "photo": "🖼️ عکس", "video": "🎬 ویدیو", "document": "📎 فایل", "media_group": "📦 گروه رسانه"}
     label = type_labels.get(post["post_type"], post["post_type"])
@@ -215,8 +219,12 @@ async def handle_post_detail(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Show which channels failed, and whether a retry is queued.
     deliveries = await get_post_deliveries(post_id)
     failed_rows = [d for d in deliveries if d["status"] in ("failed", "retrying")]
+    has_active_retries = any(
+        d.get("next_retry_at") or d["status"] == "retrying" for d in failed_rows
+    )
     if failed_rows:
-        lines.append(f"❌ ناموفق در {len(failed_rows)} مقصد:")
+        retry_state = "🔁 تلاش مجدد خودکار فعال است." if has_active_retries else "⏸️ تلاش بعدی زمان‌بندی نشده است."
+        lines.append(f"❌ ناموفق در {len(failed_rows)} مقصد ({retry_state})")
         for d in failed_rows[:5]:
             name = d.get("channel_name") or f"#{d['channel_id']}"
             when = f" — تلاش بعدی {format_local(d['next_retry_at'])}" if d.get("next_retry_at") else ""
@@ -247,7 +255,37 @@ async def handle_post_detail(update: Update, context: ContextTypes.DEFAULT_TYPE)
     markup = post_detail_keyboard(
         post_id, post.get("delivery_status", "completed"),
         schedule_id=schedule["id"] if schedule else None,
+        # Writers manage retries of their own posts; sudo/owner manage all.
+        # (Writers only ever see their own posts in the history list anyway,
+        # but this check also covers stale/shared callback data.)
+        can_manage_retries=await can_edit_post(viewer_id, post_id),
+        # Hidden once the post is fully sent or the retries were stopped.
+        has_active_retries=has_active_retries,
     )
+    return text, markup
+
+
+async def handle_post_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not await is_writer_or_above(query.from_user.id):
+        await query.edit_message_text("❌ غیرمجاز.")
+        return
+
+    try:
+        post_id = int(query.data.removeprefix("post_"))
+    except (IndexError, ValueError):
+        return
+
+    text, markup = await _post_detail_parts(post_id, query.from_user.id)
+    if text is None:
+        try:
+            await query.edit_message_text("❌ پست یافت نشد.", reply_markup=await _menu_kb(query.from_user.id))
+        except BadRequest:
+            await query.message.reply_text("❌ پست یافت نشد.", reply_markup=await _menu_kb(query.from_user.id))
+        return
+
     try:
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
     except BadRequest:
@@ -458,6 +496,167 @@ async def handle_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("⏳ در حال ارسال مجدد...")
     sent, failed = await publish_existing_post(new_post, context.bot)
     await query.message.reply_text(f"🔁 ارسال مجدد انجام شد و در تاریخچه با شناسه #{new_id} ذخیره شد: {sent} موفق، {failed} ناموفق.", reply_markup=await _menu_kb(query.from_user.id))
+
+
+async def _parse_action_post_id(query, prefix: str):
+    try:
+        return int(query.data.removeprefix(prefix))
+    except ValueError:
+        return None
+
+
+async def handle_retry_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Immediately re-send a post's failed channels.
+
+    Available to sudo/owner for every post and to writers for their own
+    posts. Unlike «🔁 ارسال مجدد», this does not create a new history row —
+    it completes the same post. On success the post is marked complete; on
+    failure the next automatic attempt is armed RETRY_INTERVAL_MINUTES from
+    now.
+    """
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    post_id = await _parse_action_post_id(query, "retry_now_")
+    if post_id is None:
+        return
+    if not await can_edit_post(user_id, post_id):
+        await query.answer("❌ شما اجازه مدیریت تلاش‌های مجدد این پست را ندارید.", show_alert=True)
+        return
+    post = await get_post(post_id)
+    if not post:
+        await query.edit_message_text("❌ پست یافت نشد.")
+        return
+    if post.get("delivery_status") in ("draft", "scheduled", "pending_approval"):
+        await query.answer("❌ این پست هنوز منتشر نشده است که مقصد ناموفق داشته باشد.", show_alert=True)
+        return
+    deliveries = await get_post_deliveries(post_id)
+    if any(d["status"] == "retrying" for d in deliveries):
+        await query.answer("⏳ یک تلاش خودکار همین حالا در حال ارسال است؛ چند لحظه دیگر دوباره امتحان کنید.", show_alert=True)
+        return
+    failed_rows = [d for d in deliveries if d["status"] == "failed"]
+    if not failed_rows:
+        await query.answer("✅ همه مقصدهای این پست با موفقیت ارسال شده‌اند.", show_alert=True)
+        return
+
+    # Claim the rows exactly like the automatic job does, so the job cannot
+    # pick one up mid-flight and double-send a channel. A row the job already
+    # grabbed simply fails to claim and is left to the job.
+    claimed = []
+    for d in failed_rows:
+        if await claim_delivery_retry(d["id"]):
+            claimed.append(d)
+    if not claimed:
+        await query.answer("⏳ یک تلاش خودکار همین حالا در حال ارسال است؛ چند لحظه دیگر دوباره امتحان کنید.", show_alert=True)
+        return
+    failed_ids = {d["channel_id"] for d in claimed}
+
+    # Channels removed since the failure can never be delivered; finalise
+    # them instead of reporting a misleading "complete".
+    live_ids, dead_ids = await split_live_targets(post, failed_ids)
+    for d in deliveries:
+        if d["channel_id"] in dead_ids and d["status"] == "failed":
+            await record_delivery(post_id, d["channel_id"], d["platform"],
+                                  "cancelled", "channel no longer available", None)
+    if not live_ids:
+        # Settle the post on its final incomplete status now that the dead
+        # channels are finalised.
+        await refresh_delivery_status(post_id)
+        await query.edit_message_text(
+            "⚠️ مقصدهای ناموفق این پست دیگر در دسترس نیستند (کانال حذف یا غیرفعال شده است).",
+            reply_markup=await _menu_kb(user_id),
+        )
+        return
+
+    await query.edit_message_text("⏳ در حال ارسال به مقصدهای ناموفق...")
+    # Bale attempts alternate bots, and each claimed row carries its own
+    # attempt count; publish one batch per attempt parity so every channel
+    # goes out on the bot its attempt number says.
+    parity_groups: dict[int, set] = {}
+    for d in claimed:
+        if d["channel_id"] in live_ids:
+            parity_groups.setdefault(d["attempts"] % 2, set()).add(d["channel_id"])
+    sent = 0
+    failed = 0
+    for parity, ids in sorted(parity_groups.items()):
+        batch_sent, batch_failed = await publish_existing_post(
+            post, context.bot, only_channel_ids=ids,
+            attempt_no=2 if parity else 1,
+        )
+        sent += batch_sent
+        failed += batch_failed
+    final_status = await refresh_delivery_status(post_id)
+    if failed == 0 and final_status == "completed":
+        result = f"✅ پست #{post_id} کامل شد: {sent} مقصد باقی‌مانده با موفقیت ارسال شد."
+    elif failed == 0:
+        result = (
+            f"✅ {sent} مقصد باقی‌ماندهٔ پست #{post_id} ارسال شد؛ "
+            "برخی مقصدها دیگر در دسترس نیستند و پست ناقص ماند."
+        )
+    elif RETRY_INTERVAL_MINUTES:
+        result = (
+            f"❌ ارسال به {failed} مقصد دوباره ناموفق بود.\n"
+            f"🔁 تلاش بعدی {RETRY_INTERVAL_MINUTES} دقیقه دیگر انجام می‌شود."
+        )
+    else:
+        result = (
+            f"❌ ارسال به {failed} مقصد دوباره ناموفق بود.\n"
+            "🔁 تلاش مجدد خودکار غیرفعال است."
+        )
+    await query.message.reply_text(result, reply_markup=await _menu_kb(user_id))
+
+
+async def handle_cancel_retries(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel every pending automatic retry for a post.
+
+    Available to sudo/owner for every post and to writers for their own
+    posts. All future attempts are dropped and the post's current delivery
+    result is accepted as final (incomplete): partial if some channels were
+    sent, otherwise failed.
+    """
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    post_id = await _parse_action_post_id(query, "cancel_retries_")
+    if post_id is None:
+        return
+    if not await can_edit_post(user_id, post_id):
+        await query.answer("❌ شما اجازه مدیریت تلاش‌های مجدد این پست را ندارید.", show_alert=True)
+        return
+    post = await get_post(post_id)
+    if not post:
+        await query.edit_message_text("❌ پست یافت نشد.")
+        return
+    if post.get("delivery_status") in ("draft", "scheduled", "pending_approval"):
+        await query.answer("❌ این پست هنوز منتشر نشده است که تلاش مجددی داشته باشد.", show_alert=True)
+        return
+
+    deliveries = await get_post_deliveries(post_id)
+    armed = sum(1 for d in deliveries if d["status"] == "failed" and d.get("next_retry_at"))
+    inflight = sum(1 for d in deliveries if d["status"] == "retrying")
+    if not armed and not inflight:
+        # Nothing queued: do NOT touch the post status, or a stale button
+        # could flip a healthy post to "failed".
+        await query.answer("ℹ️ تلاش مجددی برای این پست در صف نیست.", show_alert=True)
+        return
+
+    cleared = await cancel_post_retries(post_id)
+    status = await refresh_delivery_status(post_id)
+    status_labels = {"completed": "✅ کامل", "partial": "⚠️ ناقص", "failed": "❌ ناموفق"}
+    final_label = status_labels.get(status, status)
+    note = f"🚫 تلاش‌های خودکار برای پست #{post_id} متوقف شد و دیگر تلاشی انجام نمی‌شود."
+    if cleared:
+        note += f"\n({cleared} تلاش در صف لغو شد.)"
+    note += f"\n📤 وضعیت نهایی ارسال: {final_label}"
+
+    text, markup = await _post_detail_parts(post_id, user_id)
+    if text is None:
+        await query.edit_message_text(note, reply_markup=await _menu_kb(user_id))
+        return
+    try:
+        await query.edit_message_text(f"{note}\n\n{text}", parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest:
+        await query.message.reply_text(f"{note}\n\n{text}", parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):

@@ -143,10 +143,14 @@ from handlers.history import (
     handle_delete,
     handle_duplicate,
     handle_retry,
+    handle_retry_now,
+    handle_cancel_retries,
     handle_publish_draft,
     handle_approve,
 )
-from handlers.admin import handle_health, handle_tools_menu, run_channel_health_checks
+from handlers.admin import (
+    handle_health, handle_health_refresh, handle_tools_menu, run_channel_health_checks,
+)
 from handlers.stats import (
     handle_stats_menu, handle_stats_summary, handle_stats_trend,
     handle_stats_channels, handle_stats_authors, handle_stats_schedule,
@@ -314,6 +318,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_delete, pattern="^delete_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_duplicate, pattern="^duplicate_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_retry, pattern="^retry_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_retry_now, pattern="^retry_now_\\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_cancel_retries, pattern="^cancel_retries_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_publish_draft, pattern="^publish_draft_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_approve, pattern="^approve_\\d+$"))
     app.add_handler(CallbackQueryHandler(handle_settings, pattern="^settings$"))
@@ -368,6 +374,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_stats_authors, pattern="^stats_authors$"))
     app.add_handler(CallbackQueryHandler(handle_stats_schedule, pattern="^stats_schedule$"))
     app.add_handler(CallbackQueryHandler(handle_health, pattern="^tools_health$"))
+    app.add_handler(CallbackQueryHandler(handle_health_refresh, pattern="^health_refresh$"))
     app.add_handler(CallbackQueryHandler(handle_help, pattern="^help$"))
     app.add_handler(CallbackQueryHandler(handle_help_section, pattern="^help_(publish|schedule|roles|settings|tools)$"))
     app.add_handler(CallbackQueryHandler(handle_approval_settings, pattern="^approval_settings$"))
@@ -449,8 +456,10 @@ def main():
             process_scheduled_posts, interval=60, first=5, name="scheduled_posts",
             job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
         )
+        # Check every minute: retries now fire on a 10-minute cadence, so a
+        # slower sweep would drift noticeably past each due time.
         context.job_queue.run_repeating(
-            process_delivery_retries, interval=300, first=60, name="delivery_retries",
+            process_delivery_retries, interval=60, first=30, name="delivery_retries",
             job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 600},
         )
         context.job_queue.run_repeating(

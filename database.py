@@ -735,31 +735,36 @@ async def get_analytics(user_id: int = None):
 
 
 async def get_daily_counts(days: int = 14, user_id: int = None) -> list[dict]:
-    """Posts per calendar day (UTC), oldest first, with gaps filled as zero.
+    """Posts per calendar day in the display timezone, oldest first, gaps zero.
 
     Gap filling matters: a sparkline built from only the days that have rows
     would silently compress quiet periods and misrepresent the trend.
+    ``created_at`` is stored as naive UTC, so it is shifted by the display
+    timezone's offset before DATE() — bucketing on raw UTC would roll a late
+    Tehran evening over into "tomorrow".
     """
-    from datetime import datetime, timedelta
+    from datetime import timedelta
+    from utils import now_local, local_utc_offset_minutes
 
+    offset_minutes = local_utc_offset_minutes()
     scope, params = _scope_clause(user_id)
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
-                "SELECT DATE(created_at) AS day, COUNT(*) AS total, "
+                "SELECT DATE(TIMESTAMPADD(MINUTE, %s, created_at)) AS day, COUNT(*) AS total, "
                 "SUM(delivery_status = 'completed') AS completed "
                 "FROM post_history p "
                 f"WHERE created_at >= UTC_TIMESTAMP() - INTERVAL %s DAY{scope} "
-                "GROUP BY DATE(created_at) ORDER BY day",
-                [days] + params,
+                "GROUP BY DATE(TIMESTAMPADD(MINUTE, %s, created_at)) ORDER BY day",
+                [offset_minutes, days, offset_minutes] + params,
             )
             rows = {r["day"]: r for r in await cur.fetchall()}
 
-    today = datetime.utcnow().date()
+    today = now_local().date()
     out = []
-    for offset in range(days - 1, -1, -1):
-        day = today - timedelta(days=offset)
+    for back in range(days - 1, -1, -1):
+        day = today - timedelta(days=back)
         row = rows.get(day)
         out.append({
             "day": day,
@@ -770,16 +775,20 @@ async def get_daily_counts(days: int = 14, user_id: int = None) -> list[dict]:
 
 
 async def get_hourly_distribution(days: int = 30, user_id: int = None) -> list[int]:
-    """Posts per hour-of-day (UTC) over the window; 24 buckets."""
+    """Posts per hour-of-day in the display timezone over the window; 24 buckets."""
+    from utils import local_utc_offset_minutes
+
+    offset_minutes = local_utc_offset_minutes()
     scope, params = _scope_clause(user_id)
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
-                "SELECT HOUR(created_at) AS h, COUNT(*) AS total FROM post_history p "
+                "SELECT HOUR(TIMESTAMPADD(MINUTE, %s, created_at)) AS h, COUNT(*) AS total "
+                "FROM post_history p "
                 f"WHERE created_at >= UTC_TIMESTAMP() - INTERVAL %s DAY{scope} "
-                "GROUP BY HOUR(created_at)",
-                [days] + params,
+                "GROUP BY HOUR(TIMESTAMPADD(MINUTE, %s, created_at))",
+                [offset_minutes, days, offset_minutes] + params,
             )
             rows = {int(r["h"]): int(r["total"]) for r in await cur.fetchall()}
     return [rows.get(h, 0) for h in range(24)]
@@ -1192,6 +1201,32 @@ async def reclaim_stale_retries():
                 (SCHEDULE_CLAIM_TIMEOUT_SECONDS,),
             )
             return cur.rowcount
+
+
+async def cancel_post_retries(post_id: int) -> int:
+    """Stop every automatic retry queued for a post.
+
+    Failed channels keep their final 'failed' status but lose their scheduled
+    next attempt, so the post's delivery result is accepted as incomplete.
+    Rows claimed by a retry tick ('retrying', next_retry_at already NULL) are
+    finalised too, so the stale-retry recovery cannot re-arm them after a
+    crash. Returns how many rows had a pending attempt cleared.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE post_deliveries SET next_retry_at = NULL "
+                "WHERE post_id = %s AND status = 'failed' AND next_retry_at IS NOT NULL",
+                (post_id,),
+            )
+            cleared = cur.rowcount
+            await cur.execute(
+                "UPDATE post_deliveries SET status = 'failed' "
+                "WHERE post_id = %s AND status = 'retrying'",
+                (post_id,),
+            )
+            return cleared
 
 
 async def get_post_deliveries(post_id: int) -> list[dict]:

@@ -21,7 +21,7 @@ from database import (
     get_author_stats, get_schedule_stats, get_failure_breakdown,
     get_channel_health, is_owner, is_writer_or_above, get_user_role,
 )
-from utils import html_text, format_local, format_local_date, now_local, display_name
+from utils import html_text, format_local, format_local_date, now_local, display_name, LOCAL_TZ
 import jalali
 
 logger = logging.getLogger(__name__)
@@ -364,12 +364,13 @@ def trend_text(daily, hourly, is_admin: bool) -> str:
     if any(hourly):
         lines.append("")
         peak_hour = hourly.index(max(hourly))
-        lines.append("<b>ساعات فعالیت</b> (۳۰ روز، به وقت UTC)")
+        tzname = LOCAL_TZ.key if hasattr(LOCAL_TZ, "key") else str(LOCAL_TZ)
+        lines.append(f"<b>ساعات فعالیت</b> (۳۰ روز، به وقت {html_text(tzname)})")
         lines.append(f"<code>{sparkline(hourly)}</code>")
         # An arrow axis renders unpredictably inside an RTL message, so the
         # endpoints are labelled explicitly instead.
         lines.append(f"<i>از ساعت ۰۰ (چپ) تا ۲۳ (راست)</i>")
-        lines.append(f"⏰ پرکارترین ساعت: {_fa(f'{peak_hour:02d}')}:۰۰ UTC")
+        lines.append(f"⏰ پرکارترین ساعت: {_fa(f'{peak_hour:02d}')}:۰۰")
 
     return "\n".join(lines)
 
@@ -430,6 +431,8 @@ def channels_text(rows, failures, health) -> str:
         hp = health_by_id.get(row["channel_id"])
         if hp and hp.get("last_health_status") == "unhealthy":
             lines.append("   🩺 بررسی سلامت: ناموفق")
+        elif hp and hp.get("last_health_status") == "degraded":
+            lines.append("   🩺 بررسی سلامت: برخی ربات‌ها به این کانال دسترسی ندارند")
         lines.append("")
 
     if hidden:

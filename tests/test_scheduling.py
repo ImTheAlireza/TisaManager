@@ -119,7 +119,7 @@ class FakeDB:
             "text": kw.get("text"), "file_id": kw.get("file_id"),
             "caption": kw.get("caption"), "media_json": kw.get("media_json"),
             "target_channels_json": kw.get("target_channels_json"),
-            "tg_message_ids": None,
+            "tg_message_ids": None, "created_at": datetime.utcnow(),
         }
         return self._post_id
 
@@ -166,6 +166,19 @@ class FakeDB:
                 return True
         return False
 
+    async def cancel_post_retries(self, post_id):
+        cleared = 0
+        for r in self.deliveries.values():
+            if r["post_id"] != post_id:
+                continue
+            if r.get("status") == "failed" and r.get("next_retry_at") is not None:
+                r["next_retry_at"] = None
+                cleared += 1
+            elif r.get("status") == "retrying":
+                r["status"] = "failed"
+                r["next_retry_at"] = None
+        return cleared
+
     async def reclaim_stale_retries(self):
         return 0
 
@@ -205,6 +218,13 @@ class FakeDB:
 
     async def has_permission(self, user_id, permission):
         return self.roles.get(user_id) in ("sudo", "owner")
+
+    async def can_edit_post(self, user_id, post_id):
+        role = self.roles.get(user_id, "writer")
+        if role in ("sudo", "owner"):
+            return True
+        post = self.posts.get(post_id)
+        return bool(post and post["user_id"] == user_id)
 
     async def get_user_role(self, user_id):
         return self.roles.get(user_id, "writer")
@@ -249,6 +269,7 @@ _install_db_stub()
 try:
     import handlers.post as post
     import handlers.schedules as schedules
+    import handlers.history as history
     from utils import local_to_utc_naive, utc_naive_to_local, now_local
 except ImportError as exc:  # pragma: no cover
     raise unittest.SkipTest(f"python-telegram-bot required: {exc}") from exc
@@ -263,15 +284,17 @@ _REBIND = (
     "reclaim_stale_schedules", "expire_stale_schedules", "get_pending_schedules",
     "save_post", "get_post", "update_post_status", "update_post_delivery",
     "update_post_message_ids", "record_delivery", "get_due_retries",
-    "claim_delivery_retry", "reclaim_stale_retries", "get_post_deliveries",
+    "claim_delivery_retry", "cancel_post_retries", "reclaim_stale_retries",
+    "get_post_deliveries",
     "save_workflow_session", "load_workflow_sessions", "delete_workflow_session",
     "purge_workflow_sessions", "get_setting", "get_active_channels",
     "is_writer_or_above", "has_permission", "get_user_role", "is_sudo", "is_owner",
+    "can_edit_post",
 )
 
 
 def _rebind_fakes():
-    for module in (post, schedules):
+    for module in (post, schedules, history):
         for name in _REBIND:
             if hasattr(module, name) and hasattr(FAKE, name):
                 setattr(module, name, getattr(FAKE, name))
@@ -439,21 +462,27 @@ class ApprovalBypassTests(SchedulingTestCase):
 
 
 class RetryScheduleTests(SchedulingTestCase):
-    """The 1h / 3h / 6h ladder must advance and then stop."""
+    """Retries now fire on a fixed 10-minute cadence and never give up."""
 
-    def test_delays_follow_1_3_6_then_stop(self):
+    def test_next_retry_is_fixed_10_minutes(self):
         base = datetime.utcnow()
-        first = post._next_retry_at(1)
-        second = post._next_retry_at(2)
-        third = post._next_retry_at(3)
-        self.assertAlmostEqual((first - base).total_seconds() / 3600, 1, delta=0.05)
-        self.assertAlmostEqual((second - base).total_seconds() / 3600, 3, delta=0.05)
-        self.assertAlmostEqual((third - base).total_seconds() / 3600, 6, delta=0.05)
-        self.assertIsNone(post._next_retry_at(4),
-                          "retries must stop after the configured ladder")
+        nxt = post._next_retry_at()
+        self.assertAlmostEqual((nxt - base).total_seconds() / 60, 10, delta=0.05)
 
-    def test_exhausted_retry_is_not_rearmed(self):
-        self.assertIsNone(post._next_retry_at(99))
+    def test_retry_never_exhausts(self):
+        # No matter how many attempts have already failed, another retry is
+        # always scheduled — success (or manual cancellation) is the only stop.
+        for _ in range(50):
+            self.assertIsNotNone(post._next_retry_at(),
+                                 "retries must never be exhausted")
+
+    def test_next_retry_independent_of_attempt_count(self):
+        # The cadence is flat: attempt count must not change the delay.
+        base = datetime.utcnow()
+        a = post._next_retry_at()
+        b = post._next_retry_at()
+        self.assertAlmostEqual((a - base).total_seconds() / 60, 10, delta=0.1)
+        self.assertAlmostEqual((b - base).total_seconds() / 60, 10, delta=0.1)
 
 
 class RetryTargetingTests(SchedulingTestCase):
@@ -480,6 +509,34 @@ class RetryTargetingTests(SchedulingTestCase):
 
         self.assertEqual(seen.get("ids"), {2},
                          "retry must not re-send to channels that already succeeded")
+
+    def test_failed_retry_is_rearmed_for_10_minutes_later(self):
+        # A failed retry must schedule the next attempt 10 minutes out, even
+        # after many previous attempts (no exhaustion).
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1]"))
+        for _ in range(20):
+            run(FAKE.record_delivery(pid, 1, "telegram", "failed", "boom",
+                                     datetime.utcnow() - timedelta(minutes=11)))
+
+        async def failing_send(channels, state, bot):
+            return 0, len(channels), [], {c["id"]: "still broken" for c in channels}
+
+        async def no_bale(channels, state, bot, attempt_no=1):
+            return 0, 0, [], {}
+
+        o1, o2 = post._post_to_telegram, post._post_to_bale
+        post._post_to_telegram, post._post_to_bale = failing_send, no_bale
+        try:
+            run(post.process_delivery_retries(make_context()))
+        finally:
+            post._post_to_telegram, post._post_to_bale = o1, o2
+
+        row = FAKE.deliveries[(pid, 1)]
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNotNone(row["next_retry_at"],
+                             "a failed retry must always be re-armed, never given up")
+        delta = (row["next_retry_at"] - datetime.utcnow()).total_seconds() / 60
+        self.assertAlmostEqual(delta, 10, delta=0.5)
 
     def test_due_retry_is_claimed_once(self):
         pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1]"))
@@ -683,7 +740,7 @@ class InflightTrackingTests(SchedulingTestCase):
         original_bale = post._post_to_bale
         post._post_to_telegram = slow_send
 
-        async def no_bale(channels, state, bot):
+        async def no_bale(channels, state, bot, attempt_no=1):
             return 0, 0, [], {}
         post._post_to_bale = no_bale
         try:
@@ -781,13 +838,15 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class RetryLadderGroupingTests(SchedulingTestCase):
-    """Channels on different rungs of the ladder must not be merged."""
+class RetryGroupingTests(SchedulingTestCase):
+    """Due channels batch per post — and per Bale-bot parity."""
 
-    def test_channels_with_different_attempts_are_sent_separately(self):
+    def test_channels_with_same_attempt_parity_are_merged(self):
         pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 2]"))
         overdue = datetime.utcnow() - timedelta(minutes=1)
-        # Channel 1 has failed once; channel 2 has failed three times.
+        # Channel 1 has failed once; channel 2 has failed three times. Both
+        # counts are odd, so both next attempts fall on the same Bale bot and
+        # must go out in a single publish.
         run(FAKE.record_delivery(pid, 1, "telegram", "failed", "e", overdue))
         for _ in range(3):
             run(FAKE.record_delivery(pid, 2, "telegram", "failed", "e", overdue))
@@ -805,11 +864,527 @@ class RetryLadderGroupingTests(SchedulingTestCase):
         finally:
             post.publish_existing_post = original
 
+        self.assertEqual(len(batches), 1)
+        ids, attempt_no = batches[0]
+        self.assertEqual(ids, frozenset({1, 2}))
+        self.assertEqual(attempt_no % 2, 0,
+                         "odd attempt counts mean the next send is an even attempt (bot 2)")
+
+    def test_channels_with_different_attempt_parity_are_split(self):
+        # Bale attempts alternate bots, so channels whose next attempt lands
+        # on different bots must not share a publish.
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 2]"))
+        overdue = datetime.utcnow() - timedelta(minutes=1)
+        # Channel 1 failed once (next attempt even -> bot 2);
+        # channel 2 failed twice (next attempt odd -> bot 1).
+        run(FAKE.record_delivery(pid, 1, "telegram", "failed", "e", overdue))
+        for _ in range(2):
+            run(FAKE.record_delivery(pid, 2, "telegram", "failed", "e", overdue))
+
+        batches = []
+
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
+            batches.append((frozenset(only_channel_ids), attempt_no))
+            return 1, 0
+
+        original = post.publish_existing_post
+        post.publish_existing_post = fake_publish
+        try:
+            run(post.process_delivery_retries(make_context()))
+        finally:
+            post.publish_existing_post = original
+
         self.assertEqual(len(batches), 2,
-                         "channels on different retry rungs were merged into one batch")
-        by_channel = {next(iter(ids)): attempt for ids, attempt in batches}
-        self.assertLess(by_channel[1], by_channel[2],
-                        "a first-time failure must not inherit an older channel's attempt count")
+                         "channels on different bots were merged into one batch")
+        by_ids = {ids: attempt_no for ids, attempt_no in batches}
+        self.assertEqual(by_ids[frozenset({1})] % 2, 0, "channel 1 needs the bot-2 attempt")
+        self.assertEqual(by_ids[frozenset({2})] % 2, 1, "channel 2 needs the bot-1 attempt")
+
+
+class BaleBotAlternationTests(SchedulingTestCase):
+    """Attempts alternate between the primary Bale bot and the backup."""
+
+    def test_odd_attempts_use_bot1_even_use_bot2(self):
+        import bale_client
+        fake_backup = object()
+        original = bale_client.BACKUP_CLIENT
+        bale_client.BACKUP_CLIENT = fake_backup
+        try:
+            self.assertIs(bale_client.client_for_attempt(1), bale_client.DEFAULT_CLIENT)
+            self.assertIs(bale_client.client_for_attempt(2), fake_backup)
+            self.assertIs(bale_client.client_for_attempt(3), bale_client.DEFAULT_CLIENT)
+            self.assertIs(bale_client.client_for_attempt(4), fake_backup)
+        finally:
+            bale_client.BACKUP_CLIENT = original
+
+    def test_without_backup_every_attempt_uses_bot1(self):
+        import bale_client
+        original = bale_client.BACKUP_CLIENT
+        bale_client.BACKUP_CLIENT = None
+        try:
+            for attempt in range(1, 6):
+                self.assertIs(bale_client.client_for_attempt(attempt),
+                              bale_client.DEFAULT_CLIENT)
+        finally:
+            bale_client.BACKUP_CLIENT = original
+
+    def test_post_to_bale_sends_through_the_attempt_bot(self):
+        import bale_client
+        used = []
+
+        class FakeClient:
+            def __init__(self, name):
+                self.name = name
+
+            async def send_message(self, chat_id, text, **kw):
+                used.append(self.name)
+                return {"ok": True, "result": {"message_id": 1}}
+
+        def pick(attempt_no):
+            return FakeClient("bot1" if attempt_no % 2 else "bot2")
+
+        original = bale_client.client_for_attempt
+        bale_client.client_for_attempt = pick
+        try:
+            chans = [{"id": 1, "chat_id": -100, "name": "B", "platform": "bale"}]
+            state = {"type": "text", "text": "hi"}
+            run(post._post_to_bale(chans, state, None, attempt_no=1))
+            run(post._post_to_bale(chans, state, None, attempt_no=2))
+            run(post._post_to_bale(chans, state, None, attempt_no=3))
+        finally:
+            bale_client.client_for_attempt = original
+
+        self.assertEqual(used, ["bot1", "bot2", "bot1"],
+                         "attempts must alternate bots, starting with bot 1")
+
+    def test_retry_now_splits_batches_by_bot(self):
+        FAKE.roles[1] = "owner"
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 2]"))
+        # ch1 failed once -> next attempt even -> bot 2;
+        # ch2 failed twice -> next attempt odd -> bot 1.
+        run(FAKE.record_delivery(pid, 1, "bale", "failed", "e",
+                                 datetime.utcnow() + timedelta(minutes=10)))
+        for _ in range(2):
+            run(FAKE.record_delivery(pid, 2, "bale", "failed", "e",
+                                     datetime.utcnow() + timedelta(minutes=10)))
+
+        batches = []
+        original_publish = post.publish_existing_post
+
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
+            batches.append((frozenset(only_channel_ids), attempt_no))
+            return len(only_channel_ids), 0
+
+        # history.py binds publish_existing_post at import time.
+        original_bound = history.publish_existing_post
+        post.publish_existing_post = fake_publish
+        history.publish_existing_post = fake_publish
+        try:
+            query = RetryCancelButtonTests()._query(f"retry_now_{pid}")
+            update = types.SimpleNamespace(callback_query=query)
+            run(history.handle_retry_now(update, make_context()))
+        finally:
+            post.publish_existing_post = original_publish
+            history.publish_existing_post = original_bound
+
+        self.assertEqual(len(batches), 2,
+                         "retry-now must publish one batch per bot")
+        by_ids = {ids: attempt_no for ids, attempt_no in batches}
+        self.assertEqual(by_ids[frozenset({1})] % 2, 0)
+        self.assertEqual(by_ids[frozenset({2})] % 2, 1)
+
+
+class BaleUploadOptimizationTests(SchedulingTestCase):
+    """Media is downloaded once per post and channels upload in parallel."""
+
+    def test_each_file_downloaded_once_across_many_channels(self):
+        import io as _io
+
+        downloads = []
+
+        class FakeFile:
+            async def download_to_memory(self, out=None):
+                downloads.append(1)
+                buf = out if out is not None else _io.BytesIO()
+                buf.write(b"fake-media-bytes")
+                buf.seek(0)
+                return buf
+
+        class FakeBot:
+            async def get_file(self, file_id):
+                return FakeFile()
+
+        class FakeClient:
+            name = "bale-test"
+
+            def __init__(self):
+                self.calls = []
+
+            async def send_media_group(self, chat_id, media_files, caption=None):
+                self.calls.append((chat_id, len(media_files)))
+                return {"ok": True, "result": [{"message_id": 1}, {"message_id": 2}]}
+
+        import bale_client
+        client = FakeClient()
+        original = bale_client.client_for_attempt
+        bale_client.client_for_attempt = lambda attempt_no: client
+        try:
+            state = {"type": "media_group", "caption": "c",
+                     "media": [{"type": "photo", "file_id": "a"},
+                               {"type": "video", "file_id": "b"}]}
+            channels = [
+                {"id": 1, "chat_id": -100, "name": "B1", "platform": "bale"},
+                {"id": 2, "chat_id": -200, "name": "B2", "platform": "bale"},
+                {"id": 3, "chat_id": -300, "name": "B3", "platform": "bale"},
+            ]
+            sent, failed, message_ids, errors = run(
+                post._post_to_bale(channels, state, FakeBot(), attempt_no=1))
+        finally:
+            bale_client.client_for_attempt = original
+
+        self.assertEqual(sent, 3)
+        self.assertEqual(failed, 0)
+        self.assertEqual(len(downloads), 2,
+                         "a 2-file album to 3 channels must download 2 files, not 6")
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(len(message_ids), 6, "two messages per channel recorded")
+
+    def test_prepare_failure_marks_every_channel_failed(self):
+        class BrokenBot:
+            async def get_file(self, file_id):
+                raise RuntimeError("file too big")
+
+        state = {"type": "photo", "file_id": "x", "caption": None}
+        channels = [{"id": 1, "chat_id": -100, "name": "B1", "platform": "bale"}]
+        sent, failed, message_ids, errors = run(
+            post._post_to_bale(channels, state, BrokenBot(), attempt_no=1))
+        self.assertEqual((sent, failed), (0, 1))
+        self.assertIn("file too big", errors[1])
+
+    def test_album_files_download_concurrently(self):
+        # Sequential downloads multiplied the wall time by the number of
+        # files (5 images ≈ 5x one download); they must overlap instead.
+        import io as _io
+
+        class SlowFile:
+            async def download_to_memory(self, out=None):
+                await asyncio.sleep(0.3)
+                buf = out if out is not None else _io.BytesIO()
+                buf.write(b"x")
+                buf.seek(0)
+                return buf
+
+        class FakeBot:
+            async def get_file(self, file_id):
+                return SlowFile()
+
+        state = {"type": "media_group", "caption": None,
+                 "media": [{"type": "photo", "file_id": f"f{i}"} for i in range(4)]}
+        started = time.monotonic()
+        prepared = run(post._prepare_bale_payloads(state, FakeBot()))
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(len(prepared["items"]), 4)
+        self.assertLess(elapsed, 1.0,
+                        f"4 downloads of 0.3s took {elapsed:.1f}s — they ran sequentially")
+
+
+class RetryCancelButtonTests(SchedulingTestCase):
+    """Cancel/retry-now: available to sudo/owner and to writers for their own posts."""
+
+    def _query(self, data, user_id=1):
+        answered = []
+        edits = []
+        replies = []
+
+        async def answer(text=None, show_alert=False):
+            answered.append((text, show_alert))
+
+        async def edit_message_text(text, **kw):
+            edits.append(text)
+
+        async def reply_text(text, **kw):
+            replies.append(text)
+
+        query = types.SimpleNamespace(
+            data=data, from_user=types.SimpleNamespace(id=user_id),
+            answer=answer, edit_message_text=edit_message_text,
+            message=types.SimpleNamespace(
+                chat=types.SimpleNamespace(id=user_id), reply_text=reply_text,
+            ),
+        )
+        query._answered = answered
+        query._edits = edits
+        query._replies = replies
+        return query
+
+    def _failed_post(self):
+        """Post authored by user 7: one delivered channel, one failed (armed)."""
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 2]"))
+        run(FAKE.record_delivery(pid, 1, "telegram", "completed"))
+        run(FAKE.record_delivery(pid, 2, "telegram", "failed", "boom",
+                                 datetime.utcnow() + timedelta(minutes=10)))
+        return pid
+
+    def test_cancel_clears_queue_and_accepts_incomplete_status(self):
+        FAKE.roles[1] = "owner"
+        pid = self._failed_post()
+        query = self._query(f"cancel_retries_{pid}")
+        update = types.SimpleNamespace(callback_query=query)
+        run(history.handle_cancel_retries(update, make_context()))
+
+        self.assertIsNone(FAKE.deliveries[(pid, 2)]["next_retry_at"],
+                          "cancelled retries must never fire again")
+        self.assertEqual(FAKE.deliveries[(pid, 2)]["status"], "failed")
+        self.assertEqual(FAKE.posts[pid]["delivery_status"], "partial",
+                         "the final status must be accepted as incomplete")
+        self.assertEqual(run(FAKE.get_due_retries()), [])
+        self.assertTrue(any("متوقف شد" in e for e in query._edits))
+
+    def test_cancel_finalises_in_flight_rows_so_recovery_cannot_rearm(self):
+        FAKE.roles[1] = "owner"
+        pid = self._failed_post()
+        # Claim the retry like the job would, then cancel mid-flight.
+        run(FAKE.claim_delivery_retry(FAKE.deliveries[(pid, 2)]["id"]))
+        self.assertEqual(FAKE.deliveries[(pid, 2)]["status"], "retrying")
+        query = self._query(f"cancel_retries_{pid}")
+        update = types.SimpleNamespace(callback_query=query)
+        run(history.handle_cancel_retries(update, make_context()))
+        row = FAKE.deliveries[(pid, 2)]
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNone(row["next_retry_at"])
+
+    def test_writer_can_cancel_own_post(self):
+        FAKE.roles[7] = "writer"
+        pid = self._failed_post()
+        query = self._query(f"cancel_retries_{pid}", user_id=7)
+        update = types.SimpleNamespace(callback_query=query)
+        run(history.handle_cancel_retries(update, make_context()))
+        self.assertIsNone(FAKE.deliveries[(pid, 2)]["next_retry_at"],
+                          "a writer must be able to stop retries of their own post")
+        self.assertEqual(FAKE.posts[pid]["delivery_status"], "partial")
+
+    def test_cancel_is_forbidden_for_other_peoples_posts(self):
+        FAKE.roles[1] = "writer"
+        pid = self._failed_post()
+        query = self._query(f"cancel_retries_{pid}", user_id=1)
+        update = types.SimpleNamespace(callback_query=query)
+        run(history.handle_cancel_retries(update, make_context()))
+        self.assertIsNotNone(FAKE.deliveries[(pid, 2)]["next_retry_at"],
+                             "a writer must not cancel retries of another user's post")
+        self.assertTrue(any(t and "اجازه" in t for t, _ in query._answered))
+
+    def test_cancel_with_nothing_queued_leaves_status_alone(self):
+        # A stale button on a healthy post must not flip its status.
+        FAKE.roles[1] = "owner"
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1]",
+                                 delivery_status="completed"))
+        run(FAKE.record_delivery(pid, 1, "telegram", "completed"))
+        query = self._query(f"cancel_retries_{pid}")
+        update = types.SimpleNamespace(callback_query=query)
+        run(history.handle_cancel_retries(update, make_context()))
+        self.assertEqual(FAKE.posts[pid]["delivery_status"], "completed",
+                         "cancelling with an empty queue must not touch the status")
+        self.assertTrue(any(t and "در صف نیست" in t for t, _ in query._answered))
+
+    def test_retry_now_success_marks_post_completed(self):
+        FAKE.roles[1] = "owner"
+        pid = self._failed_post()
+        # Clear the armed retry: retry-now must work even after cancellation.
+        run(FAKE.cancel_post_retries(pid))
+
+        async def only_tg(channels, state, bot):
+            return len(channels), 0, [], {}
+
+        async def no_bale(channels, state, bot, attempt_no=1):
+            return 0, 0, [], {}
+
+        o1, o2 = post._post_to_telegram, post._post_to_bale
+        post._post_to_telegram, post._post_to_bale = only_tg, no_bale
+        try:
+            query = self._query(f"retry_now_{pid}")
+            update = types.SimpleNamespace(callback_query=query)
+            run(history.handle_retry_now(update, make_context()))
+        finally:
+            post._post_to_telegram, post._post_to_bale = o1, o2
+
+        self.assertEqual(FAKE.deliveries[(pid, 2)]["status"], "completed")
+        self.assertEqual(FAKE.posts[pid]["delivery_status"], "completed",
+                         "a successful retry-now must mark the post complete")
+        self.assertTrue(any("کامل شد" in r for r in query._replies))
+
+    def test_retry_now_failure_arms_next_attempt_in_10_minutes(self):
+        FAKE.roles[1] = "owner"
+        pid = self._failed_post()
+        run(FAKE.cancel_post_retries(pid))
+
+        async def failing_send(channels, state, bot):
+            return 0, len(channels), [], {c["id"]: "still broken" for c in channels}
+
+        async def no_bale(channels, state, bot, attempt_no=1):
+            return 0, 0, [], {}
+
+        o1, o2 = post._post_to_telegram, post._post_to_bale
+        post._post_to_telegram, post._post_to_bale = failing_send, no_bale
+        try:
+            query = self._query(f"retry_now_{pid}")
+            update = types.SimpleNamespace(callback_query=query)
+            run(history.handle_retry_now(update, make_context()))
+        finally:
+            post._post_to_telegram, post._post_to_bale = o1, o2
+
+        row = FAKE.deliveries[(pid, 2)]
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNotNone(row["next_retry_at"],
+                             "a failed retry-now must arm the next attempt")
+        delta = (row["next_retry_at"] - datetime.utcnow()).total_seconds() / 60
+        self.assertAlmostEqual(delta, 10, delta=0.5,
+                               msg="the next attempt counts from the retry-now time")
+        self.assertTrue(any("10" in r and "دقیقه" in r for r in query._replies))
+
+    def test_writer_can_retry_now_own_post(self):
+        FAKE.roles[7] = "writer"
+        pid = self._failed_post()
+
+        async def only_tg(channels, state, bot):
+            return len(channels), 0, [], {}
+
+        async def no_bale(channels, state, bot, attempt_no=1):
+            return 0, 0, [], {}
+
+        o1, o2 = post._post_to_telegram, post._post_to_bale
+        post._post_to_telegram, post._post_to_bale = only_tg, no_bale
+        try:
+            query = self._query(f"retry_now_{pid}", user_id=7)
+            update = types.SimpleNamespace(callback_query=query)
+            run(history.handle_retry_now(update, make_context()))
+        finally:
+            post._post_to_telegram, post._post_to_bale = o1, o2
+
+        self.assertEqual(FAKE.posts[pid]["delivery_status"], "completed",
+                         "a writer must be able to complete their own post")
+
+    def test_retry_now_is_forbidden_for_other_peoples_posts(self):
+        FAKE.roles[1] = "writer"
+        pid = self._failed_post()
+        query = self._query(f"retry_now_{pid}", user_id=1)
+        update = types.SimpleNamespace(callback_query=query)
+        run(history.handle_retry_now(update, make_context()))
+        self.assertTrue(any(t and "اجازه" in t for t, _ in query._answered))
+
+    def test_retry_now_refuses_when_the_auto_job_is_already_sending(self):
+        # The retry job claimed the row first: retry-now must back off instead
+        # of double-sending the channel.
+        FAKE.roles[1] = "owner"
+        pid = self._failed_post()
+        run(FAKE.claim_delivery_retry(FAKE.deliveries[(pid, 2)]["id"]))
+        query = self._query(f"retry_now_{pid}")
+        update = types.SimpleNamespace(callback_query=query)
+        run(history.handle_retry_now(update, make_context()))
+        self.assertTrue(any(t and "در حال ارسال" in t for t, _ in query._answered))
+        self.assertEqual(query._replies, [],
+                         "nothing may be sent when the auto job owns the rows")
+
+    def test_retry_now_with_dead_channel_does_not_claim_complete(self):
+        # The failed channel was removed afterwards: retry-now must finalise
+        # it instead of claiming the post is complete with zero sends.
+        FAKE.roles[1] = "owner"
+        pid = self._failed_post()
+
+        async def only_channel_1(platform=None):
+            chans = [{"id": 1, "chat_id": -100, "name": "A",
+                      "chat_type": "channel", "platform": "telegram"}]
+            return [c for c in chans if platform is None or c["platform"] == platform]
+
+        original = post.get_active_channels
+        post.get_active_channels = only_channel_1
+        try:
+            query = self._query(f"retry_now_{pid}")
+            update = types.SimpleNamespace(callback_query=query)
+            run(history.handle_retry_now(update, make_context()))
+        finally:
+            post.get_active_channels = original
+
+        self.assertEqual(FAKE.deliveries[(pid, 2)]["status"], "cancelled")
+        self.assertTrue(any("در دسترس نیستند" in e for e in query._edits))
+        self.assertFalse(any("کامل شد" in e for e in query._edits),
+                         "a dead channel must not be reported as a completed post")
+
+
+class DeadChannelRetryLoopTests(SchedulingTestCase):
+    """A channel removed after a failure must not be retried forever."""
+
+    def test_dead_channel_row_is_finalised_not_retried_forever(self):
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 2]"))
+        overdue = datetime.utcnow() - timedelta(minutes=1)
+        run(FAKE.record_delivery(pid, 1, "telegram", "failed", "e", overdue))
+        run(FAKE.record_delivery(pid, 2, "telegram", "failed", "e", overdue))
+
+        async def only_channel_1(platform=None):
+            chans = [{"id": 1, "chat_id": -100, "name": "A",
+                      "chat_type": "channel", "platform": "telegram"}]
+            return [c for c in chans if platform is None or c["platform"] == platform]
+
+        batches = []
+
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
+            batches.append(frozenset(only_channel_ids))
+            return len(only_channel_ids), 0
+
+        original_channels = post.get_active_channels
+        original_publish = post.publish_existing_post
+        post.get_active_channels = only_channel_1
+        post.publish_existing_post = fake_publish
+        try:
+            run(post.process_delivery_retries(make_context()))
+        finally:
+            post.get_active_channels = original_channels
+            post.publish_existing_post = original_publish
+
+        self.assertEqual(batches, [frozenset({1})],
+                         "only the live channel may be re-sent")
+        dead_row = FAKE.deliveries[(pid, 2)]
+        self.assertEqual(dead_row["status"], "cancelled")
+        self.assertIsNone(dead_row["next_retry_at"])
+        self.assertEqual(run(FAKE.get_due_retries()), [],
+                         "a dead channel must never re-enter the retry queue")
+
+
+class RetryButtonKeyboardTests(SchedulingTestCase):
+    """The retry-management buttons are conditional on active retries."""
+
+    def test_buttons_shown_while_retries_active(self):
+        from keyboards import post_detail_keyboard
+        markup = post_detail_keyboard(5, "partial", can_manage_retries=True,
+                                      has_active_retries=True)
+        payloads = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertIn("retry_now_5", payloads)
+        self.assertIn("cancel_retries_5", payloads)
+
+    def test_buttons_hidden_for_viewers_without_edit_rights(self):
+        from keyboards import post_detail_keyboard
+        markup = post_detail_keyboard(5, "partial", can_manage_retries=False,
+                                      has_active_retries=True)
+        payloads = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertNotIn("retry_now_5", payloads)
+        self.assertNotIn("cancel_retries_5", payloads)
+
+    def test_buttons_hidden_when_post_fully_sent(self):
+        from keyboards import post_detail_keyboard
+        markup = post_detail_keyboard(5, "completed", can_manage_retries=True,
+                                      has_active_retries=False)
+        payloads = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertNotIn("retry_now_5", payloads)
+        self.assertNotIn("cancel_retries_5", payloads)
+
+    def test_buttons_hidden_after_retries_cancelled(self):
+        # Failed rows still exist, but nothing is queued anymore.
+        from keyboards import post_detail_keyboard
+        markup = post_detail_keyboard(5, "partial", can_manage_retries=True,
+                                      has_active_retries=False)
+        payloads = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertNotIn("retry_now_5", payloads)
+        self.assertNotIn("cancel_retries_5", payloads)
 
 
 class PartialRetryPreservationTests(SchedulingTestCase):
@@ -825,14 +1400,14 @@ class PartialRetryPreservationTests(SchedulingTestCase):
         async def only_tg(channels, state, bot):
             return len(channels), 0, [], {}
 
-        async def no_bale(channels, state, bot):
+        async def no_bale(channels, state, bot, attempt_no=1):
             return 0, 0, [], {}
 
         o1, o2 = post._post_to_telegram, post._post_to_bale
         post._post_to_telegram, post._post_to_bale = only_tg, no_bale
         try:
             row = run(FAKE.get_post(pid))
-            run(post.publish_existing_post(row, FakeBot(), only_channel_ids={2}, attempt_no=2))
+            run(post.publish_existing_post(row, FakeBot(), only_channel_ids={2}))
         finally:
             post._post_to_telegram, post._post_to_bale = o1, o2
 

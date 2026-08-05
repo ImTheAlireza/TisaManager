@@ -5,6 +5,20 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BALE_TOKEN = os.getenv("BALE_TOKEN")
+# Optional second Bale bot used as a backup sender. Delivery attempts
+# alternate between the two bots (attempt 1 -> bot 1, attempt 2 -> bot 2,
+# attempt 3 -> bot 1, ...) so a rate-limited or blocked bot is swapped for a
+# fresh one on the next try. Leave unset to send every attempt with the
+# primary bot.
+BALE_TOKEN_2 = os.getenv("BALE_TOKEN_2") or None
+
+# Bale network tuning. Small API calls use BALE_TIMEOUT; file uploads use the
+# much longer BALE_UPLOAD_TIMEOUT, because a short socket timeout kills large
+# video uploads the moment the connection stalls for a few seconds.
+BALE_TIMEOUT = int(os.getenv("BALE_TIMEOUT", 30))
+BALE_UPLOAD_TIMEOUT = int(os.getenv("BALE_UPLOAD_TIMEOUT", 120))
+# How many Bale channels may be uploaded in parallel during one publish.
+BALE_MAX_CONCURRENT = int(os.getenv("BALE_MAX_CONCURRENT", 3))
 SUDO_USER_ID = int(os.getenv("SUDO_USER_ID", 0))
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", 3306))
@@ -32,11 +46,12 @@ SCHEDULE_CLAIM_TIMEOUT_SECONDS = int(os.getenv("SCHEDULE_CLAIM_TIMEOUT_SECONDS",
 # A schedule that keeps dying mid-publish is abandoned after this many claims.
 SCHEDULE_MAX_ATTEMPTS = int(os.getenv("SCHEDULE_MAX_ATTEMPTS", 3))
 
-# Automatic re-delivery offsets (hours after the first failure) for channels
-# that failed. Empty string disables automatic retries.
-RETRY_DELAYS_HOURS = tuple(
-    int(x) for x in os.getenv("RETRY_DELAYS_HOURS", "1,3,6").split(",") if x.strip()
-)
+# Automatic re-delivery cadence (minutes) for channels that failed. Failed
+# channels are retried on this fixed interval until they succeed or the
+# retries are stopped from the post history (writers for their own posts,
+# sudo/owner for all) — there is no attempt cap. Set to 0 to disable
+# automatic retries.
+RETRY_INTERVAL_MINUTES = int(os.getenv("RETRY_INTERVAL_MINUTES", 10))
 
 # An interactive workflow (composing a post, picking a time) is remembered for
 # this long, and survives a restart.

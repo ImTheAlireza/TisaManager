@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 import json
 import time
@@ -9,7 +10,8 @@ from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
 from config import (
-    RETRY_DELAYS_HOURS, SCHEDULE_GRACE_SECONDS, WORKFLOW_TTL_SECONDS,
+    RETRY_INTERVAL_MINUTES, SCHEDULE_GRACE_SECONDS, WORKFLOW_TTL_SECONDS,
+    BALE_MAX_CONCURRENT,
 )
 from database import (
     get_active_channels, is_writer_or_above, is_sudo, is_owner, save_post,
@@ -396,96 +398,169 @@ async def _post_to_telegram(channels, state, bot):
     return sent, failed, message_ids, errors
 
 
-async def _post_to_bale(channels, state, bot):
-    """Returns (sent, failed, message_ids, errors_by_channel_id)."""
+async def _download_telegram_file(bot, file_id) -> bytes:
+    """Download one Telegram file fully into memory."""
+    file = await bot.get_file(file_id)
+    buf = io.BytesIO()
+    await file.download_to_memory(buf)
+    return buf.getvalue()
+
+
+async def _prepare_bale_payloads(state, bot) -> dict:
+    """Build the shared payload for this post, downloading each file once.
+
+    Previously every channel re-downloaded every file from Telegram, so an
+    N-file album to M channels meant N*M downloads. Now each file is fetched
+    a single time and reused for every destination — and all files of an
+    album download concurrently, because sequential downloads multiplied the
+    wall time by the number of files.
+    """
+    post_type = state.get("type")
+    if post_type == "text":
+        return {"kind": "text"}
+    started = time.monotonic()
+    if post_type == "media_group":
+        media = state.get("media") or []
+        blobs = await asyncio.gather(
+            *(_download_telegram_file(bot, m["file_id"]) for m in media)
+        )
+        items = [(m["type"], blob) for m, blob in zip(media, blobs)]
+        logger.info(
+            "Prepared Bale media group: %d file(s), %.1f MB downloaded in %.1fs",
+            len(items), sum(len(b) for _, b in items) / 1048576,
+            time.monotonic() - started,
+        )
+        return {"kind": "media_group", "items": items}
+    data = await _download_telegram_file(bot, state["file_id"])
+    logger.info(
+        "Prepared Bale %s: %.1f MB downloaded in %.1fs",
+        post_type, len(data) / 1048576, time.monotonic() - started,
+    )
+    return {"kind": post_type, "bytes": data}
+
+
+async def _send_bale_channel(client, ch, state, prepared):
+    """Send one Bale channel from the shared payload.
+
+    Returns (ok, message_ids, error).
+    """
+    kind = prepared.get("kind")
+    caption = state.get("caption")
+    started = time.monotonic()
+    if kind == "text":
+        result = await client.send_message(ch["chat_id"], state["text"])
+    elif kind == "photo":
+        result = await client.send_photo(ch["chat_id"], prepared["bytes"], caption=caption)
+    elif kind == "video":
+        result = await client.send_video(ch["chat_id"], prepared["bytes"], caption=caption)
+    elif kind == "document":
+        result = await client.send_document(ch["chat_id"], prepared["bytes"], caption=caption)
+    elif kind == "media_group":
+        result = await client.send_media_group(ch["chat_id"], prepared["items"], caption=caption)
+    else:
+        return False, [], f"unsupported post type: {kind}"
+    elapsed = time.monotonic() - started
+
+    if result and result.get("ok"):
+        logger.info("Bale %s delivered to %s (%s) via %s in %.1fs",
+                    kind, ch["name"], ch["chat_id"], client.name, elapsed)
+        ids = []
+        msg = result["result"]
+        if isinstance(msg, list):
+            for m in msg:
+                ids.append({"chat_id": ch["chat_id"], "message_id": m["message_id"], "platform": "bale"})
+        else:
+            ids.append({"chat_id": ch["chat_id"], "message_id": msg["message_id"], "platform": "bale"})
+        return True, ids, None
+    if result and not result.get("ok"):
+        # A non-ok Bale response is a failure, not a success.
+        return False, [], result.get("description", "Bale API error")
+    return False, [], "empty Bale response"
+
+
+async def _post_to_bale(channels, state, bot, attempt_no: int = 1):
+    """Returns (sent, failed, message_ids, errors_by_channel_id).
+
+    ``attempt_no`` selects which Bale bot sends: attempts alternate between
+    the primary bot and the backup bot (if configured), so a rate-limited or
+    blocked bot is swapped for a fresh one on the next try.
+
+    Optimised for speed: media is downloaded from Telegram once per post and
+    the channels are uploaded in parallel (BALE_MAX_CONCURRENT), instead of
+    the old serial download-per-channel loop.
+    """
     import bale_client
-    import tempfile
-    import os
+    started = time.monotonic()
     sent = 0
     failed = 0
     message_ids = []
     errors: dict[int, str] = {}
-    post_type = state.get("type")
-    tmp_dir = tempfile.mkdtemp(prefix="bale_post_")
-    try:
+    client = bale_client.client_for_attempt(attempt_no)
+    if client is None:
+        # No Bale token configured at all; report every channel as failed.
         for ch in channels:
-            try:
-                result = None
-                if post_type == "text":
-                    result = await bale_client.send_message(ch["chat_id"], state["text"])
-                elif post_type == "photo":
-                    path = os.path.join(tmp_dir, f"photo_{ch['id']}.jpg")
-                    file = await bot.get_file(state["file_id"])
-                    await file.download_to_drive(path)
-                    with open(path, "rb") as f:
-                        result = await bale_client.send_photo(ch["chat_id"], f.read(), caption=state.get("caption"))
-                elif post_type == "video":
-                    path = os.path.join(tmp_dir, f"video_{ch['id']}.mp4")
-                    file = await bot.get_file(state["file_id"])
-                    await file.download_to_drive(path)
-                    with open(path, "rb") as f:
-                        result = await bale_client.send_video(ch["chat_id"], f.read(), caption=state.get("caption"))
-                elif post_type == "document":
-                    path = os.path.join(tmp_dir, f"doc_{ch['id']}.bin")
-                    file = await bot.get_file(state["file_id"])
-                    await file.download_to_drive(path)
-                    with open(path, "rb") as f:
-                        result = await bale_client.send_document(ch["chat_id"], f.read(), caption=state.get("caption"))
-                elif post_type == "media_group":
-                    caption = state.get("caption")
-                    media_files = []
-                    for i, m in enumerate(state["media"]):
-                        ext = "jpg" if m["type"] == "photo" else "mp4"
-                        path = os.path.join(tmp_dir, f"media_{i}.{ext}")
-                        file = await bot.get_file(m["file_id"])
-                        await file.download_to_drive(path)
-                        with open(path, "rb") as f:
-                            media_files.append((m["type"], f.read()))
-                    result = await bale_client.send_media_group(ch["chat_id"], media_files, caption=caption)
-                if result and result.get("ok"):
-                    msg = result["result"]
-                    if isinstance(msg, list):
-                        for m in msg:
-                            message_ids.append({"chat_id": ch["chat_id"], "message_id": m["message_id"], "platform": "bale"})
-                    else:
-                        message_ids.append({"chat_id": ch["chat_id"], "message_id": msg["message_id"], "platform": "bale"})
-                if result and not result.get("ok"):
-                    # A non-ok Bale response is a failure, not a success.
-                    raise RuntimeError(result.get("description", "Bale API error"))
-                sent += 1
-            except Exception as e:
-                logger.error("Failed to post to Bale %s (%s): %s", ch["name"], ch["chat_id"], e)
-                errors[ch["id"]] = str(e)
-                failed += 1
-    finally:
-        import shutil
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+            errors[ch["id"]] = "Bale token not configured"
+        return 0, len(channels), [], errors
+
+    try:
+        prepared = await _prepare_bale_payloads(state, bot)
+    except Exception as e:
+        logger.error("Could not prepare Bale media (%s): %s", state.get("type"), e)
+        for ch in channels:
+            errors[ch["id"]] = str(e)
+        return 0, len(channels), [], errors
+
+    semaphore = asyncio.Semaphore(max(1, BALE_MAX_CONCURRENT))
+
+    async def send_one(ch):
+        async with semaphore:
+            return await _send_bale_channel(client, ch, state, prepared)
+
+    results = await asyncio.gather(*(send_one(ch) for ch in channels), return_exceptions=True)
+
+    for ch, result in zip(channels, results):
+        if isinstance(result, Exception):
+            logger.error("Failed to post to Bale %s (%s) via %s: %s",
+                         ch["name"], ch["chat_id"], client.name, result)
+            errors[ch["id"]] = str(result)
+            failed += 1
+            continue
+        ok, ids, error = result
+        if ok:
+            sent += 1
+            message_ids.extend(ids)
+        else:
+            logger.error("Failed to post to Bale %s (%s) via %s: %s",
+                         ch["name"], ch["chat_id"], client.name, error)
+            errors[ch["id"]] = error
+            failed += 1
+    logger.info("Bale publish finished via %s: %d/%d channel(s) in %.1fs",
+                client.name, sent, len(channels), time.monotonic() - started)
     return sent, failed, message_ids, errors
 
 
-def _next_retry_at(attempts: int):
-    """Naive-UTC time of the next automatic retry, or None when exhausted.
+def _next_retry_at():
+    """Naive-UTC time of the next automatic retry, or None when disabled.
 
-    ``attempts`` is how many deliveries have already been tried, so attempt 1
-    schedules RETRY_DELAYS_HOURS[0] (1h), then 3h, then 6h, then gives up.
+    Failed channels are retried on a fixed RETRY_INTERVAL_MINUTES cadence
+    until they succeed or the retries are stopped from the post history —
+    there is no attempt cap.
     """
-    index = max(0, attempts - 1)
-    if index >= len(RETRY_DELAYS_HOURS):
+    if RETRY_INTERVAL_MINUTES <= 0:
         return None
-    return datetime.utcnow() + timedelta(hours=RETRY_DELAYS_HOURS[index])
+    return datetime.utcnow() + timedelta(minutes=RETRY_INTERVAL_MINUTES)
 
 
-async def _record_channel_results(post_id: int, channels, failures: dict, attempt_no: int = 1):
+async def _record_channel_results(post_id: int, channels, failures: dict):
     """Persist one row per channel and arm retries for the failures."""
     for ch in channels:
         error = failures.get(ch["id"])
         if error is None:
             await record_delivery(post_id, ch["id"], ch.get("platform", "telegram"), "completed")
         else:
-            retry_at = _next_retry_at(attempt_no)
             await record_delivery(
                 post_id, ch["id"], ch.get("platform", "telegram"), "failed",
-                error=str(error)[:1000], next_retry_at=retry_at,
+                error=str(error)[:1000], next_retry_at=_next_retry_at(),
             )
 
 
@@ -513,11 +588,26 @@ async def _resolve_targets(post: dict, only_channel_ids: set = None):
     return tg, bale
 
 
+async def split_live_targets(post: dict, channel_ids: set) -> tuple[set, set]:
+    """Split ``channel_ids`` into (live, dead) against the post's targets.
+
+    A channel is dead when it no longer exists or is inactive. Retrying a
+    dead channel can never succeed, so callers must finalise those rows
+    instead of re-queueing them forever.
+    """
+    tg, bale = await _resolve_targets(post)
+    alive = {c["id"] for c in tg + bale}
+    live = {i for i in channel_ids if i in alive}
+    return live, channel_ids - live
+
+
 async def publish_existing_post(post: dict, bot, only_channel_ids: set = None,
                                 attempt_no: int = 1) -> tuple[int, int]:
     """Publish a stored post, used by scheduled jobs and retry actions.
 
     Registers itself as in-flight so a restart can wait for it to finish.
+    ``attempt_no`` is this delivery's attempt number and only decides which
+    Bale bot sends (attempts alternate bots); scheduling is unaffected.
     """
     post_id = post["id"]
     async with _inflight_lock:
@@ -527,7 +617,7 @@ async def publish_existing_post(post: dict, bot, only_channel_ids: set = None,
         state = {"type": post["post_type"], "text": post.get("text"), "file_id": post.get("file_id"),
                  "caption": post.get("caption"), "media": json.loads(post.get("media_json") or "[]")}
         tg_sent, tg_failed, tg_ids, tg_errors = await _post_to_telegram(tg, state, bot)
-        bale_sent, bale_failed, bale_ids, bale_errors = await _post_to_bale(bale, state, bot)
+        bale_sent, bale_failed, bale_ids, bale_errors = await _post_to_bale(bale, state, bot, attempt_no)
 
         # Merge with anything already delivered so a partial retry does not
         # erase the message ids of the channels that succeeded earlier.
@@ -542,7 +632,7 @@ async def publish_existing_post(post: dict, bot, only_channel_ids: set = None,
         await update_post_message_ids(post_id, json.dumps(existing + tg_ids + bale_ids), None)
 
         failures = {**tg_errors, **bale_errors}
-        await _record_channel_results(post_id, tg + bale, failures, attempt_no)
+        await _record_channel_results(post_id, tg + bale, failures)
 
         total = len(tg) + len(bale)
         sent = tg_sent + bale_sent
@@ -569,6 +659,17 @@ async def _aggregate_status(post_id: int) -> str:
     if done == len(rows):
         return "completed"
     return "partial" if done else "failed"
+
+
+async def refresh_delivery_status(post_id: int) -> str:
+    """Recompute and persist the post-level status from its per-channel rows.
+
+    Used after retries are cancelled so the post settles on its final,
+    incomplete status (partial/failed) instead of staying "pending"-ish.
+    """
+    status = await _aggregate_status(post_id)
+    await update_post_delivery(post_id, status, None)
+    return status
 
 
 async def _notify(bot, user_id: int, text: str):
@@ -654,8 +755,8 @@ async def process_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
 
             if failed:
                 retry_note = ""
-                if RETRY_DELAYS_HOURS:
-                    retry_note = f"\n🔁 تلاش مجدد خودکار تا {RETRY_DELAYS_HOURS[0]} ساعت دیگر انجام می‌شود."
+                if RETRY_INTERVAL_MINUTES:
+                    retry_note = f"\n🔁 تلاش مجدد خودکار تا {RETRY_INTERVAL_MINUTES} دقیقه دیگر انجام می‌شود."
                 await _notify(
                     context.bot, schedule["user_id"],
                     f"⚠️ پست زمان‌بندی‌شده #{post['id']} ناقص ارسال شد.\n"
@@ -677,10 +778,10 @@ async def process_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def process_delivery_retries(context: ContextTypes.DEFAULT_TYPE):
-    """Re-send only the channels that failed, at 1h / 3h / 6h.
+    """Re-send only the channels that failed, every RETRY_INTERVAL_MINUTES.
 
-    Retries are grouped per post so a post failing on three channels produces
-    one notification, not three.
+    Retries repeat on the fixed interval until every channel succeeds or they
+    are stopped from the post history — there is no attempt cap.
     """
     try:
         await reclaim_stale_retries()
@@ -691,16 +792,23 @@ async def process_delivery_retries(context: ContextTypes.DEFAULT_TYPE):
     if not due:
         return
 
-    # Group by (post, attempt count): channels that have failed a different
-    # number of times sit on different rungs of the 1h/3h/6h ladder and must
-    # not be merged, or a first-time failure would jump straight to 6h.
-    by_group: dict[tuple, list[dict]] = {}
+    # Group by post so a post failing on three channels produces one publish
+    # and one notification, not three. Channels are also split by attempt
+    # parity: Bale attempts alternate bots, so channels whose next attempt
+    # falls on different bots must not share a publish.
+    by_key: dict[tuple, list[dict]] = {}
     for row in due:
         if await claim_delivery_retry(row["id"]):
-            by_group.setdefault((row["post_id"], row["attempts"]), []).append(row)
+            by_key.setdefault((row["post_id"], row["attempts"] % 2), []).append(row)
 
-    for (post_id, attempt_no), rows in by_group.items():
-        channel_ids = {r["channel_id"] for r in rows}
+    for (post_id, parity), rows in by_key.items():
+        # Rows carry how many attempts already happened; the next send is
+        # attempt attempts+1. Even attempts (2, 4, ...) go to the backup bot,
+        # odd ones (1, 3, ...) to the primary.
+        attempt_no = 2 if parity else 1
+        # Updated by the try-block; the except must only re-arm rows that are
+        # still live — dead channels were finalised and must stay that way.
+        live_ids = {r["channel_id"] for r in rows}
         try:
             post = await get_post(post_id)
             if not post:
@@ -709,32 +817,45 @@ async def process_delivery_retries(context: ContextTypes.DEFAULT_TYPE):
                     await record_delivery(post_id, r["channel_id"], r["platform"],
                                           "cancelled", "post deleted", None)
                 continue
+
+            # Channels that were removed/deactivated since the failure can
+            # never be delivered; finalise them instead of retrying forever.
+            live_ids, dead_ids = await split_live_targets(post, live_ids)
+            for r in rows:
+                if r["channel_id"] in dead_ids:
+                    await record_delivery(post_id, r["channel_id"], r["platform"],
+                                          "cancelled", "channel no longer available", None)
+            if not live_ids:
+                continue
+
             sent, failed = await publish_existing_post(
-                post, context.bot, only_channel_ids=channel_ids, attempt_no=attempt_no + 1,
+                post, context.bot, only_channel_ids=live_ids, attempt_no=attempt_no,
             )
-            exhausted = _next_retry_at(attempt_no + 1) is None
-            if failed and exhausted:
-                await _notify(
-                    context.bot, post["user_id"],
-                    f"❌ تلاش‌های خودکار برای ارسال پست #{post_id} به {failed} مقصد ناموفق بود "
-                    f"و دیگر تکرار نمی‌شود.\nبرای ارسال دستی از «🔁 ارسال مجدد» استفاده کنید.",
-                )
-            elif failed:
-                nxt = RETRY_DELAYS_HOURS[min(attempt_no, len(RETRY_DELAYS_HOURS) - 1)]
+            if failed:
                 await _notify(
                     context.bot, post["user_id"],
                     f"⚠️ تلاش مجدد پست #{post_id} برای {failed} مقصد ناموفق بود. "
-                    f"تلاش بعدی تا {nxt} ساعت دیگر.",
+                    f"تلاش بعدی {RETRY_INTERVAL_MINUTES} دقیقه دیگر انجام می‌شود.",
                 )
             else:
-                await _notify(
-                    context.bot, post["user_id"],
-                    f"✅ تلاش مجدد موفق بود: پست #{post_id} به {sent} مقصد باقی‌مانده ارسال شد.",
-                )
+                final_status = await _aggregate_status(post_id)
+                if final_status == "completed":
+                    await _notify(
+                        context.bot, post["user_id"],
+                        f"✅ تلاش مجدد موفق بود: پست #{post_id} به {sent} مقصد باقی‌مانده ارسال شد "
+                        "و کامل شد.",
+                    )
+                else:
+                    await _notify(
+                        context.bot, post["user_id"],
+                        f"✅ تلاش مجدد موفق بود: {sent} مقصد باقی‌ماندهٔ پست #{post_id} ارسال شد.",
+                    )
         except Exception as exc:
             logger.exception("Delivery retry for post %s failed", post_id)
-            retry_at = _next_retry_at(attempt_no + 1)
+            retry_at = _next_retry_at()
             for r in rows:
+                if r["channel_id"] not in live_ids:
+                    continue
                 await record_delivery(post_id, r["channel_id"], r["platform"], "failed",
                                       str(exc)[:1000], retry_at)
 
@@ -792,7 +913,10 @@ async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         _inflight_publishes.add(post_id)
     try:
         tg_sent, tg_failed, tg_message_ids, tg_errors = await _post_to_telegram(tg_channels, state, context.bot)
-        bale_sent, bale_failed, bale_message_ids, bale_errors = await _post_to_bale(bale_channels, state, context.bot)
+        # First attempt: always the primary Bale bot.
+        bale_sent, bale_failed, bale_message_ids, bale_errors = await _post_to_bale(
+            bale_channels, state, context.bot, attempt_no=1,
+        )
 
         # Update history with all message IDs
         all_message_ids = tg_message_ids + bale_message_ids
@@ -802,9 +926,9 @@ async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         delivery_status = "completed" if total_sent == total else ("partial" if total_sent else "failed")
         delivery_errors = {"telegram_failed": tg_failed, "bale_failed": bale_failed}
         await update_post_delivery(post_id, delivery_status, json.dumps(delivery_errors))
-        # Per-channel rows arm the automatic 1h/3h/6h retries.
+        # Per-channel rows arm the automatic retries.
         await _record_channel_results(
-            post_id, tg_channels + bale_channels, {**tg_errors, **bale_errors}, attempt_no=1,
+            post_id, tg_channels + bale_channels, {**tg_errors, **bale_errors},
         )
     finally:
         async with _inflight_lock:
@@ -821,8 +945,8 @@ async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         result += f"\n🔵 بله: {bale_sent}/{len(bale_channels)}"
     if total_failed:
         result += f"\n❌ ناموفق: {total_failed}"
-        if RETRY_DELAYS_HOURS:
-            result += f"\n🔁 تلاش مجدد خودکار تا {RETRY_DELAYS_HOURS[0]} ساعت دیگر."
+        if RETRY_INTERVAL_MINUTES:
+            result += f"\n🔁 تلاش مجدد خودکار تا {RETRY_INTERVAL_MINUTES} دقیقه دیگر."
 
     from database import is_sudo as _is_sudo, is_owner as _is_owner
     await context.bot.send_message(

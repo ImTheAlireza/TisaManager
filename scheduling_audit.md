@@ -146,10 +146,10 @@ Built now:
 - **`notify_online`** releases the users it asked to wait.
 *Tests: `WorkflowPersistenceTests` (4), `InflightTrackingTests` (2).*
 
-### "Retry in 1/3/6 hours with notification"
+### "Retry every 10 minutes until sent, with notification"
 
 **Also not implemented.** No retry table, no scheduling of retries, no
-`timedelta(hours=...)` anywhere. The only retry was the manual "🔁 ارسال مجدد"
+`timedelta(...)` anywhere. The only retry was the manual "🔁 ارسال مجدد"
 button, and `get_pool`'s 3-attempt connection loop. Worse, the old failure path
 recorded only *counts* (`{"telegram_failed": 2}`) — no record of *which*
 channels failed, so a retry was impossible even in principle. And a Bale
@@ -157,21 +157,80 @@ response with `ok: false` was silently counted as a success.
 
 Built now:
 
+- **Backup Bale bot (`BALE_TOKEN_2`)** — delivery attempts alternate between
+  two Bale bots: attempt 1 goes through bot 1, attempt 2 through bot 2,
+  attempt 3 through bot 1, and so on (`bale_client.client_for_attempt`), so a
+  rate-limited or blocked bot is swapped for a fresh one on the next try.
+  `bale_client` is now a `BaleClient` class per token; the old module-level
+  functions still exist and use the primary bot. Unset `BALE_TOKEN_2` keeps
+  the previous single-bot behaviour. Because either bot may have posted a
+  message, post edits/deletes try every configured bot, and the channel
+  health check verifies every bot can reach the channel. The retry job and
+  retry-now batch channels by attempt parity so one publish never mixes bots.
+- **Health dashboard** — "🩺 سلامت ربات‌ها و کانال‌ها" in the tools menu (and
+  `/health`) opens a dashboard instead of a bare list: `getMe` availability
+  checks for the Telegram bot and every Bale bot (stored with a timestamp in
+  `bot_settings` under `bot_health`), per-channel status with per-bot error
+  detail and last-check time, and a 🔄 بررسی مجدد button that re-runs every
+  check. Opening the page renders the stored results instantly; the first
+  visit runs a full check automatically. A Bale channel only some bots can
+  reach is `degraded` (⚠️) rather than unhealthy, because alternating
+  attempts still deliver the post.
 - **`post_deliveries`** — one row per (post, channel) with `status`, `error`,
   `attempts`, `next_retry_at`.
-- **`_next_retry_at()`** implements the 1h → 3h → 6h ladder from
-  `RETRY_DELAYS_HOURS` and returns `None` when exhausted.
-- **`process_delivery_retries`** (every 5 min) claims due rows atomically and
+- **`_next_retry_at()`** returns now + `RETRY_INTERVAL_MINUTES` (default 10).
+  There is **no attempt cap**: a failed channel is retried every 10 minutes
+  until it succeeds or a sudo/owner cancels the retries. (`RETRY_DELAYS_HOURS`,
+  the old 1h → 3h → 6h ladder, was replaced by this fixed cadence.)
+- **`process_delivery_retries`** (every minute) claims due rows atomically and
   re-sends **only the failed channels**, preserving the message ids of channels
-  that already succeeded. Grouped by `(post, attempt)` so channels on different
-  rungs aren't merged.
-- **Notifications** at every transition: partial failure with next-attempt time,
-  retry success, and final give-up pointing at the manual button.
+  that already succeeded. All due channels of a post go out in one batch.
+- **Notifications** at every transition: partial failure with next-attempt time
+  and retry success.
+- **Retry management in the post detail view** (post history), available to
+  sudo/owner for every post and to writers for their own posts (the same rule
+  as `can_edit_post`):
+  - **⚡ ارسال فوری مقصدهای ناموفق** (`retry_now_<id>`) re-sends only the
+    failed channels immediately — it completes the same post rather than
+    copying it like «🔁 ارسال مجدد». Success marks the post complete; failure
+    arms the next automatic attempt 10 minutes from that moment.
+  - **🚫 توقف تلاش‌های خودکار** (`cancel_retries_<id>`) clears every queued
+    attempt (`cancel_post_retries`, which also finalises in-flight `retrying`
+    rows so the stale-recovery sweep cannot re-arm them) and settles the post
+    on its final incomplete status via `refresh_delivery_status`. With nothing
+    queued it is a no-op that never touches the post status, so a stale button
+    cannot flip a healthy post to "failed".
+  - Both buttons are rendered only while an automatic attempt is actually
+    queued (`next_retry_at` set or a row mid-retry); they disappear once the
+    post is fully sent or the retries are stopped.
+  - Channels removed/deactivated after a failure can never be delivered:
+    `split_live_targets` separates them, both the retry job and retry-now
+    finalise those rows as `cancelled` instead of retrying/reporting them
+    forever.
 - Bale `ok: false` is now correctly treated as a failure.
+- Fixed a multipart-encoding crash (`can't concat str to bytes`) that killed
+  **every Bale file upload** client-side before it reached the API — a header
+  line was appended to the bytes body without `.encode()`. Text posts worked;
+  photos/videos/documents/media groups never did. The body builder is now
+  `_build_multipart`, covered by `tests/test_bale_client.py`.
+- **Bale send speed & reliability** — media is downloaded from Telegram once
+  per post and reused for every channel (an N-file album to M channels used
+  to mean N*M serial downloads), and the album's files download concurrently
+  (sequential downloads multiplied wall time by the file count). Channels
+  upload in parallel (`BALE_MAX_CONCURRENT`, default 3), file uploads use a
+  longer socket timeout (`BALE_UPLOAD_TIMEOUT`, default 120s vs
+  `BALE_TIMEOUT` 30s) so a brief connection stall no longer kills a large
+  video, and a connect/write timeout or reset is retried once in-process
+  (read timeouts are not, to avoid duplicate posts). The multipart body is
+  joined in one pass, and INFO logs now time each phase (download prep,
+  per-channel send, total publish) so slow sends are diagnosable.
 - Failed channels and their next retry time are shown in the post detail view;
   `/stats` gained "🔁 در صف تلاش مجدد".
-*Tests: `RetryScheduleTests` (2), `RetryTargetingTests` (2),
-`RetryLadderGroupingTests`, `PartialRetryPreservationTests`.*
+*Tests: `RetryScheduleTests` (3), `RetryTargetingTests` (3),
+`RetryGroupingTests` (2), `RetryCancelButtonTests` (11),
+`BaleBotAlternationTests` (4),
+`DeadChannelRetryLoopTests`, `RetryButtonKeyboardTests` (4),
+`PartialRetryPreservationTests`.*
 
 ---
 
@@ -185,8 +244,18 @@ Built now:
   answers them with "this button is from the previous version".
 - **New env knobs** (all optional, defaults in `config.py`): `DISPLAY_TIMEZONE`,
   `SCHEDULE_GRACE_SECONDS`, `SCHEDULE_CLAIM_TIMEOUT_SECONDS`,
-  `SCHEDULE_MAX_ATTEMPTS`, `RETRY_DELAYS_HOURS`, `WORKFLOW_TTL_SECONDS`,
-  `RESTART_DRAIN_TIMEOUT_SECONDS`.
+  `SCHEDULE_MAX_ATTEMPTS`, `RETRY_INTERVAL_MINUTES` (0 disables automatic
+  retries), `BALE_TOKEN_2` (backup Bale bot; attempts alternate between the
+  two bots), `BALE_TIMEOUT` / `BALE_UPLOAD_TIMEOUT` (Bale socket timeouts),
+  `BALE_MAX_CONCURRENT` (parallel Bale uploads per publish),
+  `WORKFLOW_TTL_SECONDS`, `RESTART_DRAIN_TIMEOUT_SECONDS`.
+- **Stats are bucketed in the display timezone.** `created_at` is stored naive
+  UTC, but the per-day trend and per-hour activity charts shift it by
+  `DISPLAY_TIMEZONE`'s offset before `DATE()`/`HOUR()`
+  (`utils.local_utc_offset_minutes`), and the activity header names the zone
+  (e.g. "به وقت Asia/Tehran") instead of the old "به وقت UTC". Every displayed
+  timestamp goes through `format_local`/`format_local_date`, so all times the
+  user sees are in their zone; only the stored values remain UTC.
 - **Not done / worth considering later:** per-user timezones and recurring
   schedules.
 
