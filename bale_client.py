@@ -39,23 +39,25 @@ def _build_multipart(data=None, files=None) -> tuple:
     Kept separate from the HTTP layer so the encoding can be unit-tested —
     a missed .encode() here once crashed every Bale file upload client-side
     with 'can't concat str to bytes' before the request ever left the bot.
+    The parts are joined in one pass: repeated ``body +=`` would re-copy the
+    whole buffer once per file, adding seconds for large albums.
     """
     boundary = "----FormBoundary7MA4YWxkTrZu0gW"
-    body = b""
+    parts = []
     if data:
         for key, val in data.items():
-            body += f"--{boundary}\r\n".encode()
-            body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
-            body += str(val).encode()
-            body += b"\r\n"
+            parts.append(f"--{boundary}\r\n".encode())
+            parts.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+            parts.append(str(val).encode())
+            parts.append(b"\r\n")
     for key, (filename, filedata, content_type) in (files or {}).items():
-        body += f"--{boundary}\r\n".encode()
-        body += f'Content-Disposition: form-data; name="{key}"; filename="{filename}"\r\n'.encode()
-        body += f"Content-Type: {content_type}\r\n\r\n".encode()
-        body += filedata
-        body += b"\r\n"
-    body += f"--{boundary}--\r\n".encode()
-    return f"multipart/form-data; boundary={boundary}", body
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(f'Content-Disposition: form-data; name="{key}"; filename="{filename}"\r\n'.encode())
+        parts.append(f"Content-Type: {content_type}\r\n\r\n".encode())
+        parts.append(filedata)
+        parts.append(b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return f"multipart/form-data; boundary={boundary}", b"".join(parts)
 
 
 def _post(url, data=None, files=None):

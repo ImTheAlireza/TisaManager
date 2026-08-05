@@ -411,17 +411,31 @@ async def _prepare_bale_payloads(state, bot) -> dict:
 
     Previously every channel re-downloaded every file from Telegram, so an
     N-file album to M channels meant N*M downloads. Now each file is fetched
-    a single time and reused for every destination.
+    a single time and reused for every destination — and all files of an
+    album download concurrently, because sequential downloads multiplied the
+    wall time by the number of files.
     """
     post_type = state.get("type")
     if post_type == "text":
         return {"kind": "text"}
+    started = time.monotonic()
     if post_type == "media_group":
-        items = []
-        for m in state.get("media") or []:
-            items.append((m["type"], await _download_telegram_file(bot, m["file_id"])))
+        media = state.get("media") or []
+        blobs = await asyncio.gather(
+            *(_download_telegram_file(bot, m["file_id"]) for m in media)
+        )
+        items = [(m["type"], blob) for m, blob in zip(media, blobs)]
+        logger.info(
+            "Prepared Bale media group: %d file(s), %.1f MB downloaded in %.1fs",
+            len(items), sum(len(b) for _, b in items) / 1048576,
+            time.monotonic() - started,
+        )
         return {"kind": "media_group", "items": items}
     data = await _download_telegram_file(bot, state["file_id"])
+    logger.info(
+        "Prepared Bale %s: %.1f MB downloaded in %.1fs",
+        post_type, len(data) / 1048576, time.monotonic() - started,
+    )
     return {"kind": post_type, "bytes": data}
 
 
@@ -432,6 +446,7 @@ async def _send_bale_channel(client, ch, state, prepared):
     """
     kind = prepared.get("kind")
     caption = state.get("caption")
+    started = time.monotonic()
     if kind == "text":
         result = await client.send_message(ch["chat_id"], state["text"])
     elif kind == "photo":
@@ -444,8 +459,11 @@ async def _send_bale_channel(client, ch, state, prepared):
         result = await client.send_media_group(ch["chat_id"], prepared["items"], caption=caption)
     else:
         return False, [], f"unsupported post type: {kind}"
+    elapsed = time.monotonic() - started
 
     if result and result.get("ok"):
+        logger.info("Bale %s delivered to %s (%s) via %s in %.1fs",
+                    kind, ch["name"], ch["chat_id"], client.name, elapsed)
         ids = []
         msg = result["result"]
         if isinstance(msg, list):
@@ -472,6 +490,7 @@ async def _post_to_bale(channels, state, bot, attempt_no: int = 1):
     the old serial download-per-channel loop.
     """
     import bale_client
+    started = time.monotonic()
     sent = 0
     failed = 0
     message_ids = []
@@ -515,6 +534,8 @@ async def _post_to_bale(channels, state, bot, attempt_no: int = 1):
                          ch["name"], ch["chat_id"], client.name, error)
             errors[ch["id"]] = error
             failed += 1
+    logger.info("Bale publish finished via %s: %d/%d channel(s) in %.1fs",
+                client.name, sent, len(channels), time.monotonic() - started)
     return sent, failed, message_ids, errors
 
 

@@ -215,12 +215,15 @@ Built now:
   `_build_multipart`, covered by `tests/test_bale_client.py`.
 - **Bale send speed & reliability** — media is downloaded from Telegram once
   per post and reused for every channel (an N-file album to M channels used
-  to mean N*M serial downloads), channels upload in parallel
-  (`BALE_MAX_CONCURRENT`, default 3), file uploads use a longer socket
-  timeout (`BALE_UPLOAD_TIMEOUT`, default 120s vs `BALE_TIMEOUT` 30s) so a
-  brief connection stall no longer kills a large video, and a connect/write
-  timeout or reset is retried once in-process (read timeouts are not, to
-  avoid duplicate posts).
+  to mean N*M serial downloads), and the album's files download concurrently
+  (sequential downloads multiplied wall time by the file count). Channels
+  upload in parallel (`BALE_MAX_CONCURRENT`, default 3), file uploads use a
+  longer socket timeout (`BALE_UPLOAD_TIMEOUT`, default 120s vs
+  `BALE_TIMEOUT` 30s) so a brief connection stall no longer kills a large
+  video, and a connect/write timeout or reset is retried once in-process
+  (read timeouts are not, to avoid duplicate posts). The multipart body is
+  joined in one pass, and INFO logs now time each phase (download prep,
+  per-channel send, total publish) so slow sends are diagnosable.
 - Failed channels and their next retry time are shown in the post detail view;
   `/stats` gained "🔁 در صف تلاش مجدد".
 *Tests: `RetryScheduleTests` (3), `RetryTargetingTests` (3),

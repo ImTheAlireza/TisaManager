@@ -1061,6 +1061,33 @@ class BaleUploadOptimizationTests(SchedulingTestCase):
         self.assertEqual((sent, failed), (0, 1))
         self.assertIn("file too big", errors[1])
 
+    def test_album_files_download_concurrently(self):
+        # Sequential downloads multiplied the wall time by the number of
+        # files (5 images ≈ 5x one download); they must overlap instead.
+        import io as _io
+
+        class SlowFile:
+            async def download_to_memory(self, out=None):
+                await asyncio.sleep(0.3)
+                buf = out if out is not None else _io.BytesIO()
+                buf.write(b"x")
+                buf.seek(0)
+                return buf
+
+        class FakeBot:
+            async def get_file(self, file_id):
+                return SlowFile()
+
+        state = {"type": "media_group", "caption": None,
+                 "media": [{"type": "photo", "file_id": f"f{i}"} for i in range(4)]}
+        started = time.monotonic()
+        prepared = run(post._prepare_bale_payloads(state, FakeBot()))
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(len(prepared["items"]), 4)
+        self.assertLess(elapsed, 1.0,
+                        f"4 downloads of 0.3s took {elapsed:.1f}s — they ran sequentially")
+
 
 class RetryCancelButtonTests(SchedulingTestCase):
     """Cancel/retry-now: available to sudo/owner and to writers for their own posts."""
