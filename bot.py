@@ -148,7 +148,9 @@ from handlers.history import (
     handle_publish_draft,
     handle_approve,
 )
-from handlers.admin import handle_health, handle_tools_menu, run_channel_health_checks
+from handlers.admin import (
+    handle_health, handle_health_refresh, handle_tools_menu, run_channel_health_checks,
+)
 from handlers.stats import (
     handle_stats_menu, handle_stats_summary, handle_stats_trend,
     handle_stats_channels, handle_stats_authors, handle_stats_schedule,
@@ -372,6 +374,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_stats_authors, pattern="^stats_authors$"))
     app.add_handler(CallbackQueryHandler(handle_stats_schedule, pattern="^stats_schedule$"))
     app.add_handler(CallbackQueryHandler(handle_health, pattern="^tools_health$"))
+    app.add_handler(CallbackQueryHandler(handle_health_refresh, pattern="^health_refresh$"))
     app.add_handler(CallbackQueryHandler(handle_help, pattern="^help$"))
     app.add_handler(CallbackQueryHandler(handle_help_section, pattern="^help_(publish|schedule|roles|settings|tools)$"))
     app.add_handler(CallbackQueryHandler(handle_approval_settings, pattern="^approval_settings$"))

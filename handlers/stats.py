@@ -430,6 +430,8 @@ def channels_text(rows, failures, health) -> str:
         hp = health_by_id.get(row["channel_id"])
         if hp and hp.get("last_health_status") == "unhealthy":
             lines.append("   🩺 بررسی سلامت: ناموفق")
+        elif hp and hp.get("last_health_status") == "degraded":
+            lines.append("   🩺 بررسی سلامت: برخی ربات‌ها به این کانال دسترسی ندارند")
         lines.append("")
 
     if hidden:

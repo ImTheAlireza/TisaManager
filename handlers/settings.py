@@ -268,9 +268,14 @@ async def handle_bot_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("📋 کانالی تنظیم نشده است.", show_alert=True)
         return
     healthy = sum(1 for row in rows if row.get("last_health_status") == "healthy")
-    lines = [f"🩺 وضعیت کانال‌ها: {healthy}/{len(rows)} سالم"]
+    degraded = sum(1 for row in rows if row.get("last_health_status") == "degraded")
+    summary = f"🩺 وضعیت کانال‌ها: {healthy}/{len(rows)} سالم"
+    if degraded:
+        summary += f" ({degraded} نیمه‌سالم)"
+    lines = [summary]
+    icons = {"healthy": "✅", "degraded": "⚠️", "unhealthy": "❌"}
     for row in rows:
-        icon = "✅" if row.get("last_health_status") == "healthy" else "❌"
+        icon = icons.get(row.get("last_health_status"), "⚪")
         lines.append(f"{icon} {row['name']} ({row['platform']}): {row.get('last_health_status') or 'نامشخص'}")
     await query.answer("\n".join(lines)[:1900], show_alert=True)
 

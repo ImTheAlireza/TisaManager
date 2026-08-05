@@ -167,6 +167,15 @@ Built now:
   message, post edits/deletes try every configured bot, and the channel
   health check verifies every bot can reach the channel. The retry job and
   retry-now batch channels by attempt parity so one publish never mixes bots.
+- **Health dashboard** — "🩺 سلامت ربات‌ها و کانال‌ها" in the tools menu (and
+  `/health`) opens a dashboard instead of a bare list: `getMe` availability
+  checks for the Telegram bot and every Bale bot (stored with a timestamp in
+  `bot_settings` under `bot_health`), per-channel status with per-bot error
+  detail and last-check time, and a 🔄 بررسی مجدد button that re-runs every
+  check. Opening the page renders the stored results instantly; the first
+  visit runs a full check automatically. A Bale channel only some bots can
+  reach is `degraded` (⚠️) rather than unhealthy, because alternating
+  attempts still deliver the post.
 - **`post_deliveries`** — one row per (post, channel) with `status`, `error`,
   `attempts`, `next_retry_at`.
 - **`_next_retry_at()`** returns now + `RETRY_INTERVAL_MINUTES` (default 10).
