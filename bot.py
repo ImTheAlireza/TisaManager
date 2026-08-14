@@ -80,6 +80,7 @@ from telegram.constants import ParseMode
 from config import BOT_TOKEN as _CONFIRM_TOKEN, DISPLAY_TIMEZONE  # noqa: F811
 from database import init_db, close_pool
 from utils import GROUP_NOTICE, is_private_chat, private_actor, telegram_display_name
+from resilience import is_transient_infra_error, describe
 from handlers.start import start
 from handlers.post import (
     handle_confirm_post,
@@ -264,7 +265,33 @@ async def on_error(update, context):
     Without one, python-telegram-bot only logs ("No error handlers are
     registered") and the user is left staring at a spinner that never resolves.
     """
-    logger.error("Unhandled exception while processing update", exc_info=context.error)
+    error = context.error
+
+    # `update` is None for job-queue callbacks, so the old blanket message
+    # ("while processing update") described a background job as a failed user
+    # interaction. Name what actually failed instead.
+    job = getattr(context, "job", None)
+    if update is None:
+        source = f"job {job.name}" if job is not None and getattr(job, "name", None) \
+            else "a background job"
+    else:
+        source = "an update"
+
+    # A host restarting MySQL or a dropped TLS handshake to api.telegram.org is
+    # an outage that resolves itself. Record it as a warning without the
+    # alarming "unhandled exception" wording; keep full tracebacks for bugs.
+    if is_transient_infra_error(error):
+        logger.warning(
+            "Infrastructure unavailable while processing %s: %s. "
+            "This usually clears on its own; no action needed unless it persists.",
+            source, describe(error), exc_info=error,
+        )
+    else:
+        logger.error("Unhandled exception while processing %s", source, exc_info=error)
+
+    if update is None:
+        # Nothing to reply to.
+        return
 
     # Always release the button the user pressed, otherwise the client spins.
     query = getattr(update, "callback_query", None) if update else None
