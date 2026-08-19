@@ -80,6 +80,7 @@ from telegram.constants import ParseMode
 from config import BOT_TOKEN as _CONFIRM_TOKEN, DISPLAY_TIMEZONE  # noqa: F811
 from database import init_db, close_pool
 from utils import GROUP_NOTICE, is_private_chat, private_actor, telegram_display_name
+from resilience import is_transient_infra_error, describe
 from handlers.start import start
 from handlers.post import (
     handle_confirm_post,
@@ -224,6 +225,11 @@ async def remember_profile(update, context):
 
 
 async def notify_online(context):
+    """Tell the owner the bot is up.
+
+    ``context`` only needs a ``.bot``, so this accepts either a job's
+    CallbackContext or the Application itself (how ``startup`` calls it).
+    """
     try:
         from config import SUDO_USER_ID
         await context.bot.send_message(
@@ -254,6 +260,91 @@ async def notify_online(context):
         state.pop("restored", None)
 
 
+def register_periodic_jobs(job_queue):
+    """Register every recurring job. Called once startup has succeeded.
+
+    ``misfire_grace_time`` is set explicitly on all of them. APScheduler's
+    default is 1 second, and a job whose run time slips past its grace window
+    is *skipped entirely*, not run late — on shared hosting a one-second stall
+    is routine, so the defaults silently dropped whole runs.
+    """
+    job_queue.run_repeating(
+        process_scheduled_posts, interval=60, first=5, name="scheduled_posts",
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
+    )
+    # Check every minute: retries now fire on a 10-minute cadence, so a
+    # slower sweep would drift noticeably past each due time.
+    job_queue.run_repeating(
+        process_delivery_retries, interval=60, first=30, name="delivery_retries",
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 600},
+    )
+    # A skipped health check just delays a diagnostic, but there is no reason
+    # to drop one over a momentary stall.
+    job_queue.run_repeating(
+        run_channel_health_checks, interval=900, first=30, name="channel_health",
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
+    )
+    # These two fire once a day. Under the 1-second default, a stall at exactly
+    # the wrong moment skipped the run and the next chance was 24 hours later,
+    # so they get the most generous windows: an hour for the report, and for
+    # the backup enough room to still run well before midnight rolls the date.
+    job_queue.run_repeating(
+        daily_report, interval=86400, first=86400, name="daily_report",
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 3600},
+    )
+    job_queue.run_daily(
+        nightly_backup,
+        time=dt_time(23, 59, tzinfo=ZoneInfo(DISPLAY_TIMEZONE)),
+        name="nightly_backup",
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 1800},
+    )
+
+
+async def startup(application):
+    """Bring the bot up: migrate, restore state, then register the jobs.
+
+    This runs as PTB's ``post_init`` hook — awaited directly by the framework
+    before polling begins — rather than as a ``run_once(when=0)`` job.
+
+    The scheduler route was unsafe: ``run_once`` inherits APScheduler's default
+    ``misfire_grace_time`` of 1 second, and a job that misses its window is
+    dropped rather than run late. A startup stall of 1.4 seconds (slow imports
+    on a loaded shared host) was enough for APScheduler to log
+
+        Run time of job "initialize_database ..." was missed by 0:00:01.4
+
+    and skip it, leaving the bot polling with no database, no restored
+    workflows and no periodic jobs at all — scheduled posts simply never went
+    out until someone restarted the process. post_init cannot misfire.
+    """
+    await init_db()
+
+    # Apply the owner's saved calendar preference before anything renders.
+    try:
+        await load_calendar_preference()
+    except Exception:
+        logger.exception("Could not load calendar preference")
+
+    # Recover interactive workflows that a restart interrupted.
+    try:
+        restored = await restore_workflow_states(application)
+        if restored:
+            logger.info("Restored %d interrupted workflow(s)", restored)
+    except Exception:
+        logger.exception("Workflow restoration failed")
+
+    register_periodic_jobs(application.job_queue)
+    logger.info("Database ready; periodic jobs scheduled")
+
+    # Announce availability only once the bot can actually serve requests.
+    # Previously a separate run_once(when=2) job, which could both misfire and
+    # race init_db — it announced "ready" while migrations were still running.
+    try:
+        await notify_online(application)
+    except Exception:
+        logger.exception("Online notification failed")
+
+
 async def shutdown_database(application):
     await close_pool()
 
@@ -264,7 +355,33 @@ async def on_error(update, context):
     Without one, python-telegram-bot only logs ("No error handlers are
     registered") and the user is left staring at a spinner that never resolves.
     """
-    logger.error("Unhandled exception while processing update", exc_info=context.error)
+    error = context.error
+
+    # `update` is None for job-queue callbacks, so the old blanket message
+    # ("while processing update") described a background job as a failed user
+    # interaction. Name what actually failed instead.
+    job = getattr(context, "job", None)
+    if update is None:
+        source = f"job {job.name}" if job is not None and getattr(job, "name", None) \
+            else "a background job"
+    else:
+        source = "an update"
+
+    # A host restarting MySQL or a dropped TLS handshake to api.telegram.org is
+    # an outage that resolves itself. Record it as a warning without the
+    # alarming "unhandled exception" wording; keep full tracebacks for bugs.
+    if is_transient_infra_error(error):
+        logger.warning(
+            "Infrastructure unavailable while processing %s: %s. "
+            "This usually clears on its own; no action needed unless it persists.",
+            source, describe(error), exc_info=error,
+        )
+    else:
+        logger.error("Unhandled exception while processing %s", source, exc_info=error)
+
+    if update is None:
+        # Nothing to reply to.
+        return
 
     # Always release the button the user pressed, otherwise the client spins.
     query = getattr(update, "callback_query", None) if update else None
@@ -432,50 +549,7 @@ def main():
 
     app.add_error_handler(on_error)
 
-    # Startup sequence. The periodic jobs are registered *after* init_db has
-    # actually finished rather than on a hopeful 10-second delay — migrations
-    # or a slow/retrying MySQL used to race the first scheduler tick.
-    async def initialize_database(context):
-        await init_db()
-
-        # Apply the owner's saved calendar preference before anything renders.
-        try:
-            await load_calendar_preference()
-        except Exception:
-            logger.exception("Could not load calendar preference")
-
-        # Recover interactive workflows that a restart interrupted.
-        try:
-            restored = await restore_workflow_states(context)
-            if restored:
-                logger.info("Restored %d interrupted workflow(s)", restored)
-        except Exception:
-            logger.exception("Workflow restoration failed")
-
-        context.job_queue.run_repeating(
-            process_scheduled_posts, interval=60, first=5, name="scheduled_posts",
-            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
-        )
-        # Check every minute: retries now fire on a 10-minute cadence, so a
-        # slower sweep would drift noticeably past each due time.
-        context.job_queue.run_repeating(
-            process_delivery_retries, interval=60, first=30, name="delivery_retries",
-            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 600},
-        )
-        context.job_queue.run_repeating(
-            run_channel_health_checks, interval=900, first=30, name="channel_health",
-            job_kwargs={"max_instances": 1, "coalesce": True},
-        )
-        context.job_queue.run_repeating(daily_report, interval=86400, first=86400, name="daily_report")
-        context.job_queue.run_daily(
-            nightly_backup,
-            time=dt_time(23, 59, tzinfo=ZoneInfo(DISPLAY_TIMEZONE)),
-            name="nightly_backup",
-        )
-        logger.info("Database ready; periodic jobs scheduled")
-
-    app.job_queue.run_once(initialize_database, when=0)
-    app.job_queue.run_once(notify_online, when=2)
+    app.post_init = startup
 
     logger.info("Bot starting...")
     app.run_polling()

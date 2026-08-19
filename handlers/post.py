@@ -24,6 +24,7 @@ from database import (
     purge_workflow_sessions, get_user_role, get_post,
 )
 import jalali
+from resilience import TransientErrorReporter
 from keyboards import (
     confirm_keyboard, main_menu_keyboard, channel_selection_keyboard,
     schedule_date_keyboard, schedule_hour_keyboard, schedule_minute_keyboard,
@@ -36,6 +37,12 @@ from utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# One reporter per periodic job. A MySQL restart fails every query in a tick,
+# and the tick repeats every 60s; without these the log channel receives a
+# traceback per failed call per minute for the whole outage.
+_schedule_db_outage = TransientErrorReporter("database", logger)
+_retry_db_outage = TransientErrorReporter("database", logger)
 
 # Per-user state tracking
 user_states: dict[int, dict] = {}
@@ -687,6 +694,11 @@ async def process_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
 
     Each row is claimed with a conditional UPDATE before any message is sent,
     so a crash or an overlapping tick can never publish the same post twice.
+
+    Every database call here can fail simply because MySQL is being restarted
+    by the host. That is an outage, not a bug: the tick is abandoned, one
+    warning is logged for the whole outage, and the untouched rows are picked
+    up on a later tick. Nothing is claimed, so nothing is lost or duplicated.
     """
     # Hand back rows whose worker died mid-publish, and warn about the ones
     # that have now been abandoned for good.
@@ -697,7 +709,11 @@ async def process_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
                 f"⚠️ زمان‌بندی پست #{row['post_id']} پس از چند بار قطع شدن متوقف شد. "
                 "لطفاً به‌صورت دستی بررسی کنید.",
             )
-    except Exception:
+    except Exception as exc:
+        if _schedule_db_outage.report(exc, "Stale schedule recovery"):
+            # The same outage will fail the two sweeps below and every query
+            # after them; stop now instead of logging it three more times.
+            return
         logger.exception("Stale schedule recovery failed")
 
     # Retire schedules that are too old to be worth publishing.
@@ -709,10 +725,25 @@ async def process_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
                 f"{format_local(row['run_at'])} از دست رفت (ربات در دسترس نبود) و لغو شد.\n"
                 "در صورت نیاز دوباره زمان‌بندی کنید.",
             )
-    except Exception:
+    except Exception as exc:
+        if _schedule_db_outage.report(exc, "Schedule expiry sweep"):
+            return
         logger.exception("Schedule expiry sweep failed")
 
-    for schedule in await get_due_schedules():
+    # Previously unguarded: a DB blip escaped the job and was reported by the
+    # global handler as "Unhandled exception while processing update", even
+    # though no update is involved.
+    try:
+        due = await get_due_schedules()
+    except Exception as exc:
+        if _schedule_db_outage.report(exc, "Due schedule lookup"):
+            return
+        logger.exception("Due schedule lookup failed")
+        return
+
+    _schedule_db_outage.clear("Scheduled posts job")
+
+    for schedule in due:
         if not await claim_schedule(schedule["id"]):
             # Someone else got it first.
             continue
@@ -785,10 +816,23 @@ async def process_delivery_retries(context: ContextTypes.DEFAULT_TYPE):
     """
     try:
         await reclaim_stale_retries()
-    except Exception:
+    except Exception as exc:
+        if _retry_db_outage.report(exc, "Stale retry recovery"):
+            return
         logger.exception("Stale retry recovery failed")
 
-    due = await get_due_retries()
+    # Same reasoning as process_scheduled_posts: an unreachable database is an
+    # outage to wait out, not an unhandled error to escalate.
+    try:
+        due = await get_due_retries()
+    except Exception as exc:
+        if _retry_db_outage.report(exc, "Due retry lookup"):
+            return
+        logger.exception("Due retry lookup failed")
+        return
+
+    _retry_db_outage.clear("Delivery retry job")
+
     if not due:
         return
 
