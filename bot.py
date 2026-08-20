@@ -84,6 +84,7 @@ from resilience import is_transient_infra_error, describe
 from handlers.start import start
 from handlers.post import (
     handle_confirm_post,
+    handle_confirm_unavailable,
     handle_cancel_post,
     handle_cancel_command,
     handle_new_post,
@@ -148,6 +149,7 @@ from handlers.history import (
     handle_cancel_retries,
     handle_publish_draft,
     handle_approve,
+    prune_history,
 )
 from handlers.admin import (
     handle_health, handle_health_refresh, handle_tools_menu, run_channel_health_checks,
@@ -278,6 +280,13 @@ def register_periodic_jobs(job_queue):
         process_delivery_retries, interval=60, first=30, name="delivery_retries",
         job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 600},
     )
+    # Keep history bounded: delete the oldest posts so the database does not
+    # grow without bound (default 100 posts = 20 pages). Runs hourly and once
+    # at startup, so a crash or outage just delays the next trim.
+    job_queue.run_repeating(
+        prune_history, interval=3600, first=60, name="history_prune",
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 600},
+    )
     # A skipped health check just delays a diagnostic, but there is no reason
     # to drop one over a momentary stall.
     job_queue.run_repeating(
@@ -334,6 +343,15 @@ async def startup(application):
         logger.exception("Workflow restoration failed")
 
     register_periodic_jobs(application.job_queue)
+
+    # Trim history to the cap immediately (a stale prune job that died with
+    # the previous process is made up for here), then let the hourly job keep
+    # it bounded.
+    try:
+        await prune_history(application)
+    except Exception:
+        logger.exception("Startup history pruning failed")
+
     logger.info("Database ready; periodic jobs scheduled")
 
     # Announce availability only once the bot can actually serve requests.
@@ -444,6 +462,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_backup, pattern="^backup_project$"))
     app.add_handler(CallbackQueryHandler(handle_restore, pattern="^restore_project$"))
     app.add_handler(CallbackQueryHandler(handle_confirm_post, pattern="^confirm_post$"))
+    app.add_handler(CallbackQueryHandler(handle_confirm_unavailable, pattern="^confirm_unavailable$"))
     app.add_handler(CallbackQueryHandler(handle_cancel_post, pattern="^cancel_post$"))
     app.add_handler(CallbackQueryHandler(handle_choose_channels, pattern="^choose_channels$"))
     app.add_handler(CallbackQueryHandler(handle_toggle_channel, pattern="^toggle_channel_\\d+$"))

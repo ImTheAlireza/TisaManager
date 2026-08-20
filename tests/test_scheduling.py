@@ -311,6 +311,11 @@ class FakeBot:
     def __init__(self):
         self.sent = []
 
+    async def get_chat(self, chat_id):
+        # Availability check probes every target before a full publish; report
+        # the channel as reachable so tests exercise the send path.
+        return object()
+
     async def send_message(self, chat_id, text, **kw):
         self.sent.append((chat_id, text))
         return types.SimpleNamespace(message_id=len(self.sent))
@@ -547,6 +552,465 @@ class RetryTargetingTests(SchedulingTestCase):
         self.assertTrue(run(FAKE.claim_delivery_retry(due[0]["id"])))
         self.assertFalse(run(FAKE.claim_delivery_retry(due[0]["id"])),
                          "the same retry must not be claimed twice")
+
+
+class AmbiguousFailureTests(SchedulingTestCase):
+    """A timed-out send must NOT be auto-retried (the message may have landed).
+
+    When `send_message` times out or loses the connection reading the reply,
+    Telegram may already have delivered the post — only the response read
+    failed. Re-sending that channel on every automatic retry is exactly what
+    turned "2 channels timed out" into "the same post 10 times in every
+    channel". Only failures that guarantee non-delivery are safe to re-send.
+    """
+
+    def _channels(self, *ids):
+        return [{"id": i, "chat_id": -i, "name": f"ch{i}",
+                 "chat_type": "channel", "platform": "telegram"} for i in ids]
+
+    def test_definite_failure_is_auto_retried(self):
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1]"))
+        run(post._record_channel_results(pid, self._channels(1), {1: "chat not found"}))
+        row = FAKE.deliveries[(pid, 1)]
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNotNone(row["next_retry_at"],
+                             "a definite (non-timeout) failure must be auto-retried")
+
+    def test_timedout_failure_is_not_auto_retried(self):
+        from telegram.error import TimedOut
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1]"))
+        run(post._record_channel_results(
+            pid, self._channels(1), {1: TimedOut("The operation did not complete (read)")}))
+        row = FAKE.deliveries[(pid, 1)]
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNone(row["next_retry_at"],
+                          "a timed-out send must not be auto-retried (it may have been delivered)")
+
+    def test_network_error_failure_is_not_auto_retried(self):
+        from telegram.error import NetworkError
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1]"))
+        run(post._record_channel_results(
+            pid, self._channels(1), {1: NetworkError("connection reset")}))
+        self.assertIsNone(FAKE.deliveries[(pid, 1)]["next_retry_at"])
+
+    def test_mixed_failures_retry_only_the_definite_one(self):
+        from telegram.error import TimedOut
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 2]"))
+        run(post._record_channel_results(
+            pid, self._channels(1, 2), {1: TimedOut("read"), 2: "chat not found"}))
+        self.assertIsNone(FAKE.deliveries[(pid, 1)]["next_retry_at"],
+                          "the timed-out channel must not be re-armed")
+        self.assertIsNotNone(FAKE.deliveries[(pid, 2)]["next_retry_at"],
+                             "the definite failure must still be re-armed")
+
+    def test_timedout_channel_never_enters_the_retry_queue(self):
+        from telegram.error import TimedOut
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 2]"))
+        run(FAKE.record_delivery(pid, 1, "telegram", "completed"))
+        run(post._record_channel_results(
+            pid, self._channels(2), {2: TimedOut("read")}))
+
+        seen = {}
+
+        async def fake_publish(p, bot, only_channel_ids=None, attempt_no=1):
+            seen["ids"] = only_channel_ids
+            return 0, 0
+
+        original = post.publish_existing_post
+        post.publish_existing_post = fake_publish
+        try:
+            run(post.process_delivery_retries(make_context()))
+        finally:
+            post.publish_existing_post = original
+
+        self.assertIsNone(seen.get("ids"),
+                          "a timed-out channel must never be re-sent by the auto job")
+        self.assertEqual(run(FAKE.get_due_retries()), [])
+
+
+class AvailabilityGateTests(SchedulingTestCase):
+    """The confirm-post flow informs the user when channels are unavailable.
+
+    The notice is informational only: the user chooses continue or cancel. On
+    continue the post goes to EVERY target — available channels post now, the
+    unavailable ones fail and are armed for the automatic retry as before.
+    """
+
+    class CheckBot:
+        def __init__(self, unavailable=()):
+            self.unavailable = set(unavailable)
+            self.sent = []
+
+        async def get_chat(self, chat_id):
+            if chat_id in self.unavailable:
+                raise RuntimeError("chat not found")
+            return object()
+
+        async def send_message(self, chat_id, text, **kw):
+            self.sent.append((chat_id, text))
+            return types.SimpleNamespace(message_id=len(self.sent))
+
+    def _query(self, data, user_id=7):
+        answered = []
+        edits = []
+
+        async def answer(text=None, show_alert=False):
+            answered.append(text)
+
+        async def edit_message_text(text, **kw):
+            edits.append(text)
+
+        return types.SimpleNamespace(
+            data=data, from_user=types.SimpleNamespace(id=user_id),
+            answer=answer, edit_message_text=edit_message_text,
+            message=types.SimpleNamespace(chat=types.SimpleNamespace(id=user_id)),
+            _answered=answered, _edits=edits,
+        )
+
+    def _state(self):
+        post.user_states[7] = {"state": "awaiting_confirm", "type": "text",
+                               "text": "hello", "media": [],
+                               "created_at": time.monotonic()}
+
+    def _channels(self, *ids):
+        return [{"id": i, "chat_id": -i, "name": f"ch{i}",
+                 "chat_type": "channel", "platform": "telegram"} for i in ids]
+
+    def _patch_channels(self, channels):
+        async def get_active_channels(platform=None):
+            if platform:
+                return [c for c in channels if c["platform"] == platform]
+            return channels
+        original = post.get_active_channels
+        post.get_active_channels = get_active_channels
+        return original
+
+    def _capture_sends(self, fail_ids=()):
+        """Replace the telegram sender; channel ids in fail_ids fail the send."""
+        seen = {}
+        fail_ids = set(fail_ids)
+
+        async def record_tg(channels, state, bot):
+            seen["tg"] = [c["id"] for c in channels]
+            sent = failed = 0
+            errors = {}
+            for c in channels:
+                if c["id"] in fail_ids:
+                    failed += 1
+                    errors[c["id"]] = "chat not found"
+                else:
+                    sent += 1
+            return sent, failed, [], errors
+
+        async def no_bale(channels, state, bot, attempt_no=1):
+            return 0, 0, [], {}
+        o1, o2 = post._post_to_telegram, post._post_to_bale
+        post._post_to_telegram, post._post_to_bale = record_tg, no_bale
+        return seen, (o1, o2)
+
+    def test_all_available_sends_immediately(self):
+        self._state()
+        channels = self._channels(1, 2)
+        original_ch = self._patch_channels(channels)
+        bot = self.CheckBot()
+        seen, (o1, o2) = self._capture_sends()
+        try:
+            query = self._query("confirm_post")
+            update = types.SimpleNamespace(callback_query=query)
+            run(post.handle_confirm_post(update, make_context(bot)))
+        finally:
+            post.get_active_channels = original_ch
+            post._post_to_telegram, post._post_to_bale = o1, o2
+
+        self.assertEqual(seen["tg"], [1, 2],
+                         "all channels available -> no gate, send to every channel")
+        self.assertNotIn(7, post.user_states, "state must be cleared after sending")
+        self.assertEqual(len(FAKE.posts), 1, "post must be saved to history")
+
+    def test_unavailable_channel_blocks_send_until_confirmed(self):
+        self._state()
+        channels = self._channels(1, 2)
+        original_ch = self._patch_channels(channels)
+        # Channel 2 (chat_id -2) is unreachable.
+        bot = self.CheckBot(unavailable=(-2,))
+        seen, (o1, o2) = self._capture_sends()
+        try:
+            query = self._query("confirm_post")
+            update = types.SimpleNamespace(callback_query=query)
+            run(post.handle_confirm_post(update, make_context(bot)))
+        finally:
+            post.get_active_channels = original_ch
+            post._post_to_telegram, post._post_to_bale = o1, o2
+
+        self.assertNotIn("tg", seen,
+                         "nothing may be sent before the user decides on the notice")
+        self.assertEqual(FAKE.posts, {}, "the post must not be saved before the notice")
+        self.assertEqual(post.user_states[7]["state"], "awaiting_unavailable_confirm")
+        self.assertTrue(any("در دسترس نیستند" in e for e in query._edits),
+                         "the user must be told which channels are unavailable")
+
+    def test_continue_sends_all_and_arms_retry_for_unavailable(self):
+        self._state()
+        channels = self._channels(1, 2)
+        original_ch = self._patch_channels(channels)
+        bot = self.CheckBot(unavailable=(-2,))
+        # Only channel 2 fails on the actual send; channel 1 delivers.
+        seen, (o1, o2) = self._capture_sends(fail_ids={2})
+        try:
+            # First confirm triggers the availability notice.
+            q1 = self._query("confirm_post")
+            run(post.handle_confirm_post(types.SimpleNamespace(callback_query=q1),
+                                         make_context(bot)))
+            # User continues -> send to EVERY target.
+            q2 = self._query("confirm_unavailable")
+            run(post.handle_confirm_unavailable(
+                types.SimpleNamespace(callback_query=q2), make_context(bot)))
+        finally:
+            post.get_active_channels = original_ch
+            post._post_to_telegram, post._post_to_bale = o1, o2
+
+        self.assertEqual(seen["tg"], [1, 2],
+                         "continuing sends to every target, not just the available ones")
+        self.assertNotIn(7, post.user_states, "state must be cleared after sending")
+        self.assertEqual(len(FAKE.posts), 1)
+        saved = list(FAKE.posts.values())[0]
+        self.assertEqual(saved["target_channels_json"], "[1, 2]",
+                         "the saved post must target every channel")
+        # Channel 2 was unavailable: recorded failed and armed for auto-retry.
+        self.assertEqual(FAKE.deliveries[(1, 2)]["status"], "failed")
+        self.assertIsNotNone(FAKE.deliveries[(1, 2)]["next_retry_at"],
+                             "the unavailable channel must be retried as before")
+        # Channel 1 delivered immediately.
+        self.assertEqual(FAKE.deliveries[(1, 1)]["status"], "completed")
+
+    def test_all_unavailable_still_offers_continue(self):
+        self._state()
+        channels = self._channels(1)
+        original_ch = self._patch_channels(channels)
+        bot = self.CheckBot(unavailable=(-1,))
+        seen, (o1, o2) = self._capture_sends(fail_ids={1})
+        try:
+            query = self._query("confirm_post")
+            update = types.SimpleNamespace(callback_query=query)
+            run(post.handle_confirm_post(update, make_context(bot)))
+        finally:
+            post.get_active_channels = original_ch
+            post._post_to_telegram, post._post_to_bale = o1, o2
+
+        self.assertNotIn("tg", seen, "nothing may be sent before the notice")
+        self.assertEqual(post.user_states[7]["state"], "awaiting_unavailable_confirm",
+                         "even when all channels are unavailable the user still chooses")
+        self.assertTrue(any("در دسترس نیستند" in e for e in query._edits))
+
+
+class ScheduledAvailabilityTests(SchedulingTestCase):
+    """Scheduled (and other full) publishes check channels before sending.
+
+    Unlike the manual flow there is no user to confirm, so unavailable
+    channels are skipped automatically and armed for the automatic retry —
+    exactly the "unavailable channels get retried as before" behaviour.
+    """
+
+    class CheckBot:
+        def __init__(self, unavailable=()):
+            self.unavailable = set(unavailable)
+            self.sent = []
+
+        async def get_chat(self, chat_id):
+            if chat_id in self.unavailable:
+                raise RuntimeError("chat not found")
+            return object()
+
+        async def send_message(self, chat_id, text, **kw):
+            self.sent.append((chat_id, text))
+            return types.SimpleNamespace(message_id=len(self.sent))
+
+    def _channels(self, *ids):
+        return [{"id": i, "chat_id": -i, "name": f"ch{i}",
+                 "chat_type": "channel", "platform": "telegram"} for i in ids]
+
+    def _patch_channels(self, channels):
+        async def get_active_channels(platform=None):
+            if platform:
+                return [c for c in channels if c["platform"] == platform]
+            return channels
+        original = post.get_active_channels
+        post.get_active_channels = get_active_channels
+        return original
+
+    def _capture_sends(self):
+        seen = {}
+
+        async def record_tg(channels, state, bot):
+            seen["ids"] = [c["id"] for c in channels]
+            return len(channels), 0, [], {}
+
+        async def no_bale(channels, state, bot, attempt_no=1):
+            return 0, 0, [], {}
+        o1, o2 = post._post_to_telegram, post._post_to_bale
+        post._post_to_telegram, post._post_to_bale = record_tg, no_bale
+        return seen, (o1, o2)
+
+    def test_scheduled_skips_unavailable_and_arms_retry(self):
+        channels = self._channels(1, 2)
+        orig_ch = self._patch_channels(channels)
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 2]",
+                                 delivery_status="scheduled"))
+        run(FAKE.create_schedule(7, pid, datetime.utcnow() - timedelta(minutes=1)))
+        bot = self.CheckBot(unavailable=(-2,))
+        seen, (o1, o2) = self._capture_sends()
+        try:
+            run(post.process_scheduled_posts(make_context(bot)))
+        finally:
+            post.get_active_channels = orig_ch
+            post._post_to_telegram, post._post_to_bale = o1, o2
+
+        self.assertEqual(seen["ids"], [1],
+                         "an unavailable channel must not be sent to")
+        self.assertEqual(FAKE.deliveries[(pid, 1)]["status"], "completed")
+        self.assertEqual(FAKE.deliveries[(pid, 2)]["status"], "failed")
+        self.assertIsNotNone(FAKE.deliveries[(pid, 2)]["next_retry_at"],
+                             "an unavailable channel must be armed for auto-retry")
+        self.assertEqual(FAKE.posts[pid]["delivery_status"], "partial")
+
+    def test_scheduled_all_available_sends_all(self):
+        channels = self._channels(1, 2)
+        orig_ch = self._patch_channels(channels)
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 2]",
+                                 delivery_status="scheduled"))
+        run(FAKE.create_schedule(7, pid, datetime.utcnow() - timedelta(minutes=1)))
+        bot = self.CheckBot()
+        seen, (o1, o2) = self._capture_sends()
+        try:
+            run(post.process_scheduled_posts(make_context(bot)))
+        finally:
+            post.get_active_channels = orig_ch
+            post._post_to_telegram, post._post_to_bale = o1, o2
+
+        self.assertEqual(seen["ids"], [1, 2],
+                         "all channels available -> every channel is sent to")
+        self.assertEqual(FAKE.posts[pid]["delivery_status"], "completed")
+
+    def test_retries_are_not_gated_by_availability(self):
+        # A retry (only_channel_ids set) must never run the availability check
+        # and drop a channel the user explicitly asked to retry.
+        channels = self._channels(1)
+        orig_ch = self._patch_channels(channels)
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1]"))
+        run(FAKE.record_delivery(pid, 1, "telegram", "failed", "boom",
+                                 datetime.utcnow() - timedelta(minutes=1)))
+
+        called = {}
+        original_check = post._check_target_availability
+
+        async def bomb(*a, **k):
+            called["check"] = True
+            return {1: "unavailable"}
+
+        post._check_target_availability = bomb
+        seen, (o1, o2) = self._capture_sends()
+        try:
+            run(post.process_delivery_retries(make_context(self.CheckBot())))
+        finally:
+            post.get_active_channels = orig_ch
+            post._post_to_telegram, post._post_to_bale = o1, o2
+            post._check_target_availability = original_check
+
+        self.assertNotIn("check", called,
+                         "retries must not run the availability gate")
+        self.assertEqual(seen["ids"], [1],
+                         "a retry must still attempt the failed channel")
+
+    def test_bale_unavailable_channel_is_skipped_and_retried(self):
+        # A Bale channel that no configured bot can reach is treated as
+        # unavailable on a full publish: skipped, armed for auto-retry.
+        import bale_client
+        bale_ch = [{"id": 9, "chat_id": -900, "name": "BaleCh",
+                    "chat_type": "channel", "platform": "bale"}]
+        tg_ch = self._channels(1)
+
+        async def get_active_channels(platform=None):
+            if platform == "telegram":
+                return tg_ch
+            if platform == "bale":
+                return bale_ch
+            return tg_ch + bale_ch
+        orig_ch = post.get_active_channels
+        post.get_active_channels = get_active_channels
+
+        pid = run(FAKE.save_post(7, "text", text="hi", target_channels_json="[1, 9]",
+                                 delivery_status="scheduled"))
+        run(FAKE.create_schedule(7, pid, datetime.utcnow() - timedelta(minutes=1)))
+
+        # No bot can reach the bale channel.
+        class UnreachableClient:
+            name = "bale-1"
+            async def get_chat(self, chat_id):
+                return {"ok": False, "description": "chat not found"}
+        orig_clients = bale_client.all_clients
+        bale_client.all_clients = lambda: [UnreachableClient()]
+
+        seen = {}
+        async def record_tg(channels, state, bot):
+            seen["tg"] = [c["id"] for c in channels]
+            return len(channels), 0, [], {}
+        async def no_bale(channels, state, bot, attempt_no=1):
+            return 0, 0, [], {}
+        o1, o2 = post._post_to_telegram, post._post_to_bale
+        post._post_to_telegram, post._post_to_bale = record_tg, no_bale
+        try:
+            run(post.process_scheduled_posts(make_context(self.CheckBot())))
+        finally:
+            post.get_active_channels = orig_ch
+            post._post_to_telegram, post._post_to_bale = o1, o2
+            bale_client.all_clients = orig_clients
+
+        self.assertEqual(seen["tg"], [1],
+                         "only the reachable telegram channel is sent to")
+        self.assertEqual(FAKE.deliveries[(pid, 1)]["status"], "completed")
+        self.assertEqual(FAKE.deliveries[(pid, 9)]["status"], "failed")
+        self.assertIsNotNone(FAKE.deliveries[(pid, 9)]["next_retry_at"],
+                             "an unreachable bale channel must be armed for retry")
+
+
+class HistoryPruneTests(SchedulingTestCase):
+    """History stays bounded: the prune job deletes the oldest posts."""
+
+    def test_prune_uses_the_history_cap(self):
+        from config import HISTORY_MAX_POSTS
+        from handlers import history
+        called = {}
+
+        async def fake_prune(max_posts):
+            called["max_posts"] = max_posts
+            return 7
+
+        original = history.prune_old_posts
+        history.prune_old_posts = fake_prune
+        try:
+            removed = run(history.prune_history(make_context()))
+        finally:
+            history.prune_old_posts = original
+
+        self.assertEqual(called.get("max_posts"), HISTORY_MAX_POSTS,
+                         "prune must use the configured history cap")
+        self.assertEqual(removed, 7)
+
+    def test_prune_history_survives_a_db_outage(self):
+        from handlers import history
+
+        async def boom(max_posts):
+            raise RuntimeError("database down")
+
+        original = history.prune_old_posts
+        history.prune_old_posts = boom
+        try:
+            removed = run(history.prune_history(make_context()))
+        finally:
+            history.prune_old_posts = original
+
+        self.assertEqual(removed, 0,
+                         "a failed prune must be skipped, not crash the job")
 
 
 class EmptyTargetTests(SchedulingTestCase):

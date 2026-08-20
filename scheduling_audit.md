@@ -185,6 +185,47 @@ Built now:
 - **`process_delivery_retries`** (every minute) claims due rows atomically and
   re-sends **only the failed channels**, preserving the message ids of channels
   that already succeeded. All due channels of a post go out in one batch.
+- **Ambiguous failures are never auto-retried.** A Telegram send that times out
+  (or drops the connection reading the reply) does not prove the message was
+  *not* posted — the server may have delivered it and only the response read
+  failed. Auto-retrying such a channel posted a duplicate on every attempt,
+  turning "2 channels timed out" into "the same post 10 times in every
+  channel". `_record_channel_results` now arms a retry only for failures that
+  guarantee non-delivery (a `NetworkError`/`TimedOut` → `None`; anything else →
+  now + `RETRY_INTERVAL_MINUTES`). A timed-out channel stays `failed` with no
+  `next_retry_at`, is excluded from `get_due_retries`, and the author is told
+  to verify it manually. The notifications in `handle_confirm_post`,
+  `process_scheduled_posts`, `process_delivery_retries` and
+  `handle_retry_now` only promise a retry when one is actually armed.
+  *Tests: `AmbiguousFailureTests` (5).*
+- **Pre-send availability check on every publish.** `_check_target_availability`
+  probes every target channel (Telegram `get_chat`; Bale reachable by at least
+  one configured bot) and marks unreachable channels unhealthy in the health
+  store. It runs in two places:
+  - **Manual confirm flow** (`confirm_post`): if some channels are unreachable,
+    nothing is sent or saved yet and the user is told which ones with a
+    «✅ ادامه / ❌ کنسل» choice. The notice is **informational only**:
+    continuing sends to every target (available post now, unavailable fail and
+    are armed for the automatic retry); cancel drops the draft.
+  - **Every full publish** (`publish_existing_post` with no retry filter —
+    scheduled posts, publish-draft, approve, schedule-now, republish): there is
+    no user in the loop, so unavailable channels are skipped automatically and
+    recorded as failed + armed for the automatic retry (they are re-sent later
+    exactly as if the send had failed). The post is marked `partial` and the
+    returned failure count includes the skipped channels, so the author is told
+    the delivery was incomplete.
+  Retries (`process_delivery_retries`, `retry_now`) are **not** gated — they
+  re-send channels the user/previous attempt already targeted. If the check
+  itself errors, the post sends as before and each channel's own send reports
+  its outcome.
+  *Tests: `AvailabilityGateTests` (4), `ScheduledAvailabilityTests` (4).*
+- **Bounded history.** `prune_old_posts(HISTORY_MAX_POSTS)` keeps at most the
+  newest `HISTORY_MAX_POSTS` posts (default 100 = 20 pages at 5 posts/page),
+  deleting the older ones together with their `scheduled_posts`,
+  `post_deliveries` and `post_versions` rows so the database does not grow
+  without bound. Posts that still have an open (scheduled/processing) schedule
+  are never pruned. Runs once at startup and hourly via the `history_prune`
+  job; a DB outage is just skipped. *Tests: `HistoryPruneTests` (2).*
 - **Notifications** at every transition: partial failure with next-attempt time
   and retry success.
 - **Retry management in the post detail view** (post history), available to
@@ -248,7 +289,8 @@ Built now:
   retries), `BALE_TOKEN_2` (backup Bale bot; attempts alternate between the
   two bots), `BALE_TIMEOUT` / `BALE_UPLOAD_TIMEOUT` (Bale socket timeouts),
   `BALE_MAX_CONCURRENT` (parallel Bale uploads per publish),
-  `WORKFLOW_TTL_SECONDS`, `RESTART_DRAIN_TIMEOUT_SECONDS`.
+  `WORKFLOW_TTL_SECONDS`, `RESTART_DRAIN_TIMEOUT_SECONDS`,
+  `HISTORY_MAX_POSTS` (history cap, default 100 = 20 pages).
 - **Stats are bucketed in the display timezone.** `created_at` is stored naive
   UTC, but the per-day trend and per-hour activity charts shift it by
   `DISPLAY_TIMEZONE`'s offset before `DATE()`/`HOUR()`

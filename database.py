@@ -1399,3 +1399,43 @@ async def delete_post(post_id: int):
             await cur.execute("DELETE FROM post_deliveries WHERE post_id = %s", (post_id,))
             await cur.execute("DELETE FROM post_versions WHERE post_id = %s", (post_id,))
             await cur.execute("DELETE FROM post_history WHERE id = %s", (post_id,))
+
+
+async def prune_old_posts(max_posts: int) -> int:
+    """Delete the oldest posts so at most ``max_posts`` remain in history.
+
+    History shows 5 posts per page, so this bounds the list (and the database)
+    at max_posts rows. Posts that still have an open schedule (status
+    'scheduled' or 'processing') are never pruned, otherwise a pending
+    schedule would later fire on a deleted post. Everything that references a
+    pruned post (scheduled_posts, post_deliveries, post_versions) is removed
+    too. Returns the number of posts deleted.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            # Oldest ids beyond the newest max_posts, skipping any that still
+            # have an open schedule. The subquery is wrapped in a derived table
+            # so MySQL does not complain about selecting from the target table.
+            await cur.execute(
+                "SELECT p.id FROM post_history p "
+                "LEFT JOIN scheduled_posts s ON s.post_id = p.id "
+                "AND s.status IN ('scheduled', 'processing') "
+                "WHERE s.post_id IS NULL AND p.id NOT IN ("
+                "SELECT id FROM (SELECT id FROM post_history ORDER BY id DESC LIMIT %s) AS keep"
+                ") ORDER BY p.id ASC",
+                (max_posts,),
+            )
+            ids = [row["id"] for row in await cur.fetchall()]
+            if not ids:
+                return 0
+            placeholders = ",".join(["%s"] * len(ids))
+            await cur.execute(
+                f"DELETE FROM scheduled_posts WHERE post_id IN ({placeholders})", ids)
+            await cur.execute(
+                f"DELETE FROM post_deliveries WHERE post_id IN ({placeholders})", ids)
+            await cur.execute(
+                f"DELETE FROM post_versions WHERE post_id IN ({placeholders})", ids)
+            await cur.execute(
+                f"DELETE FROM post_history WHERE id IN ({placeholders})", ids)
+            return len(ids)

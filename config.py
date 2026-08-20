@@ -59,3 +59,10 @@ WORKFLOW_TTL_SECONDS = int(os.getenv("WORKFLOW_TTL_SECONDS", 30 * 60))
 
 # How long a restart waits for in-flight publishes to finish before going down.
 RESTART_DRAIN_TIMEOUT_SECONDS = int(os.getenv("RESTART_DRAIN_TIMEOUT_SECONDS", 60))
+
+# Oldest posts kept in history. The history list shows 5 posts per page, so
+# this caps it at 20 pages (5 x 20 = 100). Older posts are deleted from
+# post_history together with their delivery/schedule/version rows so the
+# database does not grow without bound. Posts that still have an open
+# (scheduled/processing) schedule are never pruned.
+HISTORY_MAX_POSTS = int(os.getenv("HISTORY_MAX_POSTS", 100))

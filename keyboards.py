@@ -31,6 +31,18 @@ def confirm_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def unavailable_confirm_keyboard() -> InlineKeyboardMarkup:
+    """Informational gate: let the user continue or cancel after seeing which
+    channels are unavailable. Continuing sends to every target (the unavailable
+    ones are armed for automatic retry), so the button is a plain continue."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ ادامه", callback_data="confirm_unavailable")],
+            [InlineKeyboardButton("❌ کنسل", callback_data="cancel_post")],
+        ]
+    )
+
+
 def channel_selection_keyboard(channels: list[dict], selected: set[int]) -> InlineKeyboardMarkup:
     buttons = []
     for channel in channels:
