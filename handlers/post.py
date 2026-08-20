@@ -21,14 +21,14 @@ from database import (
     get_active_schedule_for_post, record_delivery, get_due_retries,
     claim_delivery_retry, reclaim_stale_retries, get_post_deliveries,
     save_workflow_session, delete_workflow_session, load_workflow_sessions,
-    purge_workflow_sessions, get_user_role, get_post,
+    purge_workflow_sessions, get_user_role, get_post, update_channel_health,
 )
 import jalali
 from resilience import TransientErrorReporter
 from keyboards import (
     confirm_keyboard, main_menu_keyboard, channel_selection_keyboard,
     schedule_date_keyboard, schedule_hour_keyboard, schedule_minute_keyboard,
-    schedule_calendar_keyboard,
+    schedule_calendar_keyboard, unavailable_confirm_keyboard,
 )
 from utils import (
     html_text, is_private_chat, private_actor,
@@ -400,7 +400,10 @@ async def _post_to_telegram(channels, state, bot):
             sent += 1
         except Exception as e:
             logger.error("Failed to post to %s (%s): %s", ch["name"], ch["chat_id"], e)
-            errors[ch["id"]] = str(e)
+            # Keep the exception object (not its string) so the delivery
+            # recorder can tell an ambiguous network timeout apart from a
+            # guaranteed failure. See _is_ambiguous_error.
+            errors[ch["id"]] = e
             failed += 1
     return sent, failed, message_ids, errors
 
@@ -529,7 +532,9 @@ async def _post_to_bale(channels, state, bot, attempt_no: int = 1):
         if isinstance(result, Exception):
             logger.error("Failed to post to Bale %s (%s) via %s: %s",
                          ch["name"], ch["chat_id"], client.name, result)
-            errors[ch["id"]] = str(result)
+            # Keep the exception object so _record_channel_results can decide
+            # whether an automatic retry is safe (see _is_ambiguous_error).
+            errors[ch["id"]] = result
             failed += 1
             continue
         ok, ids, error = result
@@ -558,16 +563,42 @@ def _next_retry_at():
     return datetime.utcnow() + timedelta(minutes=RETRY_INTERVAL_MINUTES)
 
 
+def _is_ambiguous_error(error) -> bool:
+    """True when a send failure may have delivered the message anyway.
+
+    A Telegram send that times out (or loses the connection while reading the
+    response) does not mean the message was not posted: the server may have
+    delivered it and only the reply read failed. Auto-retrying such a channel
+    posts a duplicate on every attempt — the "same post N times in every
+    channel" outage. Only errors that guarantee the message was NOT delivered
+    (a Telegram API 4xx, a Bale ``ok:false``, ...) are safe to re-send.
+    """
+    try:
+        from telegram.error import NetworkError
+    except Exception:
+        # Telegram library unavailable (e.g. some test harnesses): be safe and
+        # assume the failure is definitive rather than suppressing retries.
+        return False
+    return isinstance(error, NetworkError)
+
+
 async def _record_channel_results(post_id: int, channels, failures: dict):
-    """Persist one row per channel and arm retries for the failures."""
+    """Persist one row per channel and arm retries for the failures.
+
+    An ambiguous failure (a network timeout — the message may already have
+    been delivered) is recorded as failed but is NOT given a ``next_retry_at``,
+    so the automatic job will not re-send it and duplicate the post. Only
+    failures that guarantee non-delivery are re-armed for auto-retry.
+    """
     for ch in channels:
         error = failures.get(ch["id"])
         if error is None:
             await record_delivery(post_id, ch["id"], ch.get("platform", "telegram"), "completed")
         else:
+            retry_at = None if _is_ambiguous_error(error) else _next_retry_at()
             await record_delivery(
                 post_id, ch["id"], ch.get("platform", "telegram"), "failed",
-                error=str(error)[:1000], next_retry_at=_next_retry_at(),
+                error=str(error)[:1000], next_retry_at=retry_at,
             )
 
 
@@ -615,16 +646,51 @@ async def publish_existing_post(post: dict, bot, only_channel_ids: set = None,
     Registers itself as in-flight so a restart can wait for it to finish.
     ``attempt_no`` is this delivery's attempt number and only decides which
     Bale bot sends (attempts alternate bots); scheduling is unaffected.
+
+    For a FULL publish (``only_channel_ids`` is None — scheduled posts,
+    publish-draft, approve, schedule-now, republish) every target channel is
+    checked for availability first. Channels that are unreachable are NOT sent
+    to; they are recorded as failed and armed for the automatic retry (so they
+    are re-sent later, exactly as if the send had failed). Retries
+    (``only_channel_ids`` set) are untouched — they only re-send channels the
+    user/previous attempt already targeted.
     """
     post_id = post["id"]
     async with _inflight_lock:
         _inflight_publishes.add(post_id)
     try:
         tg, bale = await _resolve_targets(post, only_channel_ids)
+        all_targets = tg + bale
         state = {"type": post["post_type"], "text": post.get("text"), "file_id": post.get("file_id"),
                  "caption": post.get("caption"), "media": json.loads(post.get("media_json") or "[]")}
-        tg_sent, tg_failed, tg_ids, tg_errors = await _post_to_telegram(tg, state, bot)
-        bale_sent, bale_failed, bale_ids, bale_errors = await _post_to_bale(bale, state, bot, attempt_no)
+
+        # Availability check for every full publish. It is best-effort: if the
+        # check itself fails we publish as before and each channel's own send
+        # reports its real outcome.
+        skipped: list[dict] = []
+        if only_channel_ids is None and all_targets:
+            try:
+                unavailable = await _check_target_availability(bot, tg, bale)
+            except Exception:
+                logger.exception("Channel availability check failed; publishing anyway")
+                unavailable = {}
+            if unavailable:
+                skipped = [ch for ch in all_targets if ch["id"] in unavailable]
+                tg = [c for c in tg if c["id"] not in unavailable]
+                bale = [c for c in bale if c["id"] not in unavailable]
+                # Never attempted: record them as failed and arm the automatic
+                # retry, exactly as if the send had failed.
+                for ch in skipped:
+                    await record_delivery(
+                        post_id, ch["id"], ch.get("platform", "telegram"), "failed",
+                        error=str(unavailable[ch["id"]])[:1000], next_retry_at=_next_retry_at(),
+                    )
+
+        tg_sent, tg_failed, tg_ids, tg_errors = 0, 0, [], {}
+        bale_sent, bale_failed, bale_ids, bale_errors = 0, 0, [], {}
+        if tg or bale:
+            tg_sent, tg_failed, tg_ids, tg_errors = await _post_to_telegram(tg, state, bot)
+            bale_sent, bale_failed, bale_ids, bale_errors = await _post_to_bale(bale, state, bot, attempt_no)
 
         # Merge with anything already delivered so a partial retry does not
         # erase the message ids of the channels that succeeded earlier.
@@ -641,7 +707,7 @@ async def publish_existing_post(post: dict, bot, only_channel_ids: set = None,
         failures = {**tg_errors, **bale_errors}
         await _record_channel_results(post_id, tg + bale, failures)
 
-        total = len(tg) + len(bale)
+        total = len(all_targets)
         sent = tg_sent + bale_sent
         if only_channel_ids is not None:
             # Partial retry: derive the post-level status from every channel.
@@ -652,7 +718,9 @@ async def publish_existing_post(post: dict, bot, only_channel_ids: set = None,
             post_id, status,
             json.dumps({"telegram_failed": tg_failed, "bale_failed": bale_failed}),
         )
-        return sent, tg_failed + bale_failed
+        # Skipped (unavailable) channels count as not delivered so callers
+        # report the post as incomplete and the retry queue keeps them alive.
+        return sent, tg_failed + bale_failed + len(skipped)
     finally:
         async with _inflight_lock:
             _inflight_publishes.discard(post_id)
@@ -785,9 +853,20 @@ async def process_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
                                   None if not failed else f"{failed} channel(s) failed")
 
             if failed:
-                retry_note = ""
+                # Only DEFINITE failures are auto-retried; an ambiguous network
+                # timeout may have delivered the post and is not re-sent (that
+                # would post duplicates). Report which applies.
+                auto_retry = False
                 if RETRY_INTERVAL_MINUTES:
+                    rows = await get_post_deliveries(post["id"])
+                    auto_retry = any(r["status"] == "failed"
+                                     and r.get("next_retry_at") is not None
+                                     for r in rows)
+                retry_note = ""
+                if auto_retry:
                     retry_note = f"\n🔁 تلاش مجدد خودکار تا {RETRY_INTERVAL_MINUTES} دقیقه دیگر انجام می‌شود."
+                if failed and not auto_retry:
+                    retry_note += "\n⚠️ خطای اتصال (وقفه)؛ ممکن است ارسال شده باشد و خودکار تکرار نمی‌شود. لطفاً بررسی کنید."
                 await _notify(
                     context.bot, schedule["user_id"],
                     f"⚠️ پست زمان‌بندی‌شده #{post['id']} ناقص ارسال شد.\n"
@@ -876,10 +955,23 @@ async def process_delivery_retries(context: ContextTypes.DEFAULT_TYPE):
                 post, context.bot, only_channel_ids=live_ids, attempt_no=attempt_no,
             )
             if failed:
+                # publish_existing_post already re-armed any DEFINITE failures
+                # and deliberately did NOT re-arm ambiguous ones (a timeout may
+                # have delivered the post, so re-sending would duplicate it).
+                # Say what actually happens next instead of promising a retry.
+                remaining = await get_post_deliveries(post_id)
+                still_retrying = any(
+                    r["channel_id"] in live_ids and r["status"] == "failed"
+                    and r.get("next_retry_at") is not None
+                    for r in remaining
+                )
+                if still_retrying:
+                    note = f"تلاش بعدی {RETRY_INTERVAL_MINUTES} دقیقه دیگر انجام می‌شود."
+                else:
+                    note = "خطای اتصال؛ ممکن است ارسال شده باشد و خودکار تکرار نمی‌شود. لطفاً بررسی کنید."
                 await _notify(
                     context.bot, post["user_id"],
-                    f"⚠️ تلاش مجدد پست #{post_id} برای {failed} مقصد ناموفق بود. "
-                    f"تلاش بعدی {RETRY_INTERVAL_MINUTES} دقیقه دیگر انجام می‌شود.",
+                    f"⚠️ تلاش مجدد پست #{post_id} برای {failed} مقصد ناموفق بود. {note}",
                 )
             else:
                 final_status = await _aggregate_status(post_id)
@@ -904,39 +996,78 @@ async def process_delivery_retries(context: ContextTypes.DEFAULT_TYPE):
                                       str(exc)[:1000], retry_at)
 
 
-async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def _check_target_availability(bot, tg_channels, bale_channels) -> dict:
+    """Return {channel_id: reason} for target channels that are not reachable.
 
-    user_id = query.from_user.id
-    state = _active_state(user_id)
-    if not state or state.get("state") != "awaiting_confirm":
-        await query.edit_message_text("❌ پستی در انتظار نیست. برای شروع /start را بزنید.")
-        return
+    ``bot`` is a Telegram bot (``context.bot`` works too). A Telegram channel
+    is unavailable when ``get_chat`` fails; a Bale channel is unavailable when
+    *no* configured Bale bot can reach it (delivery alternates bots, so at
+    least one reachable bot is enough to send). The check is best-effort: if
+    it errors, the caller sends anyway and lets the per-channel send report
+    its own outcome.
+    """
+    import bale_client
 
-    tg_channels = await get_active_channels("telegram")
-    bale_channels = await get_active_channels("bale")
-    selected_ids = state.get("selected_channel_ids")
-    if selected_ids:
-        selected_ids = set(selected_ids)
-        tg_channels = [c for c in tg_channels if c["id"] in selected_ids]
-        bale_channels = [c for c in bale_channels if c["id"] in selected_ids]
+    async def check_tg(ch):
+        try:
+            await asyncio.wait_for(bot.get_chat(ch["chat_id"]), timeout=10)
+            return None
+        except Exception as exc:
+            return str(exc)
 
-    logger.info("Found %d Telegram channels, %d Bale channels", len(tg_channels), len(bale_channels))
+    async def check_bale(ch):
+        clients = bale_client.all_clients()
+        if not clients:
+            return "ربات بله پیکربندی نشده است"
+        errors = []
+        for client in clients:
+            try:
+                result = await asyncio.wait_for(client.get_chat(ch["chat_id"]), timeout=10)
+                if result.get("ok"):
+                    return None  # at least one bot can reach the channel
+                errors.append(f"{client.name}: {result.get('description', 'Bale API error')}")
+            except Exception as exc:
+                errors.append(f"{client.name}: {exc}")
+        return "؛ ".join(errors)
 
-    if not tg_channels and not bale_channels:
-        await query.edit_message_text("❌ کانالی تنظیم نشده است. از تنظیمات کانال اضافه کنید.")
-        await forget_state(user_id)
-        return
+    async def run(ch, fn):
+        try:
+            return ch["id"], await fn(ch)
+        except Exception as exc:
+            return ch["id"], str(exc)
 
+    checks = [run(ch, check_tg) for ch in tg_channels]
+    checks += [run(ch, check_bale) for ch in bale_channels]
+    results = await asyncio.gather(*checks)
+
+    unavailable: dict[int, str] = {}
+    for channel_id, reason in results:
+        if reason is not None:
+            unavailable[channel_id] = reason
+            # Best-effort persist so the health dashboard reflects reality.
+            try:
+                await update_channel_health(channel_id, "unhealthy", str(reason)[:1000])
+            except Exception:
+                logger.exception("Could not persist channel health for %s", channel_id)
+
+    if unavailable:
+        names = {c["id"]: c["name"] for c in tg_channels + bale_channels}
+        logger.warning("Channels unavailable before publish: %s",
+                       {names[i]: reason for i, reason in unavailable.items()})
+    return unavailable
+
+
+async def _save_and_send(user_id: int, state: dict, tg_channels, bale_channels,
+                         query, context):
+    """Save the post to history, send it to the given channels and report.
+
+    Shared by the normal confirm flow and the "continue after availability
+    notice" flow, so both keep identical saving/sending/retry behaviour.
+    """
+    post_type = state.get("type")
     await query.edit_message_text("⏳ در حال ارسال به کانال‌ها...")
 
-    post_type = state.get("type")
-
-    # Approval is an owner-controlled global setting and defaults to off.
-    approval_required = (await get_setting("approval_required", "0")) == "1"
-
-    # Save to history first
+    # Save to history first.
     media_json = json.dumps(state.get("media")) if post_type == "media_group" else None
     post_id = await save_post(
         user_id, post_type,
@@ -945,13 +1076,8 @@ async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         caption=state.get("caption"),
         media_json=media_json,
         target_channels_json=json.dumps([c["id"] for c in tg_channels + bale_channels]),
-        delivery_status="pending_approval" if approval_required and not await has_permission(user_id, "approve") else "pending",
+        delivery_status="pending",
     )
-
-    if approval_required and not await has_permission(user_id, "approve"):
-        await forget_state(user_id)
-        await query.edit_message_text(f"📝 پست #{post_id} برای تأیید مالک ارسال شد.", reply_markup=main_menu_keyboard(is_sudo=await is_sudo(user_id), is_owner=await is_owner(user_id)))
-        return
 
     async with _inflight_lock:
         _inflight_publishes.add(post_id)
@@ -989,15 +1115,124 @@ async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         result += f"\n🔵 بله: {bale_sent}/{len(bale_channels)}"
     if total_failed:
         result += f"\n❌ ناموفق: {total_failed}"
-        if RETRY_INTERVAL_MINUTES:
+        failures = {**tg_errors, **bale_errors}
+        auto_retry = RETRY_INTERVAL_MINUTES and any(
+            not _is_ambiguous_error(e) for e in failures.values()
+        )
+        if auto_retry:
             result += f"\n🔁 تلاش مجدد خودکار تا {RETRY_INTERVAL_MINUTES} دقیقه دیگر."
+        # A timeout may have actually delivered the post; the automatic job
+        # deliberately does NOT re-send it (that would post duplicates), so
+        # tell the author to verify manually instead of promising a retry.
+        if any(_is_ambiguous_error(e) for e in failures.values()):
+            result += "\n⚠️ برخی ارسال‌ها با خطای اتصال (وقفه) مواجه شد؛ ممکن است ارسال شده باشند. لطفاً بررسی کنید؛ ارسال خودکار تکرار نمی‌شود."
 
     from database import is_sudo as _is_sudo, is_owner as _is_owner
     await context.bot.send_message(
         chat_id=query.message.chat.id,
         text=result,
-        reply_markup=main_menu_keyboard(is_sudo=await _is_sudo(query.from_user.id), is_owner=await _is_owner(query.from_user.id)),
+        reply_markup=main_menu_keyboard(is_sudo=await _is_sudo(user_id), is_owner=await _is_owner(user_id)),
     )
+
+
+async def handle_confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    state = _active_state(user_id)
+    if not state or state.get("state") != "awaiting_confirm":
+        await query.edit_message_text("❌ پستی در انتظار نیست. برای شروع /start را بزنید.")
+        return
+
+    tg_channels = await get_active_channels("telegram")
+    bale_channels = await get_active_channels("bale")
+    selected_ids = state.get("selected_channel_ids")
+    if selected_ids:
+        selected_ids = set(selected_ids)
+        tg_channels = [c for c in tg_channels if c["id"] in selected_ids]
+        bale_channels = [c for c in bale_channels if c["id"] in selected_ids]
+
+    logger.info("Found %d Telegram channels, %d Bale channels", len(tg_channels), len(bale_channels))
+
+    if not tg_channels and not bale_channels:
+        await query.edit_message_text("❌ کانالی تنظیم نشده است. از تنظیمات کانال اضافه کنید.")
+        await forget_state(user_id)
+        return
+
+    # Approval is an owner-controlled global setting and defaults to off. When
+    # the post only goes to the approval queue it is not sent anywhere yet, so
+    # the channel-availability gate below is skipped.
+    approval_required = (await get_setting("approval_required", "0")) == "1"
+    if approval_required and not await has_permission(user_id, "approve"):
+        post_type = state.get("type")
+        media_json = json.dumps(state.get("media")) if post_type == "media_group" else None
+        post_id = await save_post(
+            user_id, post_type,
+            text=state.get("text"),
+            file_id=state.get("file_id"),
+            caption=state.get("caption"),
+            media_json=media_json,
+            target_channels_json=json.dumps([c["id"] for c in tg_channels + bale_channels]),
+            delivery_status="pending_approval",
+        )
+        await forget_state(user_id)
+        await query.edit_message_text(f"📝 پست #{post_id} برای تأیید مالک ارسال شد.", reply_markup=main_menu_keyboard(is_sudo=await is_sudo(user_id), is_owner=await is_owner(user_id)))
+        return
+
+    # Availability gate: check the target channels first and tell the user
+    # which ones are unreachable. It is informational only — continuing sends
+    # to every target, so the unavailable channels fail and are armed for the
+    # automatic retry exactly as before. Cancel drops the draft.
+    try:
+        unavailable = await _check_target_availability(context.bot, tg_channels, bale_channels)
+    except Exception:
+        # A check failure must never block publishing; fall back to sending as
+        # before (the per-channel send still reports its own outcome).
+        logger.exception("Channel availability check failed; sending anyway")
+        unavailable = {}
+
+    if unavailable:
+        # Keep the FULL target list so the retry system re-sends the
+        # unavailable channels once the user continues.
+        state["all_tg"] = tg_channels
+        state["all_bale"] = bale_channels
+        state["state"] = "awaiting_unavailable_confirm"
+        await persist_state(user_id, state)
+        lines = ["⚠️ این کانال‌های مقصد در دسترس نیستند:"]
+        for ch in tg_channels + bale_channels:
+            if ch["id"] in unavailable:
+                lines.append(f"• ❌ {html_text(ch['name'])} — {html_text(str(unavailable[ch['id']]))}")
+        lines.append("\nادامه می‌دهید؟ (به کانال‌های در دسترس ارسال می‌شود و کانال‌های در دسترس‌نبوده، تلاش مجدد می‌شوند)")
+        await query.edit_message_text("\n".join(lines), reply_markup=unavailable_confirm_keyboard())
+        return
+
+    await _save_and_send(user_id, state, tg_channels, bale_channels, query, context)
+
+
+async def handle_confirm_unavailable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Continue after the availability notice.
+
+    Sends to every target: available channels post now, unavailable ones fail
+    and are armed for the automatic retry as before.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    state = _active_state(user_id)
+    if not state or state.get("state") != "awaiting_unavailable_confirm":
+        await query.edit_message_text("❌ پستی در انتظار نیست. برای شروع /start را بزنید.")
+        return
+
+    tg_channels = state.get("all_tg") or []
+    bale_channels = state.get("all_bale") or []
+    if not tg_channels and not bale_channels:
+        await query.edit_message_text("❌ کانالی در دسترس نیست.")
+        await forget_state(user_id)
+        return
+
+    await _save_and_send(user_id, state, tg_channels, bale_channels, query, context)
 
 
 async def _channel_picker(update, context):

@@ -148,7 +148,7 @@ class MisfireGraceTimeTests(unittest.TestCase):
         self.assertEqual(
             set(self._registered_jobs()),
             {"scheduled_posts", "delivery_retries", "channel_health",
-             "daily_report", "nightly_backup"},
+             "daily_report", "nightly_backup", "history_prune"},
         )
 
 

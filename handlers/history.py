@@ -7,14 +7,14 @@ from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 
-from config import RETRY_INTERVAL_MINUTES
+from config import RETRY_INTERVAL_MINUTES, HISTORY_MAX_POSTS
 from database import (
     get_user_posts, get_all_posts, get_user_posts_paginated, get_all_posts_paginated,
     count_user_posts, count_all_posts, get_post, update_post_text, update_post_caption,
     delete_post, is_writer_or_above, is_owner, is_sudo, can_edit_post, can_delete_post,
     get_user_role, has_permission, update_post_status, save_post_version, save_post,
     get_active_schedule_for_post, cancel_schedule, get_post_deliveries,
-    cancel_post_retries, record_delivery, claim_delivery_retry,
+    cancel_post_retries, record_delivery, claim_delivery_retry, prune_old_posts,
 )
 from keyboards import main_menu_keyboard, history_keyboard, post_detail_keyboard, confirm_keyboard
 from utils import html_text, state_is_expired, format_local, format_local_date
@@ -25,6 +25,22 @@ from handlers.post import (
 logger = logging.getLogger(__name__)
 
 _edit_states: dict[int, dict] = {}
+
+
+async def prune_history(context: ContextTypes.DEFAULT_TYPE = None):
+    """Delete the oldest posts so history stays bounded (default 100 = 20 pages).
+
+    Keeps the database from growing without bound. Runs periodically and once
+    at startup. A database outage is just skipped — the next run picks it up.
+    """
+    try:
+        removed = await prune_old_posts(HISTORY_MAX_POSTS)
+    except Exception:
+        logger.exception("History pruning failed")
+        return 0
+    if removed:
+        logger.info("Pruned %d old post(s); history capped at %d", removed, HISTORY_MAX_POSTS)
+    return removed
 
 
 async def _menu_kb(user_id):
@@ -594,10 +610,20 @@ async def handle_retry_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "برخی مقصدها دیگر در دسترس نیستند و پست ناقص ماند."
         )
     elif RETRY_INTERVAL_MINUTES:
-        result = (
-            f"❌ ارسال به {failed} مقصد دوباره ناموفق بود.\n"
-            f"🔁 تلاش بعدی {RETRY_INTERVAL_MINUTES} دقیقه دیگر انجام می‌شود."
+        # publish_existing_post only re-armed DEFINITE failures. An ambiguous
+        # timeout may have delivered the post and is deliberately not re-sent
+        # (re-sending would post a duplicate), so only promise a retry when one
+        # is actually queued.
+        remaining = await get_post_deliveries(post_id)
+        still_retrying = any(
+            r["status"] == "failed" and r.get("next_retry_at") is not None
+            for r in remaining
         )
+        if still_retrying:
+            note = f"🔁 تلاش بعدی {RETRY_INTERVAL_MINUTES} دقیقه دیگر انجام می‌شود."
+        else:
+            note = "⚠️ خطای اتصال (وقفه)؛ ممکن است ارسال شده باشد و خودکار تکرار نمی‌شود. لطفاً بررسی کنید."
+        result = f"❌ ارسال به {failed} مقصد دوباره ناموفق بود.\n{note}"
     else:
         result = (
             f"❌ ارسال به {failed} مقصد دوباره ناموفق بود.\n"
