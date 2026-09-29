@@ -17,6 +17,26 @@ BALE_TOKEN_2 = os.getenv("BALE_TOKEN_2") or None
 # video uploads the moment the connection stalls for a few seconds.
 BALE_TIMEOUT = int(os.getenv("BALE_TIMEOUT", 30))
 BALE_UPLOAD_TIMEOUT = int(os.getenv("BALE_UPLOAD_TIMEOUT", 120))
+
+# HTTP proxy for reaching the Bale API (tapi.bale.ai). Bale's edge servers
+# refuse TCP connections from non-Iranian IPs, so a server hosted abroad needs
+# to route Bale traffic through a relay inside Iran — a plain HTTP proxy is
+# enough (urllib tunnels HTTPS through it with CONNECT). Example:
+#   BALE_PROXY=http://USER:PASS@IRAN_VPS_IP:3128
+# Leave unset to connect directly (also honours the standard http_proxy /
+# https_proxy environment variables, like before).
+BALE_PROXY = os.getenv("BALE_PROXY") or None
+
+# Iran-side HTTP bridge (an alternative to BALE_PROXY): a tiny PHP script
+# (bridge/bale_bridge.php in this repo) hosted on a shared host inside Iran
+# that forwards API calls to tapi.bale.ai. Takes precedence over BALE_PROXY
+# because the relay happens on the bridge host itself. Needs the shared
+# secret the bridge checks:
+#   BALE_API_BASE=https://YOUR-SITE.ir/path/bale_bridge.php
+#   BALE_BRIDGE_KEY=<same secret as BRIDGE_KEY in the PHP file>
+# Leave both unset to connect directly.
+BALE_API_BASE = os.getenv("BALE_API_BASE") or None
+BALE_BRIDGE_KEY = os.getenv("BALE_BRIDGE_KEY") or None
 # How many Bale channels may be uploaded in parallel during one publish.
 BALE_MAX_CONCURRENT = int(os.getenv("BALE_MAX_CONCURRENT", 3))
 SUDO_USER_ID = int(os.getenv("SUDO_USER_ID", 0))
