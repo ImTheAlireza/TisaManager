@@ -12,8 +12,10 @@ import logging
 import asyncio
 import time
 import urllib.error
+import urllib.request
 
-from config import BALE_TOKEN, BALE_TOKEN_2, BALE_TIMEOUT, BALE_UPLOAD_TIMEOUT
+from config import (BALE_TOKEN, BALE_TOKEN_2, BALE_TIMEOUT, BALE_UPLOAD_TIMEOUT,
+                    BALE_PROXY, BALE_API_BASE, BALE_BRIDGE_KEY)
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +62,54 @@ def _build_multipart(data=None, files=None) -> tuple:
     return f"multipart/form-data; boundary={boundary}", b"".join(parts)
 
 
+_PROXY_OPENER = None
+
+
+def _get_opener():
+    """The urllib opener for Bale API calls, with the proxy applied if set.
+
+    Built lazily and cached. With BALE_PROXY set, an explicit ProxyHandler
+    routes every Bale request through that relay (an HTTP proxy tunnelling
+    HTTPS with CONNECT) — needed when the bot server sits outside Iran and
+    Bale's edge refuses its TCP connections. Without it, build_opener() still
+    installs an env-driven ProxyHandler, so plain urlopen behaviour
+    (http_proxy/https_proxy) is preserved.
+    """
+    global _PROXY_OPENER
+    if _PROXY_OPENER is None:
+        handlers = []
+        if BALE_PROXY:
+            proxy = BALE_PROXY if "://" in BALE_PROXY else f"http://{BALE_PROXY}"
+            handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+            logger.info("Bale client using proxy relay for tapi.bale.ai")
+        _PROXY_OPENER = urllib.request.build_opener(*handlers)
+    return _PROXY_OPENER
+
+
+def _post_via_bridge(token, method, data=None, files=None):
+    """Send one API call through the Iran-side PHP bridge (bridge/bale_bridge.php).
+
+    The token and method travel in headers — never the URL — so they cannot
+    end up in the bridge host's access logs. The body is always multipart,
+    which the bridge rebuilds toward tapi.bale.ai; it answers with Bale's
+    verbatim JSON.
+    """
+    from urllib.request import Request
+
+    content_type, body = _build_multipart(data=data, files=files)
+    req = Request(BALE_API_BASE, data=body, method="POST")
+    req.add_header("Content-Type", content_type)
+    req.add_header("X-Bridge-Key", BALE_BRIDGE_KEY or "")
+    req.add_header("X-Bale-Token", token)
+    req.add_header("X-Bale-Method", method)
+    timeout = BALE_UPLOAD_TIMEOUT if files else BALE_TIMEOUT
+    resp = _get_opener().open(req, timeout=timeout)
+    return json.loads(resp.read().decode())
+
+
 def _post(url, data=None, files=None):
     """Synchronous HTTP POST using urllib (no external deps)."""
-    from urllib.request import Request, urlopen
+    from urllib.request import Request
     from urllib.parse import urlencode
 
     if files:
@@ -82,7 +129,7 @@ def _post(url, data=None, files=None):
         req = Request(url, method="POST")
         resp_timeout = BALE_TIMEOUT
 
-    resp = urlopen(req, timeout=resp_timeout)
+    resp = _get_opener().open(req, timeout=resp_timeout)
     return json.loads(resp.read().decode())
 
 
@@ -105,7 +152,12 @@ class BaleClient:
         # without waiting a full 10-minute retry cycle.
         for attempt in (1, 2):
             try:
-                result = _post(url, data=data, files=files)
+                if BALE_API_BASE:
+                    # Iran-side bridge mode: the relay happens on the bridge
+                    # host, so BALE_PROXY would only double-hop needlessly.
+                    result = _post_via_bridge(self.token, method, data, files)
+                else:
+                    result = _post(url, data=data, files=files)
                 if not result.get("ok"):
                     logger.error("Bale API error on %s (%s): %s", method, self.name, result)
                 else:

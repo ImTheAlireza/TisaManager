@@ -150,5 +150,95 @@ class TransientNetworkRetryTests(unittest.TestCase):
                            "large media uploads need more headroom than getMe-style calls")
 
 
+class ProxyOpenerTests(unittest.TestCase):
+    """BALE_PROXY routes Bale traffic through an Iran-side relay; the opener
+    must honour it and forget it between configurations."""
+
+    def setUp(self):
+        self._original = (bale_client.BALE_PROXY, bale_client._PROXY_OPENER)
+
+    def tearDown(self):
+        bale_client.BALE_PROXY, bale_client._PROXY_OPENER = self._original
+
+    @staticmethod
+    def _proxy_of(opener):
+        import urllib.request
+        handlers = [h for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)]
+        return handlers[-1].proxies if handlers else {}
+
+    def test_explicit_proxy_is_applied(self):
+        bale_client.BALE_PROXY = "http://user:pass@10.0.0.5:3128"
+        bale_client._PROXY_OPENER = None
+        proxies = self._proxy_of(bale_client._get_opener())
+        self.assertEqual(proxies.get("https"), "http://user:pass@10.0.0.5:3128")
+        self.assertEqual(proxies.get("http"), "http://user:pass@10.0.0.5:3128")
+
+    def test_schemeless_proxy_gets_http_scheme(self):
+        bale_client.BALE_PROXY = "10.0.0.5:3128"
+        bale_client._PROXY_OPENER = None
+        proxies = self._proxy_of(bale_client._get_opener())
+        self.assertEqual(proxies.get("https"), "http://10.0.0.5:3128")
+
+    def test_unset_proxy_forces_no_relay(self):
+        bale_client.BALE_PROXY = None
+        bale_client._PROXY_OPENER = None
+        proxies = self._proxy_of(bale_client._get_opener())
+        self.assertIsNone(proxies.get("https"),
+                          "without BALE_PROXY the opener must not gain a forced relay")
+
+
+class BridgeTests(unittest.TestCase):
+    """BALE_API_BASE mode: token/method go in headers, never the URL."""
+
+    def setUp(self):
+        self._original = (bale_client.BALE_API_BASE, bale_client.BALE_BRIDGE_KEY,
+                          bale_client._PROXY_OPENER, bale_client._post_via_bridge,
+                          bale_client._get_opener)
+        bale_client.BALE_API_BASE = "https://site.example/bale_bridge.php"
+        bale_client.BALE_BRIDGE_KEY = "secret"
+        bale_client._PROXY_OPENER = None
+
+    def tearDown(self):
+        (bale_client.BALE_API_BASE, bale_client.BALE_BRIDGE_KEY,
+         bale_client._PROXY_OPENER, bale_client._post_via_bridge,
+         bale_client._get_opener) = self._original
+
+    def test_request_is_sent_with_token_and_method_in_headers(self):
+        captured = {}
+
+        class FakeResponse:
+            def read(self):
+                return b'{"ok": true, "result": {"message_id": 7}}'
+
+        class FakeOpener:
+            def open(self, req, timeout=None):
+                captured["url"] = req.full_url
+                captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+                captured["timeout"] = timeout
+                captured["body"] = req.data
+                return FakeResponse()
+
+        bale_client._get_opener = lambda: FakeOpener()
+        result = bale_client.BaleClient("123:abc", "bale-1")._request("sendMessage", {"chat_id": 5, "text": "hi"})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(captured["url"], "https://site.example/bale_bridge.php")
+        self.assertEqual(captured["headers"]["x-bale-token"], "123:abc",
+                         "the token must ride in a header, not the URL")
+        self.assertEqual(captured["headers"]["x-bale-method"], "sendMessage")
+        self.assertEqual(captured["headers"]["x-bridge-key"], "secret")
+        self.assertIn(b'name="chat_id"', captured["body"])
+
+    def test_bridge_failure_gives_ok_false(self):
+        import urllib.error
+
+        def boom(*a, **k):
+            raise urllib.error.URLError("connection refused")
+
+        bale_client._post_via_bridge = boom
+        result = bale_client.BaleClient("123:abc", "bale-1")._request("getMe")
+        self.assertFalse(result["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()
