@@ -95,7 +95,7 @@ $ch = curl_init();
 curl_setopt_array($ch, [
     CURLOPT_URL            => UPSTREAM_BASE . '/bot' . $token . '/' . $method,
     CURLOPT_POST           => true,
-    CURLOPT_POSTFIELDS     => $post ?: new stdClass(), // {} avoids "array to string" on empty
+    CURLOPT_POSTFIELDS     => $post ?: '', // empty string, not stdClass: cURL would try (string) cast
     CURLOPT_RETURNTRANSFER => true,
     CURLOPT_TIMEOUT        => CURL_TIMEOUT,
     CURLOPT_CONNECTTIMEOUT => CURL_CONNECT_TO,
