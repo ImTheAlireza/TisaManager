@@ -240,5 +240,251 @@ class BridgeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
 
 
+def _http_error(code, body: bytes, reason="Bad Request"):
+    """An HTTPError that carries a response body, the way urllib raises one."""
+    import io
+    import urllib.error
+
+    return urllib.error.HTTPError(
+        "https://tapi.bale.ai/bot1/sendMediaGroup", code, reason, {}, io.BytesIO(body)
+    )
+
+
+class HttpErrorReportingTests(unittest.TestCase):
+    """A rejected request must say WHY.
+
+    urllib discards the body of every 4xx, so an album that Bale refused, a
+    bridge host that dropped an oversized upload and a web server error page
+    all reached the log as the same "HTTP Error 400: Bad Request" — the
+    production failure this covers.
+    """
+
+    def setUp(self):
+        self._original = (bale_client.BALE_API_BASE, bale_client._post)
+
+    def tearDown(self):
+        bale_client.BALE_API_BASE, bale_client._post = self._original
+
+    def test_bale_description_is_kept(self):
+        result = bale_client._error_result(_http_error(
+            400, b'{"ok": false, "error_code": 400, '
+                b'"description": "Bad Request: group send failed"}'))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], 400)
+        self.assertEqual(result["description"], "Bad Request: group send failed")
+
+    def test_bridge_json_error_is_kept(self):
+        result = bale_client._error_result(_http_error(
+            413, b'{"ok": false, "error_code": 413, "description": '
+                b'"request body of 41.7 MB exceeds this host\'s post_max_size (8M)."}'))
+
+        self.assertIn("post_max_size (8M)", result["description"])
+        self.assertEqual(result["error_code"], 413)
+
+    def test_html_error_page_is_kept_as_a_snippet(self):
+        html = b"<html><body><h1>413 Request Entity Too Large</h1></body></html>"
+        result = bale_client._error_result(_http_error(413, html))
+
+        self.assertIn("non-JSON response", result["description"])
+        self.assertIn("413 Request Entity Too Large", result["description"])
+
+    def test_empty_body_falls_back_to_the_exception_text(self):
+        result = bale_client._error_result(_http_error(400, b""))
+        self.assertEqual(result["description"], "HTTP Error 400: Bad Request")
+        self.assertEqual(result["error_code"], 400)
+
+    def test_upload_note_reports_file_count_and_size(self):
+        note = bale_client._upload_note({
+            "file_0": ("file_0.jpg", b"x" * 1048576, "image/jpeg"),
+            "file_1": ("file_1.mp4", b"y" * 1048576, "video/mp4"),
+        })
+        self.assertEqual(note, " [2 file(s), 2.0 MB]")
+        self.assertEqual(bale_client._upload_note(None), "")
+
+    def _failed_send(self, error, media_files):
+        bale_client.BALE_API_BASE = None
+
+        def fake_post(url, data=None, files=None):
+            raise error
+
+        bale_client._post = fake_post
+        client = bale_client.BaleClient("token", "bale-1")
+        with self.assertLogs("bale_client", level="ERROR") as logs:
+            result = run(client.send_media_group(5033953014, media_files, caption="کپشن"))
+        return result, "\n".join(logs.output)
+
+    def test_failed_album_logs_the_api_reason_and_the_payload_size(self):
+        result, log = self._failed_send(
+            _http_error(400, b'{"ok": false, "error_code": 400, '
+                           b'"description": "Bad Request: group send failed"}'),
+            [("photo", b"x" * 1048576), ("video", b"y" * 1048576)],
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["description"], "Bad Request: group send failed",
+                         "the delivery row must store the reason, not the urllib text")
+        self.assertIn("sendMediaGroup", log)
+        self.assertIn("HTTP 400", log)
+        self.assertIn("group send failed", log)
+        self.assertIn("2 file(s), 2.0 MB", log,
+                      "a rejected album needs its payload size in the same line")
+
+    def test_failed_album_keeps_the_host_error_page(self):
+        _, log = self._failed_send(
+            _http_error(413, b"<h1>413 Request Entity Too Large</h1>"),
+            [("video", b"z" * 1024)],
+        )
+        self.assertIn("413 Request Entity Too Large", log)
+
+
+class AlbumShapeTests(unittest.TestCase):
+    """A media group only exists for 2-10 items — the rest must still post.
+
+    Production failure: an album whose siblings arrived after the debounce was
+    published as a group of one, and Bale answered every attempt with
+    "Bad Request: malformed request" on sendMediaGroup.
+    """
+
+    def setUp(self):
+        self._original = bale_client._post
+        self.calls = []
+
+    def tearDown(self):
+        bale_client._post = self._original
+
+    def _capture(self, results=None):
+        def fake_post(url, data=None, files=None):
+            self.calls.append({"url": url, "data": data, "files": files})
+            if results:
+                return results[len(self.calls) - 1]
+            return {"ok": True, "result": [{"message_id": len(self.calls)}]}
+        bale_client._post = fake_post
+
+    def test_single_photo_is_sent_as_a_photo(self):
+        self._capture()
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(
+            5033953014, [("photo", b"img-bytes")], caption="کپشن"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("sendPhoto", self.calls[0]["url"],
+                      "a group of one is not an album; sendMediaGroup would be refused")
+        self.assertNotIn("sendMediaGroup", self.calls[0]["url"])
+        self.assertEqual(self.calls[0]["data"]["caption"], "کپشن")
+
+    def test_single_video_is_sent_as_a_video(self):
+        self._capture()
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(
+            5033953014, [("video", b"vid-bytes")]))
+
+        self.assertTrue(result["ok"])
+        self.assertIn("sendVideo", self.calls[0]["url"])
+
+    def test_two_items_still_go_out_as_one_album(self):
+        self._capture()
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(
+            5033953014, [("photo", b"a"), ("photo", b"b")], caption="کپشن"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("sendMediaGroup", self.calls[0]["url"])
+        self.assertEqual(len(json.loads(self.calls[0]["data"]["media"])), 2)
+
+    def test_empty_album_is_refused_before_any_request(self):
+        self._capture()
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(5033953014, []))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.calls, [], "an empty album must not hit the API")
+
+    def test_album_longer_than_ten_is_split(self):
+        self._capture()
+        items = [("photo", bytes([i])) for i in range(12)]
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(
+            5033953014, items, caption="کپشن"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.calls), 2, "10 + 2 items, not one 12-item group")
+        first = json.loads(self.calls[0]["data"]["media"])
+        second = json.loads(self.calls[1]["data"]["media"])
+        self.assertEqual((len(first), len(second)), (10, 2))
+        self.assertEqual(first[0]["caption"], "کپشن", "the caption goes on the first item")
+        self.assertNotIn("caption", second[0], "the caption must not be repeated")
+        self.assertEqual(len(result["result"]), 2, "one entry per album that landed")
+
+    def test_failure_after_a_delivered_chunk_is_reported_as_partial(self):
+        self._capture(results=[
+            {"ok": True, "result": [{"message_id": 1}, {"message_id": 2}]},
+            {"ok": False, "error_code": 400, "description": "Bad Request: chat not found"},
+        ])
+        items = [("photo", bytes([i])) for i in range(12)]
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(5033953014, items))
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["partial"],
+                        "a re-send here would duplicate the album already delivered")
+        self.assertIn("already delivered", result["description"])
+        self.assertIn("chat not found", result["description"])
+
+    def test_first_chunk_failure_is_a_plain_failure(self):
+        self._capture(results=[{"ok": False, "description": "Bad Request: group send failed"}])
+        items = [("photo", bytes([i])) for i in range(12)]
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(5033953014, items))
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("partial", result, "nothing was delivered, so a retry is safe")
+
+
+class BridgePhpLimitsTests(unittest.TestCase):
+    """The PHP relay must not turn a host limit into a mystery 400.
+
+    PHP silently discards a POST body over post_max_size and a file over
+    upload_max_filesize; the bridge used to forward the resulting empty
+    request to Bale, so an oversized album only ever produced "400 Bad
+    Request" in the bot log. These checks lock the guard in place.
+    """
+
+    SOURCE = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "bridge", "bale_bridge.php",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        with open(cls.SOURCE, encoding="utf-8") as fh:
+            cls.php = fh.read()
+
+    def test_oversized_body_is_rejected_with_the_limit_named(self):
+        self.assertIn("ini_get('post_max_size')", self.php)
+        self.assertIn("$contentLength > $postMaxBytes", self.php)
+        self.assertIn("fail(413", self.php)
+
+    def test_a_body_php_dropped_is_caught_after_parsing(self):
+        self.assertIn("!$post && $contentLength >= DROPPED_BODY_MIN", self.php)
+
+    def test_upload_failures_explain_themselves(self):
+        self.assertIn("upload_error_text", self.php)
+        self.assertIn("upload_max_filesize", self.php)
+
+    def test_bridge_errors_carry_an_error_code(self):
+        self.assertIn("'error_code' => $code", self.php,
+                      "the bot reads bridge failures like Bale ones")
+
+    def test_setup_notes_state_the_required_ini_values(self):
+        for setting in ("post_max_size = 64M", "upload_max_filesize = 50M"):
+            self.assertIn(setting, self.php)
+
+    def test_php_is_syntactically_valid(self):
+        import shutil
+        import subprocess
+
+        php = shutil.which("php")
+        if not php:
+            self.skipTest("php CLI not installed")
+        proc = subprocess.run([php, "-l", self.SOURCE], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

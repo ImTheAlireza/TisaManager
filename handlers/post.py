@@ -11,8 +11,9 @@ from telegram.constants import ParseMode
 
 from config import (
     RETRY_INTERVAL_MINUTES, SCHEDULE_GRACE_SECONDS, WORKFLOW_TTL_SECONDS,
-    BALE_MAX_CONCURRENT,
+    BALE_MAX_CONCURRENT, MEDIA_GROUP_DEBOUNCE_SECONDS,
 )
+from bale_client import MEDIA_GROUP_MAX_ITEMS
 from database import (
     get_active_channels, is_writer_or_above, is_sudo, is_owner, save_post,
     update_post_message_ids, update_post_delivery, create_schedule, get_due_schedules,
@@ -62,6 +63,16 @@ class SchedulePastError(ValueError):
 
     A dedicated type so a genuine DB/JSON ValueError is never misreported to
     the user as "you picked a past time".
+    """
+
+
+class PartialDelivery(Exception):
+    """Part of a post reached the channel and the rest did not.
+
+    An album longer than one API call is sent in chunks; if a later chunk is
+    refused, the earlier ones are already in the channel. This is not a
+    transient failure — the automatic retry would post the delivered half a
+    second time — so it is reported apart and never re-armed.
     """
 
 
@@ -183,13 +194,23 @@ async def _process_media_group_callback(context: ContextTypes.DEFAULT_TYPE):
         return
 
     state["state"] = "awaiting_confirm"
-    state["type"] = "media_group"
+    if len(media) == 1:
+        # Only one item of the album made it here (its siblings arrived after
+        # the debounce, or Telegram sent the group on its own). A media group
+        # of one is rejected by both Telegram and Bale, so the post becomes
+        # the single photo/video the user actually sent.
+        only = media[0]
+        state["type"] = only["type"]
+        state["file_id"] = only["file_id"]
+    else:
+        state["type"] = "media_group"
     await persist_state(user_id, state)
 
     lines = ["📝 <b>پیش‌نمایش پست:</b>\n"]
     if caption:
         lines.append(f"کپشن: {html_text(caption)}")
-    lines.append(f"\n📦 تعداد رسانه‌ها: {len(media)}")
+    if len(media) > 1:
+        lines.append(f"\n📦 تعداد رسانه‌ها: {len(media)}")
     lines.append("\nبه همه کانال‌ها ارسال شود؟")
 
     msg = state["message"]
@@ -202,13 +223,20 @@ async def _process_media_group_callback(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _schedule_media_group(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel existing job and schedule a new one in 1 second."""
+    """Cancel the pending job and restart the quiet period (default 2s).
+
+    The album is published once no new item has arrived for the quiet period.
+    One second was too tight: when the rest of a large album arrived late the
+    bot published the first item alone, and an album of one is not a valid
+    media group. Every arriving item pushes the deadline out, so a longer quiet
+    period costs nothing on a complete album and saves a truncated one.
+    """
     current_jobs = context.job_queue.get_jobs_by_name(f"media_group_{user_id}")
     for job in current_jobs:
         job.schedule_removal()
     context.job_queue.run_once(
         _process_media_group_callback,
-        when=1.0,
+        when=MEDIA_GROUP_DEBOUNCE_SECONDS,
         data=user_id,
         name=f"media_group_{user_id}",
     )
@@ -363,6 +391,39 @@ async def handle_document_post(update: Update, context: ContextTypes.DEFAULT_TYP
     return True
 
 
+async def _telegram_send_album(bot, chat_id, state):
+    """Send an album to Telegram, reshaping what send_media_group refuses.
+
+    Telegram accepts 2-10 items per media group and answers anything else with
+    BadRequest. An album that lost items to a late update arrives here as a
+    group of one — the same shape that Bale rejected — so it is sent as the
+    single photo/video it really is, and a longer list goes out as albums of
+    ten rather than failing outright.
+    """
+    caption = state.get("caption")
+    media_items = []
+    for m in state.get("media") or []:
+        cap = caption if not media_items and caption else None
+        if m["type"] == "photo":
+            media_items.append(InputMediaPhoto(m["file_id"], caption=cap, parse_mode=ParseMode.HTML if cap else None))
+        elif m["type"] == "video":
+            media_items.append(InputMediaVideo(m["file_id"], caption=cap, parse_mode=ParseMode.HTML if cap else None))
+    if not media_items:
+        return []
+    if len(media_items) == 1:
+        single = media_items[0]
+        if isinstance(single, InputMediaPhoto):
+            return [await bot.send_photo(chat_id=chat_id, photo=single.media,
+                                         caption=single.caption, parse_mode=single.parse_mode)]
+        return [await bot.send_video(chat_id=chat_id, video=single.media,
+                                     caption=single.caption, parse_mode=single.parse_mode)]
+    sent = []
+    for start in range(0, len(media_items), MEDIA_GROUP_MAX_ITEMS):
+        chunk = media_items[start:start + MEDIA_GROUP_MAX_ITEMS]
+        sent.extend(await bot.send_media_group(chat_id=chat_id, media=chunk))
+    return sent
+
+
 async def _post_to_telegram(channels, state, bot):
     """Returns (sent, failed, message_ids, errors_by_channel_id)."""
     sent = 0
@@ -382,15 +443,7 @@ async def _post_to_telegram(channels, state, bot):
             elif post_type == "document":
                 result = await bot.send_document(chat_id=ch["chat_id"], document=state["file_id"], caption=state.get("caption"))
             elif post_type == "media_group":
-                caption = state.get("caption")
-                media_items = []
-                for i, m in enumerate(state["media"]):
-                    cap = caption if i == 0 and caption else None
-                    if m["type"] == "photo":
-                        media_items.append(InputMediaPhoto(m["file_id"], caption=cap, parse_mode=ParseMode.HTML if cap else None))
-                    elif m["type"] == "video":
-                        media_items.append(InputMediaVideo(m["file_id"], caption=cap, parse_mode=ParseMode.HTML if cap else None))
-                result = await bot.send_media_group(chat_id=ch["chat_id"], media=media_items)
+                result = await _telegram_send_album(bot, ch["chat_id"], state)
             if result:
                 if isinstance(result, (list, tuple)):
                     for msg in result:
@@ -484,7 +537,12 @@ async def _send_bale_channel(client, ch, state, prepared):
         return True, ids, None
     if result and not result.get("ok"):
         # A non-ok Bale response is a failure, not a success.
-        return False, [], result.get("description", "Bale API error")
+        error = result.get("description", "Bale API error")
+        if result.get("partial"):
+            # Part of a split album is already in the channel; re-sending the
+            # whole album would duplicate it.
+            return False, [], PartialDelivery(error)
+        return False, [], error
     return False, [], "empty Bale response"
 
 
@@ -571,8 +629,12 @@ def _is_ambiguous_error(error) -> bool:
     delivered it and only the reply read failed. Auto-retrying such a channel
     posts a duplicate on every attempt — the "same post N times in every
     channel" outage. Only errors that guarantee the message was NOT delivered
-    (a Telegram API 4xx, a Bale ``ok:false``, ...) are safe to re-send.
+    (a Telegram API 4xx, a Bale ``ok:false``, ...) are safe to re-send. A
+    ``PartialDelivery`` is grouped here for the same reason: part of the post
+    is on the channel already, so a retry would duplicate that part.
     """
+    if isinstance(error, PartialDelivery):
+        return True
     try:
         from telegram.error import NetworkError
     except Exception:

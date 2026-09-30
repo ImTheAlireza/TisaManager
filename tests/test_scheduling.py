@@ -1553,6 +1553,118 @@ class BaleUploadOptimizationTests(SchedulingTestCase):
                         f"4 downloads of 0.3s took {elapsed:.1f}s — they ran sequentially")
 
 
+class AlbumShapeTests(SchedulingTestCase):
+    """An album is 2-10 items; anything else must still reach the channel.
+
+    Production failure: an album whose siblings arrived after the one-second
+    debounce was published as a group of one, and every send was refused with
+    "Bad Request: malformed request".
+    """
+
+    class RecordingBot:
+        def __init__(self):
+            self.photos = []
+            self.videos = []
+            self.albums = []
+
+        async def send_photo(self, chat_id, photo, caption=None, parse_mode=None):
+            self.photos.append((chat_id, photo, caption))
+            return types.SimpleNamespace(message_id=len(self.photos))
+
+        async def send_video(self, chat_id, video, caption=None, parse_mode=None):
+            self.videos.append((chat_id, video, caption))
+            return types.SimpleNamespace(message_id=len(self.videos))
+
+        async def send_media_group(self, chat_id, media):
+            self.albums.append((chat_id, len(media)))
+            return [types.SimpleNamespace(message_id=i) for i in range(len(media))]
+
+    def _state(self, count, media_type="photo"):
+        return {"type": "media_group", "caption": "کپشن", "created_at": time.monotonic(),
+                "state": "awaiting_media_group",
+                "media": [{"type": media_type, "file_id": f"f{i}"} for i in range(count)],
+                "message": types.SimpleNamespace(chat=types.SimpleNamespace(id=7))}
+
+    def _run_debounce(self, state):
+        post.user_states[7] = state
+        context = make_context()
+        run(post._process_media_group_callback(types.SimpleNamespace(job=types.SimpleNamespace(data=7), bot=context.bot)))
+        return post.user_states[7]
+
+    def test_album_of_one_becomes_a_single_photo_post(self):
+        state = self._run_debounce(self._state(1))
+
+        self.assertEqual(state["type"], "photo",
+                         "a group of one is not an album and cannot be sent as one")
+        self.assertEqual(state["file_id"], "f0")
+        self.assertEqual(state["state"], "awaiting_confirm")
+
+    def test_album_of_one_video_becomes_a_single_video_post(self):
+        state = self._run_debounce(self._state(1, "video"))
+
+        self.assertEqual(state["type"], "video")
+        self.assertEqual(state["file_id"], "f0")
+
+    def test_a_real_album_stays_an_album(self):
+        state = self._run_debounce(self._state(3))
+
+        self.assertEqual(state["type"], "media_group")
+        self.assertEqual(len(state["media"]), 3)
+
+    def test_debounce_window_is_not_one_second(self):
+        self.assertGreaterEqual(post.MEDIA_GROUP_DEBOUNCE_SECONDS, 1.5,
+                                "a one-second window truncates albums on a slow connection")
+
+    def test_telegram_album_of_one_is_sent_as_a_photo(self):
+        bot = self.RecordingBot()
+        sent = run(post._telegram_send_album(bot, 100, self._state(1)))
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(bot.albums, [], "send_media_group refuses a group of one")
+        self.assertEqual(bot.photos[0][1], "f0")
+        self.assertEqual(bot.photos[0][2], "کپشن")
+
+    def test_telegram_album_of_one_video_is_sent_as_a_video(self):
+        bot = self.RecordingBot()
+        run(post._telegram_send_album(bot, 100, self._state(1, "video")))
+
+        self.assertEqual(bot.albums, [])
+        self.assertEqual(bot.videos[0][1], "f0")
+
+    def test_telegram_album_longer_than_ten_is_split(self):
+        bot = self.RecordingBot()
+        run(post._telegram_send_album(bot, 100, self._state(12)))
+
+        self.assertEqual([n for _chat, n in bot.albums], [10, 2])
+
+    def test_partial_album_delivery_is_never_auto_retried(self):
+        # Half of a split album is already in the channel: re-sending the post
+        # would duplicate it on every 10-minute cycle.
+        self.assertTrue(post._is_ambiguous_error(post.PartialDelivery("2 of 12 delivered")))
+        self.assertFalse(post._is_ambiguous_error("Bad Request: chat not found"),
+                         "a plain rejection is safe to re-send")
+
+    def test_partial_album_marks_the_channel_failed_without_a_retry(self):
+        deliveries = []
+
+        async def record(post_id, channel_id, platform, status, error=None, next_retry_at=None):
+            deliveries.append((channel_id, status, error, next_retry_at))
+
+        import handlers.post as post_mod
+        original = post_mod.record_delivery
+        post_mod.record_delivery = record
+        try:
+            channels = [{"id": 1, "chat_id": -100, "name": "B1", "platform": "bale"}]
+            run(post._record_channel_results(1, channels, {
+                1: post.PartialDelivery("2 of 12 already delivered, the rest failed"),
+            }))
+        finally:
+            post_mod.record_delivery = original
+
+        self.assertEqual(deliveries[0][1], "failed")
+        self.assertIsNone(deliveries[0][3], "a delivered half must not be re-armed")
+
+
 class RetryCancelButtonTests(SchedulingTestCase):
     """Cancel/retry-now: available to sudo/owner and to writers for their own posts."""
 
