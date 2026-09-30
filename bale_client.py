@@ -24,6 +24,11 @@ from config import (BALE_TOKEN, BALE_TOKEN_2, BALE_TIMEOUT, BALE_UPLOAD_TIMEOUT,
 
 logger = logging.getLogger(__name__)
 
+# A media group holds 2-10 items. Anything outside that is not an album: one
+# item goes out as a single photo/video, a longer list is split into albums of
+# ten (both Telegram and Bale reject the over-long group).
+MEDIA_GROUP_MAX_ITEMS = 10
+
 
 def _is_retryable_network_error(exc: Exception) -> bool:
     """Network-level failures that are safe to retry once.
@@ -302,10 +307,54 @@ class BaleClient:
             return await self._request_async("sendDocument", data)
 
     async def send_media_group(self, chat_id, media_files, caption=None):
-        """Send media group with file uploads via attach:// syntax.
+        """Send an album of photos/videos, adapting to what the API accepts.
 
         media_files: list of (type, file_bytes) tuples
+
+        A media group must hold 2-10 items — Bale answers a one-item group with
+        "Bad Request: malformed request" and a longer one with a 400 as well.
+        The shapes that cannot be sent as one group are reshaped rather than
+        dropped: a single item is what the user actually posted, so it goes out
+        as one photo/video, and a longer list is split into albums of ten.
         """
+        items = list(media_files or [])
+        if not items:
+            return {"ok": False, "description": "album has no media"}
+        if len(items) == 1:
+            media_type, blob = items[0]
+            if media_type == "photo":
+                return await self.send_photo(chat_id, blob, caption=caption)
+            if media_type == "video":
+                return await self.send_video(chat_id, blob, caption=caption)
+            return {"ok": False, "description": f"unsupported media type: {media_type}"}
+        if len(items) <= MEDIA_GROUP_MAX_ITEMS:
+            return await self._send_album(chat_id, items, caption)
+
+        messages = []
+        for start in range(0, len(items), MEDIA_GROUP_MAX_ITEMS):
+            chunk = items[start:start + MEDIA_GROUP_MAX_ITEMS]
+            result = await self._send_album(chat_id, chunk, caption if start == 0 else None)
+            if not (result and result.get("ok")):
+                if not messages:
+                    return result or {"ok": False, "description": "empty Bale response"}
+                # The earlier albums are already in the channel. Reporting a
+                # plain failure would have the 10-minute retry send the whole
+                # album again and duplicate them, so the partial delivery is
+                # flagged for the caller.
+                reason = (result or {}).get("description", "Bale API error")
+                return {
+                    "ok": False,
+                    "partial": True,
+                    "delivered": len(messages),
+                    "description": f"{len(messages)} of {len(items)} media already "
+                                   f"delivered, the rest failed: {reason}",
+                }
+            sent = result.get("result") or []
+            messages.extend(sent if isinstance(sent, list) else [sent])
+        return {"ok": True, "result": messages}
+
+    async def _send_album(self, chat_id, media_files, caption=None):
+        """One sendMediaGroup request, files uploaded via attach:// syntax."""
         media_items = []
         files = {}
         for i, (media_type, file_bytes) in enumerate(media_files):

@@ -338,6 +338,104 @@ class HttpErrorReportingTests(unittest.TestCase):
         self.assertIn("413 Request Entity Too Large", log)
 
 
+class AlbumShapeTests(unittest.TestCase):
+    """A media group only exists for 2-10 items — the rest must still post.
+
+    Production failure: an album whose siblings arrived after the debounce was
+    published as a group of one, and Bale answered every attempt with
+    "Bad Request: malformed request" on sendMediaGroup.
+    """
+
+    def setUp(self):
+        self._original = bale_client._post
+        self.calls = []
+
+    def tearDown(self):
+        bale_client._post = self._original
+
+    def _capture(self, results=None):
+        def fake_post(url, data=None, files=None):
+            self.calls.append({"url": url, "data": data, "files": files})
+            if results:
+                return results[len(self.calls) - 1]
+            return {"ok": True, "result": [{"message_id": len(self.calls)}]}
+        bale_client._post = fake_post
+
+    def test_single_photo_is_sent_as_a_photo(self):
+        self._capture()
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(
+            5033953014, [("photo", b"img-bytes")], caption="کپشن"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("sendPhoto", self.calls[0]["url"],
+                      "a group of one is not an album; sendMediaGroup would be refused")
+        self.assertNotIn("sendMediaGroup", self.calls[0]["url"])
+        self.assertEqual(self.calls[0]["data"]["caption"], "کپشن")
+
+    def test_single_video_is_sent_as_a_video(self):
+        self._capture()
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(
+            5033953014, [("video", b"vid-bytes")]))
+
+        self.assertTrue(result["ok"])
+        self.assertIn("sendVideo", self.calls[0]["url"])
+
+    def test_two_items_still_go_out_as_one_album(self):
+        self._capture()
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(
+            5033953014, [("photo", b"a"), ("photo", b"b")], caption="کپشن"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("sendMediaGroup", self.calls[0]["url"])
+        self.assertEqual(len(json.loads(self.calls[0]["data"]["media"])), 2)
+
+    def test_empty_album_is_refused_before_any_request(self):
+        self._capture()
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(5033953014, []))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.calls, [], "an empty album must not hit the API")
+
+    def test_album_longer_than_ten_is_split(self):
+        self._capture()
+        items = [("photo", bytes([i])) for i in range(12)]
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(
+            5033953014, items, caption="کپشن"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.calls), 2, "10 + 2 items, not one 12-item group")
+        first = json.loads(self.calls[0]["data"]["media"])
+        second = json.loads(self.calls[1]["data"]["media"])
+        self.assertEqual((len(first), len(second)), (10, 2))
+        self.assertEqual(first[0]["caption"], "کپشن", "the caption goes on the first item")
+        self.assertNotIn("caption", second[0], "the caption must not be repeated")
+        self.assertEqual(len(result["result"]), 2, "one entry per album that landed")
+
+    def test_failure_after_a_delivered_chunk_is_reported_as_partial(self):
+        self._capture(results=[
+            {"ok": True, "result": [{"message_id": 1}, {"message_id": 2}]},
+            {"ok": False, "error_code": 400, "description": "Bad Request: chat not found"},
+        ])
+        items = [("photo", bytes([i])) for i in range(12)]
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(5033953014, items))
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["partial"],
+                        "a re-send here would duplicate the album already delivered")
+        self.assertIn("already delivered", result["description"])
+        self.assertIn("chat not found", result["description"])
+
+    def test_first_chunk_failure_is_a_plain_failure(self):
+        self._capture(results=[{"ok": False, "description": "Bad Request: group send failed"}])
+        items = [("photo", bytes([i])) for i in range(12)]
+        result = run(bale_client.BaleClient("t", "bale-1").send_media_group(5033953014, items))
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("partial", result, "nothing was delivered, so a retry is safe")
+
+
 class BridgePhpLimitsTests(unittest.TestCase):
     """The PHP relay must not turn a host limit into a mystery 400.
 

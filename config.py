@@ -39,6 +39,12 @@ BALE_API_BASE = os.getenv("BALE_API_BASE") or None
 BALE_BRIDGE_KEY = os.getenv("BALE_BRIDGE_KEY") or None
 # How many Bale channels may be uploaded in parallel during one publish.
 BALE_MAX_CONCURRENT = int(os.getenv("BALE_MAX_CONCURRENT", 3))
+# Quiet period (seconds) before an incoming album is treated as complete.
+# Telegram delivers album items as separate updates, so this is the pause
+# after the last one. Too short and a slow connection pushes the siblings past
+# the window: the bot then publishes the first item alone, and a media group
+# of one is rejected by both Telegram and Bale.
+MEDIA_GROUP_DEBOUNCE_SECONDS = float(os.getenv("MEDIA_GROUP_DEBOUNCE_SECONDS", 2))
 SUDO_USER_ID = int(os.getenv("SUDO_USER_ID", 0))
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", 3306))
