@@ -5,6 +5,11 @@ Delivery attempts alternate between the bots — attempt 1 goes out through
 bot 1, attempt 2 through bot 2, attempt 3 through bot 1, and so on — so a
 rate-limited or blocked bot is swapped for a fresh one on the next try.
 Without BALE_TOKEN_2 every attempt uses the primary bot.
+
+Every failure keeps the reason the API gave: the body of an HTTP 4xx/5xx is
+read back and returned as Bale's own ``ok: false`` payload, so a log line
+(or a delivery row in the health dashboard) says what was actually rejected
+instead of a bare "HTTP Error 400: Bad Request".
 """
 
 import json
@@ -35,6 +40,63 @@ def _is_retryable_network_error(exc: Exception) -> bool:
     return isinstance(exc, (urllib.error.URLError, ConnectionError, TimeoutError))
 
 
+def _upload_note(files) -> str:
+    """Size context for a failed upload, e.g. " [3 file(s), 41.7 MB]".
+
+    An album is one request carrying every file in it, so the size is usually
+    what decides the outcome — and the failure log used to say nothing about
+    what was in the request that Bale (or the bridge host) rejected.
+    """
+    if not files:
+        return ""
+    total = sum(len(blob) for (_name, blob, _ctype) in files.values()
+                if isinstance(blob, (bytes, bytearray)))
+    return f" [{len(files)} file(s), {total / 1048576:.1f} MB]"
+
+
+def _error_result(exc: Exception) -> dict:
+    """Build Bale's ``ok: false`` payload out of whatever HTTP raised.
+
+    urllib turns every 4xx/5xx into an HTTPError and *throws the body away*,
+    so a rejected album, a bridge host that refused the upload and a web
+    server error page all reached the log as the identical, useless
+    "HTTP Error 400: Bad Request". An HTTPError is itself a readable
+    response, so the explanation is read back here:
+
+      - Bale/bridge JSON -> its ``description``/``error_code`` are kept
+        verbatim ("Bad Request: group send failed", "request body ... exceeds
+        this host's post_max_size (8M)"),
+      - an HTML error page from the host -> a trimmed snippet, which is what
+        actually identifies a 413/502 from the web server,
+      - nothing readable -> the exception text, as before.
+    """
+    result = {"ok": False}
+    body = b""
+    if isinstance(exc, urllib.error.HTTPError):
+        result["error_code"] = exc.code
+        try:
+            body = exc.read() or b""
+        except Exception:  # a body that cannot be read is not worth crashing over
+            body = b""
+    text = body.decode("utf-8", "replace").strip()
+    description = None
+    if text:
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            if payload.get("error_code") is not None:
+                result["error_code"] = payload["error_code"]
+            description = payload.get("description") or payload.get("error_message")
+        else:
+            # An HTML error page (host 413/502, cPanel error page, ...) is the
+            # only evidence of what the relay host answered.
+            description = "non-JSON response: " + " ".join(text.split())[:200]
+    result["description"] = description or str(exc)
+    return result
+
+
 def _build_multipart(data=None, files=None) -> tuple:
     """Build a multipart/form-data body. Returns (content_type, body bytes).
 
@@ -63,6 +125,7 @@ def _build_multipart(data=None, files=None) -> tuple:
 
 
 _PROXY_OPENER = None
+_BRIDGE_LOGGED = False
 
 
 def _get_opener():
@@ -96,6 +159,13 @@ def _post_via_bridge(token, method, data=None, files=None):
     """
     from urllib.request import Request
 
+    global _BRIDGE_LOGGED
+    if not _BRIDGE_LOGGED:
+        # Say once which transport is live. An API error read through the
+        # relay can come from Bale *or* from the PHP host in front of it, and
+        # the two are told apart by exactly one line in the log.
+        _BRIDGE_LOGGED = True
+        logger.info("Bale client using Iran-side bridge for tapi.bale.ai: %s", BALE_API_BASE)
     content_type, body = _build_multipart(data=data, files=files)
     req = Request(BALE_API_BASE, data=body, method="POST")
     req.add_header("Content-Type", content_type)
@@ -171,7 +241,17 @@ class BaleClient:
                     )
                     time.sleep(2)
                     continue
-                logger.error("Bale API request failed on %s (%s): %s", method, self.name, e)
+                note = _upload_note(files)
+                if isinstance(e, urllib.error.HTTPError):
+                    result = _error_result(e)
+                    logger.error(
+                        "Bale API request failed on %s (%s): HTTP %s — %s%s",
+                        method, self.name, result.get("error_code"),
+                        result["description"], note,
+                    )
+                    return result
+                logger.error("Bale API request failed on %s (%s): %s%s",
+                             method, self.name, e, note)
                 return {"ok": False, "description": str(e)}
 
     async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
