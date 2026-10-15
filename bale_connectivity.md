@@ -31,8 +31,11 @@ python diagnose_bale.py
 | پل ایران | `BALE_API_BASE=https://SITE.ir/path/bale_bridge.php` + `BALE_BRIDGE_KEY=...` | فایل `bridge/bale_bridge.php` روی هاست ایرانی |
 
 - اگر `BALE_API_BASE` تنظیم باشد، همهٔ درخواست‌ها از پل می‌روند (پروکسی نادیده گرفته می‌شود).
-- اگر **هر دو** تنظیم باشند و هاست پل خودش درخواست را رد کند، همان یک درخواست به‌طور
-  خودکار از مسیر پروکسی دوباره فرستاده می‌شود.
+- اگر هاست پل خودش درخواست را رد کند (همان ۴۰۳ بدون هدر `X-Bridge`)، ربات همان یک درخواست
+  را خودکار از **مسیر دیگر** می‌فرستد: اگر `BALE_PROXY` تنظیم باشد از پروکسی، وگرنه مستقیم به
+  `tapi.bale.ai`. پس پلِ خراب، ارسال را زمین نمی‌گذارد.
+- اگر سرور ربات خودش داخل ایران است (اکثر هاست‌های ایرانی)، اصلاً به پل نیازی نیست: `BALE_API_BASE`
+  را خالی بگذارید. اجرای `python diagnose_bale.py` نشان می‌دهد مسیر مستقیم کار می‌کند یا نه.
 - مسیر فعال را همیشه می‌بینید: در منوی **🩺 سلامت ربات‌ها و کانال‌ها** خط
   «🔀 مسیر ارسال بله: …» نوشته می‌شود.
 
@@ -89,7 +92,14 @@ Bale API request failed on sendPhoto (bale-1): HTTP 403 — refused before the B
 - یک ۴۰۳/۴۲۹ غیر-JSON (فیلتر جلویی) یک بار دوباره تلاش می‌شود، چون این بلاک‌ها موقتی‌اند و
   هیچ رباتی درخواست را ندیده، پس ارسال دوباره باعث پست تکراری نمی‌شود.
 - خط `Bale API attempt 1 failed on …: … — retrying once` یعنی مسیر عوض شده یا درخواست
-  تکرار شده است.
+  تکرار شده است. اگر مسیر دوم هم خطا بدهد، همان لاگ اول (مثلاً مسدودی پل) گزارش می‌شود و
+  در آخر خط `(the fallback route also failed: …)` می‌آید.
+
+```
+Bale API request failed on sendMessage (bale-2): HTTP 403 — the bridge host refused it
+(the relay script never ran): non-JSON response: <!DOCTYPE html> … [server: BitNinja-WafPro]
+(the fallback route also failed: <urlopen error TLS/SSL connection has been closed …>)
+```
 
 ## ۶) اگر خواستید مسیر را عوض کنید
 

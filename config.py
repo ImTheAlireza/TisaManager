@@ -36,11 +36,14 @@ BALE_PROXY = os.getenv("BALE_PROXY") or None
 #   BALE_BRIDGE_KEY=<same secret as BRIDGE_KEY in the PHP file>
 # Leave both unset to connect directly.
 #
-# Setting BALE_PROXY as well buys a second route: if the bridge host refuses a
-# request itself (its web server/WAF answering before the PHP runs — the bot
-# logs it as "the bridge host refused it"), that one request is retried
-# through the proxy instead of into the same block. Diagnose either route with
-# `python diagnose_bale.py` on the bot server (see bale_connectivity.md).
+# If the bridge host refuses a request itself (its web server/WAF answering
+# before the PHP runs — the bot logs it as "the bridge host refused it"), that
+# one request is retried along the other route: through BALE_PROXY when one is
+# configured, otherwise straight to tapi.bale.ai. So a blocked relay does not
+# stop delivery while the bot server can still reach Bale directly, and if the
+# relay is only for safety it needs no manual switch during an outage.
+# Diagnose every route with `python diagnose_bale.py` on the bot server, and
+# see bale_connectivity.md for what each answer means.
 BALE_API_BASE = os.getenv("BALE_API_BASE") or None
 BALE_BRIDGE_KEY = os.getenv("BALE_BRIDGE_KEY") or None
 # How many Bale channels may be uploaded in parallel during one publish.

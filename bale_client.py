@@ -28,9 +28,10 @@ refused in three very different places and the fix differs accordingly:
 
 A 403 that is not Bale's JSON is treated as a front-end block: it is retried
 once (a WAF/rate-limit block is often intermittent, and no bot saw the request
-so a retry cannot duplicate a post), and when the relay host is the one
-refusing while ``BALE_PROXY`` is configured as well, the retry goes out along
-that alternate route instead of into the same block.
+so a retry cannot duplicate a post). When the relay host is the one refusing,
+that retry does not go back into the same block: it goes out along the other
+route — through ``BALE_PROXY`` if one is configured, otherwise straight to the
+API, so a blocked relay does not take Bale delivery down with it.
 """
 
 import json
@@ -194,17 +195,22 @@ def _plan_retry(exc: Exception, body, via_bridge: bool, used_fallback: bool):
 
     Three failures are worth one more request:
 
-    * the relay host refused it (its page, its WAF) while ``BALE_PROXY`` is
-      configured as well — the alternate route is tried, because re-sending
-      into the same block only wastes an attempt,
+    * the relay host refused it (its page, its WAF): the request goes out the
+      other way instead — through the proxy when one is configured, otherwise
+      straight to the API. Re-sending into the same block only wastes an
+      attempt, and this is a real arrangement: a shared host whose BitNinja /
+      ModSecurity rule blocks the POST while the bot server itself can still
+      reach tapi.bale.ai directly,
     * a 403/429 from a front-end filter in any other arrangement,
     * a connect/write failure, where the request never left in full.
     """
     code = exc.code if isinstance(exc, urllib.error.HTTPError) else None
-    if (via_bridge and not used_fallback and BALE_PROXY
+    if (via_bridge and not used_fallback
             and _failure_origin(exc, body, via_bridge) == "bridge-host"):
-        return ("the bridge host refused it — retrying through the configured proxy",
-                True)
+        if BALE_PROXY:
+            return ("the bridge host refused it — retrying through the configured proxy",
+                    True)
+        return ("the bridge host refused it — retrying directly against the API", True)
     if _is_front_end_block(code, body):
         return (f"HTTP {code} from a front-end filter, so no bot saw the request",
                 used_fallback)
@@ -408,6 +414,7 @@ class BaleClient:
         # which case the retry goes out through that proxy instead of back into
         # the same block (see _plan_retry).
         used_fallback = False
+        first_failure = None
         for attempt in (1, 2):
             use_bridge = via_bridge and not used_fallback
             try:
@@ -427,6 +434,7 @@ class BaleClient:
                 # would be empty if read again later.
                 body = _read_body(e)
                 if attempt == 1:
+                    first_failure = (e, body)
                     reason, used_fallback = _plan_retry(e, body, use_bridge, used_fallback)
                     if reason:
                         logger.warning(
@@ -435,18 +443,30 @@ class BaleClient:
                         )
                         time.sleep(2)
                         continue
-                note = _upload_note(files)
-                if isinstance(e, urllib.error.HTTPError):
-                    result = _error_result(e, via_bridge=use_bridge, body=body)
+                report_exc, report_body, report_bridge = e, body, use_bridge
+                extra = ""
+                if attempt == 2 and used_fallback and first_failure is not None:
+                    # Both routes failed. Lead with the first refusal — that is
+                    # the one that explains the outage — and append what the
+                    # fallback route answered, so one log line tells the whole
+                    # story.
+                    report_exc, report_body = first_failure
+                    report_bridge = via_bridge
+                    second = _error_result(e, via_bridge=use_bridge, body=body)
+                    extra = f" (the fallback route also failed: {second['description'][:120]})"
+                note = _upload_note(files) + extra
+                if isinstance(report_exc, urllib.error.HTTPError):
+                    result = _error_result(report_exc, via_bridge=report_bridge,
+                                           body=report_body)
                     logger.error(
                         "Bale API request failed on %s (%s): HTTP %s — %s%s%s",
                         method, self.name, result.get("error_code"),
-                        result["description"], _server_note(e), note,
+                        result["description"], _server_note(report_exc), note,
                     )
                     return result
-                logger.error("Bale API request failed on %s (%s): %s%s",
-                             method, self.name, e, note)
-                return {"ok": False, "description": str(e)}
+                logger.error("Bale API request failed on %s (%s): %s%s%s",
+                             method, self.name, report_exc, _server_note(report_exc), note)
+                return {"ok": False, "description": f"{report_exc}{extra}"}
 
     async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
         data = {"chat_id": chat_id, "text": text}

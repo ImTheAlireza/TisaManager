@@ -204,8 +204,11 @@ def classify(probe_result, expected_forbidden=False):
         return "❌", ("آدرس پل به‌جای پاسخ اسکریپت، یک صفحهٔ HTML برگرداند"
                       f" — {body_text(probe_result, 80)}"), "bridge-host"
     if probe_result["via_bridge"] and not bridge_ran:
+        server = header(probe_result, "Server") or ""
+        who = f" ({server})" if server else ""
+        advice = "waf" if "bitninja" in server.lower() else "bridge-host"
         return "❌", (f"هاست پل، درخواست را قبل از اجرای اسکریپت رد کرد "
-                      f"(HTTP {status}، بدون هدر X-Bridge)"), "bridge-host"
+                      f"(HTTP {status}، بدون هدر X-Bridge){who}"), advice
     if probe_result["via_bridge"]:
         return "❌", (f"اسکریپت پل اجرا شد ولی بله صفحهٔ HTML برگرداند "
                       f"(HTTP {status}) — یعنی لبهٔ بله این IP را رد میکند"), "bale-edge"
@@ -281,7 +284,17 @@ ADVICE = {
         "۲. آدرس پل را در مرورگر (داخل ایران) باز کنید: باید JSON «forbidden» ببینید؛ اگر صفحهٔ ۴۰۳ دیدید،",
         "   هاست/WAF مسیر را بسته است — در cPanel → Metrics → Errors و ModSecurity Tools دنبال دلیلش بگردید.",
         "۳. اگر اکانت/سهمیهٔ هاست پر شده یا سایت معلق شده، محدودیت را بردارید یا پل را به هاست دیگری ببرید.",
-        "۴. تا رفع مشکل: اگر پروکسی/مسیر جایگزین دارید، BALE_API_BASE را موقتاً خالی کنید (یا BALE_PROXY بگذارید).",
+        "۴. ربات خودش اگر مسیر جایگزین سالم باشد همان را امتحان می‌کند، ولی برای اینکه هر ارسال یک",
+        "   تلاش تلف‌شده نداشته باشد: اگر مسیر مستقیم بالا سبز است، BALE_API_BASE را در .env خالی کنید",
+        "   (سرور داخل ایران معمولاً به پل نیازی ندارد) و ربات را ری‌استارت کنید. پروکسی هم مسیر جایگزین است.",
+    ],
+    "waf": [
+        "این همان صفحهٔ WAF هاست است (از هدر Server تشخیص داده شد) — نه بله، نه اسکریپت پل.",
+        "پس PHP اجرا نشده و فایل پل سالم است؛ فقط فایروال/مودسکیوریتی مسیر POST را بسته است.",
+        "در پنل هاست: BitNinja → WAF / False Positive (یا cPanel → ModSecurity Tools) مسیر",
+        "«/x7fp9/bale_bridge.php» را whitelist کنید و برای آن False Positive ثبت کنید.",
+        "تا آن موقع لازم نیست چیزی را عوض کنید: ربات خودش همین درخواست را از مسیر دیگر می‌فرستد",
+        "(اگر مسیر مستقیم بالا سبز است، یا BALE_API_BASE را خالی کنید یا بگذارید fallback کارش را بکند).",
     ],
     "bale-edge": [
         "اسکریپت پل اجرا میشود ولی خود بله پاسخ HTML میدهد — یعنی IP این مسیر را رد/محدود کرده است.",
@@ -315,9 +328,21 @@ def print_summary(advices):
         print()
         return 0
     if REACHED_API:
+        # A blocked relay while the direct route works is the common shape of
+        # this outage, so it gets a one-line fix instead of the generic note.
+        direct_fix = (("bridge-host" in advices or "waf" in advices)
+                      and any("مستقیم" in title for title in WORKING_ROUTES))
+        if direct_fix:
+            print("   💡 هاست پل بسته است ولی «مسیر مستقیم» از سرور خودتان کار می‌کند —")
+            print("      پس BALE_API_BASE و BALE_BRIDGE_KEY را در .env خالی/کامنت کنید"
+                  " و ربات را ری‌استارت کنید.")
         print(f"   ✅ مسیرهای سالم: {', '.join(WORKING_ROUTES)}")
-        print("   ⚠️ بقیهٔ مسیرها خطا می‌دهند — تا وقتی مسیر اصلی درست شود،"
-              " می‌توانید همان مسیر سالم را در .env تنظیم کنید و ربات را ری‌استارت کنید.")
+        if direct_fix:
+            print("   (اگر همین‌طور بماند هم ربات خودش از مسیر مستقیم ارسال می‌کند،"
+                  " ولی هر ارسال یک تلاش تلف‌شده به پل دارد.)")
+        else:
+            print("   ⚠️ بقیهٔ مسیرها خطا می‌دهند — تا وقتی مسیر اصلی درست شود،"
+                  " می‌توانید همان مسیر سالم را در .env تنظیم کنید و ربات را ری‌استارت کنید.")
     else:
         print("   ❌ هیچ مسیری به بله نرسید: هیچ پاسخی با ok=true از بله نیامد.")
         if PHP_RAN:
@@ -327,7 +352,7 @@ def print_summary(advices):
     # The generic network note only earns space when nothing more specific was
     # found: a probe that reached a web server and got a 403 is not a network
     # problem, even though the *other* route timed out.
-    order = [key for key in ("bridge-host", "bale-edge", "key", "bale") if key in advices]
+    order = [key for key in ("waf", "bridge-host", "bale-edge", "key", "bale") if key in advices]
     if not order and "network" in advices and not REACHED_API:
         order = ["network"]
     for key in order:

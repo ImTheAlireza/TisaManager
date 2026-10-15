@@ -585,10 +585,21 @@ class IntermediaryFailureTests(unittest.TestCase):
         result, calls, _ = self._send_with(_http_error(400, self.HTML_403))
         self.assertEqual(calls["post"], 1)
 
-    def test_relay_host_block_without_a_proxy_retries_the_same_route(self):
-        result, calls, _ = self._send_with(_http_error(403, self.HTML_403), bridge=True)
-        self.assertEqual(calls["bridge"], 2)
-        self.assertEqual(calls["post"], 0, "no other route is configured")
+    def test_relay_host_block_without_a_proxy_falls_back_to_the_direct_route(self):
+        """The deployed case: a WAF rule on the relay host, tapi.bale.ai fine.
+
+        BitNinja/ModSecurity on the shared host blocked every POST to the
+        bridge while the bot server reached the API directly. Without a
+        fallback the bot stayed down for a day; the alternate route needs no
+        configuration to be tried.
+        """
+        result, calls, log = self._send_with(_http_error(403, self.HTML_403),
+                                             bridge=True, post_succeeds=True)
+
+        self.assertEqual(calls["bridge"], 1, "do not re-send into the same block")
+        self.assertEqual(calls["post"], 1, "the direct route is tried instead")
+        self.assertTrue(result["ok"], "the fallback route delivered the message")
+        self.assertIn("retrying directly against the API", log)
 
     def test_relay_host_block_with_a_proxy_switches_route(self):
         result, calls, log = self._send_with(_http_error(403, self.HTML_403),
@@ -606,14 +617,24 @@ class IntermediaryFailureTests(unittest.TestCase):
         return error
 
     def test_relay_host_block_is_logged_with_the_layer_and_the_server(self):
+        """When the fallback fails too, the reported failure is the relay's.
+
+        That is the one an operator can act on: the address of the blocking
+        layer, the web server that answered it, and what the other route said.
+        """
+        import urllib.error
+
         originals = (bale_client.BALE_API_BASE, bale_client._post_via_bridge,
-                     bale_client.time.sleep)
+                     bale_client._post, bale_client.time.sleep)
         bale_client.BALE_API_BASE = "https://site.example/bale_bridge.php"
 
         def via_bridge(*a, **k):
             raise self._relay_page()
 
-        bale_client._post_via_bridge = via_bridge
+        def direct(*a, **k):
+            raise urllib.error.URLError("no route to tapi.bale.ai")
+
+        bale_client._post_via_bridge, bale_client._post = via_bridge, direct
         bale_client.time.sleep = lambda s: None
         try:
             with self.assertLogs("bale_client", level="ERROR") as logs:
@@ -621,7 +642,7 @@ class IntermediaryFailureTests(unittest.TestCase):
                     5, [("photo", b"x"), ("photo", b"y")], caption="کپشن"))
         finally:
             (bale_client.BALE_API_BASE, bale_client._post_via_bridge,
-             bale_client.time.sleep) = originals
+             bale_client._post, bale_client.time.sleep) = originals
         log = "\n".join(logs.output)
 
         self.assertFalse(outcome["ok"])
@@ -629,6 +650,8 @@ class IntermediaryFailureTests(unittest.TestCase):
         self.assertIn("bridge host refused it", log)
         self.assertIn("server: LiteSpeed", log,
                       "the web server that blocked the request belongs in the log")
+        self.assertIn("the fallback route also failed", log)
+        self.assertIn("no route to tapi.bale.ai", log)
 
 
 class TransportDescriptionTests(unittest.TestCase):
