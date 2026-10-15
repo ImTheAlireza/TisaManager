@@ -165,13 +165,29 @@ class HealthTextTests(unittest.TestCase):
         dashboard is where the operator looks first — not .env.
         """
         transport = {"route": "bridge", "fa": "پل ایران (bridge)",
+                     "active_fa": "پل ایران (bridge)",
                      "detail": "https://site.example/fp9x2/bale_bridge.php",
-                     "fallback_fa": "پروکسی"}
+                     "bridge_host": "site.example",
+                     "fallback_fa": "پروکسی", "paused": False}
 
         text = admin._health_text(self._rows(), None, backup_configured=True, transport=transport)
 
         self.assertIn("مسیر ارسال بله: پل ایران (bridge)", text)
-        self.assertIn("مسیر پشتیبان: پروکسی", text)
+        self.assertIn("مسیر جایگزین: پروکسی", text)
+        self.assertIn("هاست پل: <code>site.example</code>", text)
+
+    def test_a_paused_relay_is_shown_as_skipped(self):
+        """The relay that is blocking us must not look like the active route."""
+        transport = {"route": "bridge", "fa": "پل ایران (bridge)",
+                     "active_fa": "مستقیم",
+                     "detail": "https://site.example/fp9x2/bale_bridge.php",
+                     "bridge_host": "site.example",
+                     "fallback_fa": "پل ایران (bridge)", "paused": True}
+
+        text = admin._health_text(self._rows(), None, backup_configured=True, transport=transport)
+
+        self.assertIn("مسیر ارسال بله: مستقیم", text)
+        self.assertIn("پل موقتاً کنار گذاشته شده", text)
         self.assertIn("هاست پل: <code>site.example</code>", text)
 
     def test_no_transport_line_without_bale(self):

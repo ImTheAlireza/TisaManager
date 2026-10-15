@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from urllib.parse import urlsplit
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -193,13 +192,16 @@ def _health_text(rows: list, bot_health: dict | None, backup_configured: bool,
     if transport:
         # Which route is in use, and where it points: an outage is usually
         # diagnosed down to one relay host, and this saves opening .env.
-        line = f"🔀 مسیر ارسال بله: {html_text(transport.get('fa', ''))}"
+        line = f"🔀 مسیر ارسال بله: {html_text(transport.get('active_fa', transport.get('fa', '')))}"
         if transport.get("fallback_fa"):
-            line += f" (مسیر پشتیبان: {html_text(transport['fallback_fa'])})"
+            line += f" (مسیر جایگزین: {html_text(transport['fallback_fa'])})"
         lines.append(line)
-        host = urlsplit(transport.get("detail") or "").netloc
-        if transport.get("route") == "bridge" and host:
-            lines.append(f"🏠 هاست پل: <code>{html_text(host)}</code>")
+        if transport.get("bridge_host"):
+            lines.append(f"🏠 هاست پل: <code>{html_text(transport['bridge_host'])}</code>")
+        if transport.get("paused"):
+            # The configured route is skipping itself after refusing requests;
+            # say so, or "why is the relay not being used?" is the next question.
+            lines.append("⏸️ پل موقتاً کنار گذاشته شده (خودش درخواست‌ها را رد می‌کند) — پس از چند دقیقه خودبه‌خود دوباره امتحان می‌شود.")
     lines.append("")
 
     # --- Channels -----------------------------------------------------------

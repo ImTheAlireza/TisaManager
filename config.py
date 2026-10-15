@@ -48,6 +48,14 @@ BALE_API_BASE = os.getenv("BALE_API_BASE") or None
 BALE_BRIDGE_KEY = os.getenv("BALE_BRIDGE_KEY") or None
 # How many Bale channels may be uploaded in parallel during one publish.
 BALE_MAX_CONCURRENT = int(os.getenv("BALE_MAX_CONCURRENT", 3))
+
+# How long a route that is refusing requests (a blocked relay host, a refused
+# connection) is skipped before it is tried again, in seconds. The other route
+# carries the calls in the meantime, and when the cooldown is over the paused
+# route gets the next attempt: if it answers, it is back in charge
+# automatically — the relay stays the primary route and needs no manual
+# switch. Set to 0 to disable (a blocked route is then always tried first).
+BALE_ROUTE_COOLDOWN_SECONDS = int(os.getenv("BALE_ROUTE_COOLDOWN_SECONDS", 600))
 # Quiet period (seconds) before an incoming album is treated as complete.
 # Telegram delivers album items as separate updates, so this is the pause
 # after the last one. Too short and a slow connection pushes the siblings past

@@ -37,12 +37,15 @@ API, so a blocked relay does not take Bale delivery down with it.
 import json
 import logging
 import asyncio
+import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 from config import (BALE_TOKEN, BALE_TOKEN_2, BALE_TIMEOUT, BALE_UPLOAD_TIMEOUT,
-                    BALE_PROXY, BALE_API_BASE, BALE_BRIDGE_KEY)
+                    BALE_PROXY, BALE_API_BASE, BALE_BRIDGE_KEY,
+                    BALE_ROUTE_COOLDOWN_SECONDS)
 
 logger = logging.getLogger(__name__)
 
@@ -186,38 +189,29 @@ def _is_front_end_block(code, body) -> bool:
     return not _body_is_json(body)
 
 
-def _plan_retry(exc: Exception, body, via_bridge: bool, used_fallback: bool):
-    """Should a failed first attempt be repeated, and along which route?
+def _plan_retry(exc: Exception, body, via_bridge: bool):
+    """Why another request is worth making — or None when it is not.
 
-    Returns ``(reason, used_fallback)``. ``reason`` is None when another
-    request would only repeat the same answer — the caller then reports the
-    failure instead of burning a second attempt.
+    None means the next request would only get the same answer (Bale rejected
+    the request itself, or a read timeout that may already have delivered it),
+    so the caller reports the failure instead of burning another attempt.
 
     Three failures are worth one more request:
 
-    * the relay host refused it (its page, its WAF): the request goes out the
-      other way instead — through the proxy when one is configured, otherwise
-      straight to the API. Re-sending into the same block only wastes an
-      attempt, and this is a real arrangement: a shared host whose BitNinja /
-      ModSecurity rule blocks the POST while the bot server itself can still
-      reach tapi.bale.ai directly,
-    * a 403/429 from a front-end filter in any other arrangement,
+    * the relay host refused it (its page, its WAF) — a real arrangement: a
+      shared host whose BitNinja / ModSecurity rule blocks the POST while the
+      bot server itself can still reach tapi.bale.ai directly,
+    * a 403/429 from a front-end filter, which is often intermittent,
     * a connect/write failure, where the request never left in full.
     """
     code = exc.code if isinstance(exc, urllib.error.HTTPError) else None
-    if (via_bridge and not used_fallback
-            and _failure_origin(exc, body, via_bridge) == "bridge-host"):
-        if BALE_PROXY:
-            return ("the bridge host refused it — retrying through the configured proxy",
-                    True)
-        return ("the bridge host refused it — retrying directly against the API", True)
+    if via_bridge and _failure_origin(exc, body, via_bridge) == "bridge-host":
+        return "the bridge host refused it"
     if _is_front_end_block(code, body):
-        return (f"HTTP {code} from a front-end filter, so no bot saw the request",
-                used_fallback)
+        return f"HTTP {code} from a front-end filter, so no bot saw the request"
     if _is_retryable_network_error(exc):
-        return ("transient network failure — the request never left in full",
-                used_fallback)
-    return (None, used_fallback)
+        return "transient network failure — the request never left in full"
+    return None
 
 
 def _error_result(exc: Exception, via_bridge: bool = False, body=None) -> dict:
@@ -318,6 +312,79 @@ _PROXY_OPENER = None
 _BRIDGE_LOGGED = False
 
 
+# --- Route state ------------------------------------------------------------
+# A Bale call has up to two routes: the Iran-side bridge, and the direct (or
+# proxied) connection. One can be blocked while the other works — the deployed
+# case was a BitNinja WAF answering every POST to the relay host with a 403
+# page while tapi.bale.ai answered the bot server normally — and the bridge
+# exists because the direct route was *not* always usable before. So the two
+# are not alternatives to pick between: whichever answers is used.
+#
+# What a refusal costs, though, is one failed attempt per call. To avoid
+# paying that on every single post, a route that answers with a block is
+# skipped for BALE_ROUTE_COOLDOWN_SECONDS and the other route carries the
+# calls. After the cooldown the paused route is tried again, so a fixed bridge
+# takes over again on its own — no .env edit and no restart.
+_route_lock = threading.Lock()
+_route_paused_until: dict = {}
+
+# Route names as they appear in log lines and in the health dashboard.
+ROUTE_LABELS = {"bridge": "bridge", "direct": "direct/proxy"}
+
+
+def _pause_route(route: str, reason: str, other_route_exists: bool = True) -> None:
+    """Skip ``route`` for the cooldown: it is refusing requests, not the calls."""
+    if BALE_ROUTE_COOLDOWN_SECONDS <= 0:
+        return
+    now = time.monotonic()
+    with _route_lock:
+        already = _route_paused_until.get(route, 0.0) > now
+        _route_paused_until[route] = now + BALE_ROUTE_COOLDOWN_SECONDS
+    if already:
+        return
+    minutes = max(1, BALE_ROUTE_COOLDOWN_SECONDS // 60)
+    logger.warning(
+        "Bale route '%s' is refusing requests (%s) — %s for the next %d minute(s)",
+        route, reason,
+        "using the other route" if other_route_exists else "still retrying it",
+        minutes,
+    )
+
+
+def _resume_route(route: str) -> None:
+    """Note that a route answered; it is back to normal if it had been paused."""
+    with _route_lock:
+        was_paused = _route_paused_until.pop(route, None) is not None
+    if was_paused:
+        logger.info("Bale route '%s' answered again — back to normal", route)
+
+
+def _route_paused(route: str) -> bool:
+    with _route_lock:
+        until = _route_paused_until.get(route)
+    return until is not None and time.monotonic() < until
+
+
+def reset_route_state() -> None:
+    """Forget every route pause (used by tests and by the doctor script)."""
+    with _route_lock:
+        _route_paused_until.clear()
+
+
+def _route_order(via_bridge: bool) -> list:
+    """The routes to try, in order, for the current configuration.
+
+    The configured route goes first. A paused route goes *last* rather than
+    being dropped: if the direct connection is the thing that is broken — the
+    reason the bridge was set up — the relay is still worth one attempt.
+    """
+    if not via_bridge:
+        return ["direct"]
+    if _route_paused("bridge") and not _route_paused("direct"):
+        return ["direct", "bridge"]
+    return ["bridge", "direct"]
+
+
 def _get_opener():
     """The urllib opener for Bale API calls, with the proxy applied if set.
 
@@ -405,68 +472,89 @@ class BaleClient:
         """Run the legacy urllib client without blocking the bot event loop."""
         return await asyncio.to_thread(self._request, method, data, files)
 
+    def _call(self, route, method, url, data=None, files=None):
+        """One API call along one route."""
+        if route == "bridge":
+            return _post_via_bridge(self.token, method, data, files)
+        return _post(url, data=data, files=files)
+
+    def _report_failure(self, method, failures, files):
+        """Log and return the failure that explains the outage.
+
+        With two routes configured, both answers matter and one log line
+        carries both: the first is what the configured route said (usually the
+        actionable one — the WAF page and the host that sent it), and the
+        rest is what the alternative answered when it was tried.
+        """
+        route, exc, body = failures[0]
+        extra = ""
+        if len(failures) > 1 and failures[-1][0] != route:
+            last_route, last_exc, last_body = failures[-1]
+            second = _error_result(last_exc, via_bridge=last_route == "bridge",
+                                   body=last_body)
+            extra = (f" (the {ROUTE_LABELS[last_route]} route also failed: "
+                     f"{second['description'][:120]})")
+        note = _upload_note(files) + extra
+        if isinstance(exc, urllib.error.HTTPError):
+            result = _error_result(exc, via_bridge=route == "bridge", body=body)
+            logger.error(
+                "Bale API request failed on %s (%s): HTTP %s — %s%s%s",
+                method, self.name, result.get("error_code"),
+                result["description"], _server_note(exc), note,
+            )
+            return result
+        logger.error("Bale API request failed on %s (%s): %s%s%s",
+                     method, self.name, exc, _server_note(exc), note)
+        return {"ok": False, "description": f"{exc}{extra}"}
+
     def _request(self, method, data=None, files=None):
+        """Run one API call, trying each configured route until one answers.
+
+        Routes are tried in the order ``_route_order`` returns (the configured
+        one first, a route that is in its cooldown last). A route with another
+        route behind it gets a single attempt: the next attempt is better spent
+        on the other route than on the same block. The last route is also the
+        one with nowhere else to go, so it gets one retry — a front-end block
+        or a reset line is often momentary.
+        """
         url = f"{self.base_url}/{method}"
-        via_bridge = bool(BALE_API_BASE)
-        # One automatic retry for failures a second request can still fix:
-        # a connect/write timeout, a front-end 403/429 — or a relay host that
-        # refused the request while a proxy route is configured as well, in
-        # which case the retry goes out through that proxy instead of back into
-        # the same block (see _plan_retry).
-        used_fallback = False
-        first_failure = None
-        for attempt in (1, 2):
-            use_bridge = via_bridge and not used_fallback
-            try:
-                if use_bridge:
-                    # Iran-side bridge mode: the relay happens on the bridge
-                    # host, so BALE_PROXY would only double-hop needlessly.
-                    result = _post_via_bridge(self.token, method, data, files)
-                else:
-                    result = _post(url, data=data, files=files)
+        routes = _route_order(bool(BALE_API_BASE))
+        failures = []          # (route, exc, body) in the order they happened
+        for route in routes:
+            other_route = route != routes[-1]
+            attempts_left = 2 if not other_route else 1
+            while attempts_left:
+                attempts_left -= 1
+                try:
+                    result = self._call(route, method, url, data, files)
+                except Exception as e:
+                    # Read the body now: it is needed to classify the failure
+                    # and would be empty if read again later.
+                    body = _read_body(e)
+                    failures.append((route, e, body))
+                    reason = _plan_retry(e, body, route == "bridge")
+                    if reason:
+                        _pause_route(route, reason, other_route_exists=other_route)
+                    if not reason or not (attempts_left or other_route):
+                        return self._report_failure(method, failures, files)
+                    if attempts_left:
+                        follow_up = "retrying the same route once"
+                    else:
+                        follow_up = ("trying the other route (%s)"
+                                     % ROUTE_LABELS[routes[routes.index(route) + 1]])
+                    logger.warning(
+                        "Bale API attempt failed on %s (%s): %s — %s",
+                        method, self.name, reason, follow_up,
+                    )
+                    time.sleep(2)
+                    continue
+                _resume_route(route)
                 if not result.get("ok"):
                     logger.error("Bale API error on %s (%s): %s", method, self.name, result)
                 else:
                     logger.info("Bale API success on %s (%s)", method, self.name)
                 return result
-            except Exception as e:
-                # Read the body now: it is needed to classify the failure and
-                # would be empty if read again later.
-                body = _read_body(e)
-                if attempt == 1:
-                    first_failure = (e, body)
-                    reason, used_fallback = _plan_retry(e, body, use_bridge, used_fallback)
-                    if reason:
-                        logger.warning(
-                            "Bale API attempt 1 failed on %s (%s): %s — retrying once",
-                            method, self.name, reason,
-                        )
-                        time.sleep(2)
-                        continue
-                report_exc, report_body, report_bridge = e, body, use_bridge
-                extra = ""
-                if attempt == 2 and used_fallback and first_failure is not None:
-                    # Both routes failed. Lead with the first refusal — that is
-                    # the one that explains the outage — and append what the
-                    # fallback route answered, so one log line tells the whole
-                    # story.
-                    report_exc, report_body = first_failure
-                    report_bridge = via_bridge
-                    second = _error_result(e, via_bridge=use_bridge, body=body)
-                    extra = f" (the fallback route also failed: {second['description'][:120]})"
-                note = _upload_note(files) + extra
-                if isinstance(report_exc, urllib.error.HTTPError):
-                    result = _error_result(report_exc, via_bridge=report_bridge,
-                                           body=report_body)
-                    logger.error(
-                        "Bale API request failed on %s (%s): HTTP %s — %s%s%s",
-                        method, self.name, result.get("error_code"),
-                        result["description"], _server_note(report_exc), note,
-                    )
-                    return result
-                logger.error("Bale API request failed on %s (%s): %s%s%s",
-                             method, self.name, report_exc, _server_note(report_exc), note)
-                return {"ok": False, "description": f"{report_exc}{extra}"}
+        return self._report_failure(method, failures, files)
 
     async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
         data = {"chat_id": chat_id, "text": text}
@@ -633,21 +721,33 @@ def _mask_credentials(url: str) -> str:
 
 
 def describe_transport() -> dict:
-    """Which route Bale calls take right now.
+    """Which route Bale calls take right now, and what they fall back to.
 
     Used by the health dashboard and by ``diagnose_bale.py``: during an outage
     the first question is always "which path is actually in use", and the
-    answer is a file that lives outside the repo (.env).
+    answer is a file that lives outside the repo (.env). ``paused`` says
+    whether the configured route is currently being skipped after refusing
+    requests (see _pause_route).
     """
+    direct_fa = "پروکسی" if BALE_PROXY else "مستقیم"
     if BALE_API_BASE:
-        return {"route": "bridge", "fa": "پل ایران (bridge)",
-                "detail": BALE_API_BASE,
-                "fallback_fa": "پروکسی" if BALE_PROXY else None}
+        paused = _route_paused("bridge")
+        return {
+            "route": "bridge",
+            "fa": "پل ایران (bridge)",
+            "active_fa": direct_fa if paused else "پل ایران (bridge)",
+            "detail": BALE_API_BASE,
+            "bridge_host": urlsplit(BALE_API_BASE).netloc,
+            "fallback_fa": "پل ایران (bridge)" if paused else direct_fa,
+            "paused": paused,
+        }
     if BALE_PROXY:
-        return {"route": "proxy", "fa": "پروکسی",
-                "detail": _mask_credentials(BALE_PROXY), "fallback_fa": None}
-    return {"route": "direct", "fa": "مستقیم", "detail": "tapi.bale.ai",
-            "fallback_fa": None}
+        return {"route": "proxy", "fa": "پروکسی", "active_fa": "پروکسی",
+                "detail": _mask_credentials(BALE_PROXY), "bridge_host": None,
+                "fallback_fa": None, "paused": False}
+    return {"route": "direct", "fa": "مستقیم", "active_fa": "مستقیم",
+            "detail": "tapi.bale.ai", "bridge_host": None,
+            "fallback_fa": None, "paused": False}
 
 
 # --- Backwards-compatible module-level API (primary bot) --------------------

@@ -34,8 +34,15 @@ python diagnose_bale.py
 - اگر هاست پل خودش درخواست را رد کند (همان ۴۰۳ بدون هدر `X-Bridge`)، ربات همان یک درخواست
   را خودکار از **مسیر دیگر** می‌فرستد: اگر `BALE_PROXY` تنظیم باشد از پروکسی، وگرنه مستقیم به
   `tapi.bale.ai`. پس پلِ خراب، ارسال را زمین نمی‌گذارد.
-- اگر سرور ربات خودش داخل ایران است (اکثر هاست‌های ایرانی)، اصلاً به پل نیازی نیست: `BALE_API_BASE`
-  را خالی بگذارید. اجرای `python diagnose_bale.py` نشان می‌دهد مسیر مستقیم کار می‌کند یا نه.
+- مسیری که درخواست‌ها را رد می‌کند، بعد از آن **۱۰ دقیقه کنار گذاشته می‌شود** تا هر ارسال یک
+  تلاش تلف‌شده نداشته باشد؛ بعد از آن باز خودش اول صف می‌شود. یعنی اگر پل درست شود، خودش
+  دوباره مسیر اصلی می‌شود — نیازی به تغییر `.env` یا ری‌استارت نیست. (مدتش با
+  `BALE_ROUTE_COOLDOWN_SECONDS` در `.env` قابل تنظیم است؛ `0` این رفتار را خاموش می‌کند.)
+- تا وقتی مسیر در حالت استراحت است، در **🩺 سلامت ربات‌ها و کانال‌ها** می‌بینید:
+  «🔀 مسیر ارسال بله: مستقیم (مسیر جایگزین: پل ایران)» + خط ⏸️.
+- اگر سرور ربات خودش داخل ایران است (اکثر هاست‌های ایرانی)، به پل نیازی ندارید: `BALE_API_BASE`
+  را خالی بگذارید. اجرای `python diagnose_bale.py` نشان می‌دهد مسیر مستقیم کار می‌کند یا نه —
+  ولی اگر پل را نگه دارید هم مشکلی نیست: مسیر سالم خودش انتخاب می‌شود.
 - مسیر فعال را همیشه می‌بینید: در منوی **🩺 سلامت ربات‌ها و کانال‌ها** خط
   «🔀 مسیر ارسال بله: …» نوشته می‌شود.
 
@@ -98,7 +105,14 @@ Bale API request failed on sendPhoto (bale-1): HTTP 403 — refused before the B
 ```
 Bale API request failed on sendMessage (bale-2): HTTP 403 — the bridge host refused it
 (the relay script never ran): non-JSON response: <!DOCTYPE html> … [server: BitNinja-WafPro]
-(the fallback route also failed: <urlopen error TLS/SSL connection has been closed …>)
+(the direct/proxy route also failed: <urlopen error TLS/SSL connection has been closed …>)
+```
+
+و وقتی یک مسیر کنار گذاشته می‌شود:
+
+```
+Bale route 'bridge' is refusing requests (the bridge host refused it) — using the other route for the next 10 minute(s)
+Bale route 'bridge' answered again — back to normal
 ```
 
 ## ۶) اگر خواستید مسیر را عوض کنید
@@ -111,6 +125,10 @@ Bale API request failed on sendMessage (bale-2): HTTP 403 — the bridge host re
 # سپس ربات را ری‌استارت کنید و دوباره اجرا کنید:
 python diagnose_bale.py
 ```
+
+**لازم نیست** مسیر را دستی عوض کنید: ربات مسیر سالم را خودش انتخاب می‌کند و مسیر خراب را
+موقتاً کنار می‌گذارد. عوض‌کردن `.env` فقط وقتی لازم است که بخواهید مسیر اصلی را عوض کنید یا
+یک تلاش تلف‌شدهٔ اولیه هم نداشته باشید.
 
 بعد از هر تغییر، یک پست آزمایشی به یک کانال بله بفرستید و در
 **🩺 سلامت ربات‌ها و کانال‌ها** نتیجهٔ `getMe` و خط مسیر ارسال را ببینید.
