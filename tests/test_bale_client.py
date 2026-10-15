@@ -486,5 +486,188 @@ class BridgePhpLimitsTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
+class IntermediaryFailureTests(unittest.TestCase):
+    """A 403 that is not Bale's JSON must name the layer that sent it.
+
+    Production failure: every attempt, on both relay bots, came back as
+    "HTTP 403 — non-JSON response: <!DOCTYPE html> ... <title>403 Forbidden
+    </title>" for a whole day. Nothing in the log said whether the relay host
+    had blocked the bot, Bale had blocked the relay's IP, or the token was
+    dead — three different fixes behind one line.
+    """
+
+    HTML_403 = (b'<!DOCTYPE html><html style="height:100%"><head>'
+                b"<title>403 Forbidden</title></head><body>no</body></html>")
+    BALE_JSON_403 = (b'{"ok": false, "error_code": 403, '
+                     b'"description": "Forbidden: bot was blocked by the user"}')
+
+    def test_relay_host_page_is_named_as_the_relay_host(self):
+        result = bale_client._error_result(_http_error(403, self.HTML_403),
+                                           via_bridge=True)
+
+        self.assertEqual(result["origin"], "bridge-host",
+                         "without the bridge's own header the script never ran")
+        self.assertIn("bridge host refused it", result["description"])
+        self.assertIn("403 Forbidden", result["description"])
+
+    def test_bridge_header_means_the_relay_script_did_forward_it(self):
+        error = _http_error(403, self.HTML_403)
+        error.headers["X-Bridge"] = "bale-bridge/1"   # the script's own stamp
+
+        result = bale_client._error_result(error, via_bridge=True)
+
+        self.assertEqual(result["origin"], "edge",
+                         "PHP ran, so this page came from a layer beyond it")
+        self.assertIn("edge/front-end layer", result["description"])
+
+    def test_bale_json_is_kept_verbatim_and_not_blamed_on_the_host(self):
+        result = bale_client._error_result(_http_error(403, self.BALE_JSON_403),
+                                           via_bridge=True)
+
+        self.assertEqual(result["origin"], "bale")
+        self.assertEqual(result["description"], "Forbidden: bot was blocked by the user")
+        self.assertNotIn("bridge host", result["description"])
+
+    def test_front_end_block_classifier(self):
+        self.assertTrue(bale_client._is_front_end_block(403, self.HTML_403))
+        self.assertTrue(bale_client._is_front_end_block(429, b""),
+                        "an empty 429 is a filter, not a Bale answer")
+        self.assertFalse(bale_client._is_front_end_block(403, self.BALE_JSON_403),
+                         "Bale's own JSON rejection must not be re-sent")
+        self.assertFalse(bale_client._is_front_end_block(400, self.HTML_403),
+                         "only 403/429 are retried")
+
+    def _send_with(self, error, bridge=False, proxy=False, post_succeeds=False):
+        """One sendMessage, with the HTTP layer stubbed to fail as told.
+
+        The relay route always fails with ``error``; the direct/proxy route
+        fails too unless ``post_succeeds`` (needed to show that a fallback
+        route really delivers).
+        """
+        calls = {"bridge": 0, "post": 0}
+        originals = (bale_client.BALE_API_BASE, bale_client.BALE_PROXY,
+                     bale_client._post_via_bridge, bale_client._post,
+                     bale_client.time.sleep)
+
+        bale_client.BALE_API_BASE = "https://site.example/bale_bridge.php" if bridge else None
+        bale_client.BALE_PROXY = "http://10.0.0.5:3128" if proxy else None
+
+        def via_bridge(*a, **k):
+            calls["bridge"] += 1
+            raise error
+
+        def post(*a, **k):
+            calls["post"] += 1
+            if post_succeeds:
+                return {"ok": True, "result": {"message_id": 1}}
+            raise error
+
+        bale_client._post_via_bridge, bale_client._post = via_bridge, post
+        bale_client.time.sleep = lambda s: None
+        try:
+            with self.assertLogs("bale_client", level="WARNING") as logs:
+                result = run(bale_client.BaleClient("1:abc", "bale-1").send_message(1, "hi"))
+        finally:
+            (bale_client.BALE_API_BASE, bale_client.BALE_PROXY,
+             bale_client._post_via_bridge, bale_client._post,
+             bale_client.time.sleep) = originals
+        return result, calls, "\n".join(logs.output)
+
+    def test_filter_403_is_retried_once(self):
+        result, calls, _ = self._send_with(_http_error(403, self.HTML_403))
+        self.assertEqual(calls["post"], 2, "a front-end 403 is worth one retry")
+
+    def test_bale_json_403_is_not_retried(self):
+        result, calls, _ = self._send_with(_http_error(403, self.BALE_JSON_403))
+        self.assertEqual(calls["post"], 1, "Bale answered; a retry repeats the same answer")
+
+    def test_400_is_not_retried(self):
+        result, calls, _ = self._send_with(_http_error(400, self.HTML_403))
+        self.assertEqual(calls["post"], 1)
+
+    def test_relay_host_block_without_a_proxy_retries_the_same_route(self):
+        result, calls, _ = self._send_with(_http_error(403, self.HTML_403), bridge=True)
+        self.assertEqual(calls["bridge"], 2)
+        self.assertEqual(calls["post"], 0, "no other route is configured")
+
+    def test_relay_host_block_with_a_proxy_switches_route(self):
+        result, calls, log = self._send_with(_http_error(403, self.HTML_403),
+                                             bridge=True, proxy=True, post_succeeds=True)
+        self.assertEqual(calls["bridge"], 1, "do not re-send into the same block")
+        self.assertEqual(calls["post"], 1, "the configured proxy route is tried instead")
+        self.assertTrue(result["ok"], "the fallback route delivered the message")
+        self.assertIn("retrying through the configured proxy", log)
+
+    @staticmethod
+    def _relay_page():
+        """A fresh relay-host 403 — a body can only be read once."""
+        error = _http_error(403, IntermediaryFailureTests.HTML_403)
+        error.headers["Server"] = "LiteSpeed"
+        return error
+
+    def test_relay_host_block_is_logged_with_the_layer_and_the_server(self):
+        originals = (bale_client.BALE_API_BASE, bale_client._post_via_bridge,
+                     bale_client.time.sleep)
+        bale_client.BALE_API_BASE = "https://site.example/bale_bridge.php"
+
+        def via_bridge(*a, **k):
+            raise self._relay_page()
+
+        bale_client._post_via_bridge = via_bridge
+        bale_client.time.sleep = lambda s: None
+        try:
+            with self.assertLogs("bale_client", level="ERROR") as logs:
+                outcome = run(bale_client.BaleClient("1:abc", "bale-2").send_media_group(
+                    5, [("photo", b"x"), ("photo", b"y")], caption="کپشن"))
+        finally:
+            (bale_client.BALE_API_BASE, bale_client._post_via_bridge,
+             bale_client.time.sleep) = originals
+        log = "\n".join(logs.output)
+
+        self.assertFalse(outcome["ok"])
+        self.assertIn("HTTP 403", log)
+        self.assertIn("bridge host refused it", log)
+        self.assertIn("server: LiteSpeed", log,
+                      "the web server that blocked the request belongs in the log")
+
+
+class TransportDescriptionTests(unittest.TestCase):
+    """The active route is configuration from .env, so it is printed."""
+
+    def setUp(self):
+        self._original = (bale_client.BALE_API_BASE, bale_client.BALE_PROXY)
+
+    def tearDown(self):
+        bale_client.BALE_API_BASE, bale_client.BALE_PROXY = self._original
+
+    def test_bridge_wins_over_proxy_and_names_its_fallback(self):
+        bale_client.BALE_API_BASE = "https://site.example/bale_bridge.php"
+        bale_client.BALE_PROXY = "http://user:secret@10.0.0.5:3128"
+
+        transport = bale_client.describe_transport()
+
+        self.assertEqual(transport["route"], "bridge")
+        self.assertEqual(transport["fallback_fa"], "پروکسی")
+
+    def test_proxy_password_is_masked(self):
+        bale_client.BALE_API_BASE = None
+        bale_client.BALE_PROXY = "http://user:secret@10.0.0.5:3128"
+
+        transport = bale_client.describe_transport()
+
+        self.assertEqual(transport["route"], "proxy")
+        self.assertNotIn("secret", transport["detail"])
+        self.assertIn("10.0.0.5:3128", transport["detail"])
+
+    def test_direct_is_the_default(self):
+        bale_client.BALE_API_BASE = None
+        bale_client.BALE_PROXY = None
+
+        transport = bale_client.describe_transport()
+
+        self.assertEqual(transport["route"], "direct")
+        self.assertIsNone(transport["fallback_fa"])
+
+
 if __name__ == "__main__":
     unittest.main()

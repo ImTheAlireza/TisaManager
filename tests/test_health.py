@@ -158,6 +158,42 @@ class HealthTextTests(unittest.TestCase):
         self.assertIn("هنوز بررسی‌ای انجام نشده", text)
         self.assertIn("کانالی تنظیم نشده", text)
 
+    def test_active_bale_route_is_shown(self):
+        """Which relay the Bale calls go through, and where it points.
+
+        A day-long Bale outage is usually an outage of the relay host, and the
+        dashboard is where the operator looks first — not .env.
+        """
+        transport = {"route": "bridge", "fa": "پل ایران (bridge)",
+                     "detail": "https://site.example/fp9x2/bale_bridge.php",
+                     "fallback_fa": "پروکسی"}
+
+        text = admin._health_text(self._rows(), None, backup_configured=True, transport=transport)
+
+        self.assertIn("مسیر ارسال بله: پل ایران (bridge)", text)
+        self.assertIn("مسیر پشتیبان: پروکسی", text)
+        self.assertIn("هاست پل: <code>site.example</code>", text)
+
+    def test_no_transport_line_without_bale(self):
+        text = admin._health_text(self._rows(), None, backup_configured=False)
+        self.assertNotIn("مسیر ارسال بله", text)
+
+    def test_a_down_bale_bot_points_at_the_doctor(self):
+        bot_health = {"bale-1": {"ok": False, "error": "403 — the bridge host refused it"},
+                      "checked_at": "2026-08-05T08:00:00"}
+
+        text = admin._health_text(self._rows(), bot_health, backup_configured=False)
+
+        self.assertIn("diagnose_bale.py", text)
+
+    def test_a_healthy_bale_bot_does_not_point_at_the_doctor(self):
+        bot_health = {"bale-1": {"ok": True, "name": "@bale_one"},
+                      "checked_at": "2026-08-05T08:00:00"}
+
+        text = admin._health_text(self._rows(), bot_health, backup_configured=False)
+
+        self.assertNotIn("diagnose_bale.py", text)
+
 
 class BotAvailabilityTests(unittest.TestCase):
     """run_bot_health_checks reports the Telegram bot and every Bale bot."""

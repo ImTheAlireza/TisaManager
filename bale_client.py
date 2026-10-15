@@ -10,6 +10,27 @@ Every failure keeps the reason the API gave: the body of an HTTP 4xx/5xx is
 read back and returned as Bale's own ``ok: false`` payload, so a log line
 (or a delivery row in the health dashboard) says what was actually rejected
 instead of a bare "HTTP Error 400: Bad Request".
+
+Every failure also names the layer that answered, because a Bale call can be
+refused in three very different places and the fix differs accordingly:
+
+``bale``
+    the API itself. Its rejections are always JSON (``{"ok": false, ...}``),
+    and the bridge passes that body through untouched.
+``bridge-host``
+    the relay host in front of ``bale_bridge.php``: it answered with its own
+    page *before* PHP ran (403 from a WAF or a suspended account, a host error
+    page), so nothing ever reached Bale. Detected by the absence of the
+    ``X-Bridge`` header the script adds to its own answers.
+``edge``
+    something else on the way (Bale's own edge, a proxy, a filter) answered
+    with a non-JSON page.
+
+A 403 that is not Bale's JSON is treated as a front-end block: it is retried
+once (a WAF/rate-limit block is often intermittent, and no bot saw the request
+so a retry cannot duplicate a post), and when the relay host is the one
+refusing while ``BALE_PROXY`` is configured as well, the retry goes out along
+that alternate route instead of into the same block.
 """
 
 import json
@@ -59,7 +80,141 @@ def _upload_note(files) -> str:
     return f" [{len(files)} file(s), {total / 1048576:.1f} MB]"
 
 
-def _error_result(exc: Exception) -> dict:
+# The bridge script stamps its own answers with this header
+# (bridge/bale_bridge.php). It is the only reliable way to tell WHICH layer
+# refused a request: the relay host's web server answers before PHP runs, so a
+# response without this header never reached the bridge script — while one with
+# it carries Bale's verbatim answer, passed through by the script.
+BRIDGE_HEADER = "x-bridge"
+
+# What each layer's refusal means, in the words that end up in the log line and
+# in the delivery row of the health dashboard. "bale" needs no note: its JSON
+# body already says why.
+_ORIGIN_NOTES = {
+    "bridge-host": "the bridge host refused it (the relay script never ran)",
+    "edge": "refused before the Bale API (edge/front-end layer)",
+}
+
+
+def _response_header(exc: Exception, name: str):
+    """One header of a failed response, or None when there was no response.
+
+    Handles both the case-insensitive ``email.message.Message`` urllib really
+    produces and a plain dict (tests, and other HTTP stacks): HTTP header names
+    are case-insensitive, a dict lookup is not.
+    """
+    headers = getattr(exc, "headers", None)
+    if headers is None:
+        return None
+    try:
+        value = headers.get(name)
+    except Exception:
+        return None
+    if value is not None:
+        return value
+    try:
+        for key in headers:
+            if str(key).lower() == name.lower():
+                return headers[key]
+    except Exception:
+        return None
+    return None
+
+
+def _read_body(exc: Exception) -> bytes:
+    """The body of an HTTPError. Read ONCE — reading it consumes the stream.
+
+    Callers that need the body twice (to decide on a retry *and* to report the
+    failure) must read it here first and pass it on, or the second read comes
+    back empty and the log loses the explanation.
+    """
+    if not isinstance(exc, urllib.error.HTTPError):
+        return b""
+    try:
+        return exc.read() or b""
+    except Exception:  # a body that cannot be read is not worth crashing over
+        return b""
+
+
+def _body_is_json(body) -> bool:
+    """True when the response body is a JSON object (Bale's answer shape)."""
+    text = (body or b"").decode("utf-8", "replace").strip()
+    if not text:
+        return False
+    try:
+        return isinstance(json.loads(text), dict)
+    except ValueError:
+        return False
+
+
+def _failure_origin(exc: Exception, body, via_bridge: bool):
+    """Which layer answered a failed request (see the module docstring).
+
+    ``None`` means no HTTP response at all: the connection failed, so the
+    exception text is the only evidence (a DNS/TLS/connect problem).
+    """
+    if not isinstance(exc, urllib.error.HTTPError):
+        return None
+    if _body_is_json(body):
+        return "bale"
+    if via_bridge and not _response_header(exc, BRIDGE_HEADER):
+        return "bridge-host"
+    return "edge"
+
+
+def _server_note(exc: Exception) -> str:
+    """The web server that answered, when it named itself (LiteSpeed, nginx…).
+
+    A relaying host that blocks a request usually does it from the web server
+    or a WAF in front of PHP, so this is the fingerprint of the blocking layer.
+    """
+    server = _response_header(exc, "server")
+    return f" [server: {server}]" if server else ""
+
+
+def _is_front_end_block(code, body) -> bool:
+    """A 403/429 that never reached the API, so a retry is safe and may work.
+
+    Bale answers every rejection in JSON. A 403/429 whose body is *not* JSON
+    came from a filter in front of it — a WAF, a rate limiter, the relay host,
+    an edge rule — and those blocks are frequently intermittent. No bot saw the
+    request, so re-sending cannot duplicate a post.
+    """
+    if code not in (403, 429):
+        return False
+    return not _body_is_json(body)
+
+
+def _plan_retry(exc: Exception, body, via_bridge: bool, used_fallback: bool):
+    """Should a failed first attempt be repeated, and along which route?
+
+    Returns ``(reason, used_fallback)``. ``reason`` is None when another
+    request would only repeat the same answer — the caller then reports the
+    failure instead of burning a second attempt.
+
+    Three failures are worth one more request:
+
+    * the relay host refused it (its page, its WAF) while ``BALE_PROXY`` is
+      configured as well — the alternate route is tried, because re-sending
+      into the same block only wastes an attempt,
+    * a 403/429 from a front-end filter in any other arrangement,
+    * a connect/write failure, where the request never left in full.
+    """
+    code = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+    if (via_bridge and not used_fallback and BALE_PROXY
+            and _failure_origin(exc, body, via_bridge) == "bridge-host"):
+        return ("the bridge host refused it — retrying through the configured proxy",
+                True)
+    if _is_front_end_block(code, body):
+        return (f"HTTP {code} from a front-end filter, so no bot saw the request",
+                used_fallback)
+    if _is_retryable_network_error(exc):
+        return ("transient network failure — the request never left in full",
+                used_fallback)
+    return (None, used_fallback)
+
+
+def _error_result(exc: Exception, via_bridge: bool = False, body=None) -> dict:
     """Build Bale's ``ok: false`` payload out of whatever HTTP raised.
 
     urllib turns every 4xx/5xx into an HTTPError and *throws the body away*,
@@ -74,32 +229,56 @@ def _error_result(exc: Exception) -> dict:
       - an HTML error page from the host -> a trimmed snippet, which is what
         actually identifies a 413/502 from the web server,
       - nothing readable -> the exception text, as before.
+
+    ``via_bridge`` says whether the call went out through the Iran-side relay.
+    That one flag is what makes a 403 from the relay host itself (the PHP never
+    ran, nothing reached Bale) distinguishable from a 403 from Bale's edge, so
+    the recorded reason names the layer to go and fix.
+
+    ``body`` is an already-read body (a caller that read it to decide on a
+    retry must pass it in, since reading an HTTPError consumes it).
     """
     result = {"ok": False}
-    body = b""
     if isinstance(exc, urllib.error.HTTPError):
         result["error_code"] = exc.code
-        try:
-            body = exc.read() or b""
-        except Exception:  # a body that cannot be read is not worth crashing over
-            body = b""
-    text = body.decode("utf-8", "replace").strip()
-    description = None
+    if body is None:
+        body = _read_body(exc)
+    text = (body or b"").decode("utf-8", "replace").strip()
+    payload = None
     if text:
         try:
             payload = json.loads(text)
         except ValueError:
             payload = None
-        if isinstance(payload, dict):
-            if payload.get("error_code") is not None:
-                result["error_code"] = payload["error_code"]
-            description = payload.get("description") or payload.get("error_message")
-        else:
-            # An HTML error page (host 413/502, cPanel error page, ...) is the
-            # only evidence of what the relay host answered.
-            description = "non-JSON response: " + " ".join(text.split())[:200]
+    origin = _failure_origin(exc, body, via_bridge)
+    description = None
+    if isinstance(payload, dict):
+        if payload.get("error_code") is not None:
+            result["error_code"] = payload["error_code"]
+        description = payload.get("description") or payload.get("error_message")
+    elif text:
+        # An HTML error page (a relay host that blocked the request, a WAF page,
+        # a 413/502 from the web server, a cPanel page, ...) is the only
+        # evidence of who refused it.
+        snippet = " ".join(text.split())[:200]
+        note = _ORIGIN_NOTES.get(origin)
+        description = f"{note}: non-JSON response: {snippet}" if note \
+            else f"non-JSON response: {snippet}"
     result["description"] = description or str(exc)
+    if origin:
+        result["origin"] = origin
     return result
+
+
+def describe_failure(exc: Exception, via_bridge: bool = False, body=None) -> dict:
+    """Public form of the failure reporter, for the doctor script and tests.
+
+    ``body`` is for callers that already read it (reading an HTTPError twice
+    yields nothing the second time).
+    """
+    if body is None:
+        body = _read_body(exc)
+    return _error_result(exc, via_bridge=via_bridge, body=body)
 
 
 def _build_multipart(data=None, files=None) -> tuple:
@@ -222,12 +401,17 @@ class BaleClient:
 
     def _request(self, method, data=None, files=None):
         url = f"{self.base_url}/{method}"
-        # One automatic retry for transient network failures (connect/write
-        # timeouts, resets). Doubles the odds a flaky line delivers the post
-        # without waiting a full 10-minute retry cycle.
+        via_bridge = bool(BALE_API_BASE)
+        # One automatic retry for failures a second request can still fix:
+        # a connect/write timeout, a front-end 403/429 — or a relay host that
+        # refused the request while a proxy route is configured as well, in
+        # which case the retry goes out through that proxy instead of back into
+        # the same block (see _plan_retry).
+        used_fallback = False
         for attempt in (1, 2):
+            use_bridge = via_bridge and not used_fallback
             try:
-                if BALE_API_BASE:
+                if use_bridge:
                     # Iran-side bridge mode: the relay happens on the bridge
                     # host, so BALE_PROXY would only double-hop needlessly.
                     result = _post_via_bridge(self.token, method, data, files)
@@ -239,20 +423,25 @@ class BaleClient:
                     logger.info("Bale API success on %s (%s)", method, self.name)
                 return result
             except Exception as e:
-                if attempt == 1 and _is_retryable_network_error(e):
-                    logger.warning(
-                        "Bale API transient error on %s (%s): %s — retrying once",
-                        method, self.name, e,
-                    )
-                    time.sleep(2)
-                    continue
+                # Read the body now: it is needed to classify the failure and
+                # would be empty if read again later.
+                body = _read_body(e)
+                if attempt == 1:
+                    reason, used_fallback = _plan_retry(e, body, use_bridge, used_fallback)
+                    if reason:
+                        logger.warning(
+                            "Bale API attempt 1 failed on %s (%s): %s — retrying once",
+                            method, self.name, reason,
+                        )
+                        time.sleep(2)
+                        continue
                 note = _upload_note(files)
                 if isinstance(e, urllib.error.HTTPError):
-                    result = _error_result(e)
+                    result = _error_result(e, via_bridge=use_bridge, body=body)
                     logger.error(
-                        "Bale API request failed on %s (%s): HTTP %s — %s%s",
+                        "Bale API request failed on %s (%s): HTTP %s — %s%s%s",
                         method, self.name, result.get("error_code"),
-                        result["description"], note,
+                        result["description"], _server_note(e), note,
                     )
                     return result
                 logger.error("Bale API request failed on %s (%s): %s%s",
@@ -406,6 +595,39 @@ def client_for_attempt(attempt_no: int):
 def all_clients() -> list:
     """Every configured Bale bot, primary first."""
     return [c for c in (DEFAULT_CLIENT, BACKUP_CLIENT) if c is not None]
+
+
+def _mask_credentials(url: str) -> str:
+    """``http://user:secret@host:3128`` -> ``http://user:***@host:3128``.
+
+    The transport is printed in logs and in the health dashboard, and a proxy
+    password must not travel with it.
+    """
+    if "@" not in url:
+        return url
+    scheme, sep, rest = url.partition("://")
+    credentials, _, host = rest.rpartition("@")
+    if ":" in credentials:
+        credentials = credentials.split(":", 1)[0] + ":***"
+    return f"{scheme}{sep}{credentials}@{host}" if sep else f"{credentials}@{host}"
+
+
+def describe_transport() -> dict:
+    """Which route Bale calls take right now.
+
+    Used by the health dashboard and by ``diagnose_bale.py``: during an outage
+    the first question is always "which path is actually in use", and the
+    answer is a file that lives outside the repo (.env).
+    """
+    if BALE_API_BASE:
+        return {"route": "bridge", "fa": "پل ایران (bridge)",
+                "detail": BALE_API_BASE,
+                "fallback_fa": "پروکسی" if BALE_PROXY else None}
+    if BALE_PROXY:
+        return {"route": "proxy", "fa": "پروکسی",
+                "detail": _mask_credentials(BALE_PROXY), "fallback_fa": None}
+    return {"route": "direct", "fa": "مستقیم", "detail": "tapi.bale.ai",
+            "fallback_fa": None}
 
 
 # --- Backwards-compatible module-level API (primary bot) --------------------
