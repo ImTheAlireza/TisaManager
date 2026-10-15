@@ -135,8 +135,15 @@ def load_bot_health(raw) -> dict | None:
         return None
 
 
-def _health_text(rows: list, bot_health: dict | None, backup_configured: bool) -> str:
-    """Render the health dashboard (pure function, easy to test)."""
+def _health_text(rows: list, bot_health: dict | None, backup_configured: bool,
+                 transport: dict | None = None) -> str:
+    """Render the health dashboard (pure function, easy to test).
+
+    ``transport`` is what ``bale_client.describe_transport()`` returns. It is
+    shown because a Bale failure is often a failure of the *route* (the relay
+    host, the proxy) rather than of the bot, and the route is configured in
+    .env where nobody looks during an outage.
+    """
     lines = ["🩺 <b>سلامت ربات‌ها و کانال‌ها</b>"]
 
     checked_at = (bot_health or {}).get("checked_at")
@@ -161,20 +168,40 @@ def _health_text(rows: list, bot_health: dict | None, backup_configured: bool) -
         elif tg:
             lines.append(f"❌ ربات تلگرام: {html_text(tg.get('error', 'خطا'))}")
         bale_1 = bot_health.get("bale-1")
+        bale_down = False
         if bale_1 and bale_1.get("ok"):
             lines.append(f"✅ ربات بله ۱: {html_text(bale_1.get('name', ''))}")
         elif bale_1:
+            bale_down = True
             lines.append(f"❌ ربات بله ۱: {html_text(bale_1.get('error', 'خطا'))}")
         if backup_configured:
             bale_2 = bot_health.get("bale-2")
             if bale_2 and bale_2.get("ok"):
                 lines.append(f"✅ ربات بله ۲: {html_text(bale_2.get('name', ''))}")
             elif bale_2:
+                bale_down = True
                 lines.append(f"❌ ربات بله ۲: {html_text(bale_2.get('error', 'خطا'))}")
             else:
                 lines.append("⚪ ربات بله ۲: نتیجه‌ای ثبت نشده")
         else:
             lines.append("⚪ ربات بله ۲: پیکربندی نشده (BALE_TOKEN_2)")
+        if bale_down:
+            # Point at the tool that separates "Bale refused us" from "the
+            # relay host refused us" — the question this screen always raises.
+            lines.append("💡 عیب‌یابی: روی سرور ربات دستور <code>python diagnose_bale.py</code> را اجرا کنید.")
+    if transport:
+        # Which route is in use, and where it points: an outage is usually
+        # diagnosed down to one relay host, and this saves opening .env.
+        line = f"🔀 مسیر ارسال بله: {html_text(transport.get('active_fa', transport.get('fa', '')))}"
+        if transport.get("fallback_fa"):
+            line += f" (مسیر جایگزین: {html_text(transport['fallback_fa'])})"
+        lines.append(line)
+        if transport.get("bridge_host"):
+            lines.append(f"🏠 هاست پل: <code>{html_text(transport['bridge_host'])}</code>")
+        if transport.get("paused"):
+            # The configured route is skipping itself after refusing requests;
+            # say so, or "why is the relay not being used?" is the next question.
+            lines.append("⏸️ پل موقتاً کنار گذاشته شده (خودش درخواست‌ها را رد می‌کند) — پس از چند دقیقه خودبه‌خود دوباره امتحان می‌شود.")
     lines.append("")
 
     # --- Channels -----------------------------------------------------------
@@ -225,7 +252,8 @@ async def _render_health(update, context, refresh: bool):
 
     rows = await get_channel_health()
     bot_health = load_bot_health(await get_setting(BOT_HEALTH_SETTING))
-    text = _health_text(rows, bot_health, bale_client.BACKUP_CLIENT is not None)
+    transport = bale_client.describe_transport() if bale_client.all_clients() else None
+    text = _health_text(rows, bot_health, bale_client.BACKUP_CLIENT is not None, transport)
     markup = _health_keyboard()
 
     if update.callback_query:

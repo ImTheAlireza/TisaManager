@@ -16,6 +16,20 @@
  *     they never land in the web server's access logs. Bodies are never
  *     logged.
  *
+ * Telling a 403 from this host apart from a 403 from Bale:
+ *   Every answer this script produces carries the "X-Bridge: bale-bridge/1"
+ *   header, and the bot logs / shows that fact. So when the bot reports
+ *       HTTP 403 ... the bridge host refused it (the relay script never ran)
+ *   the request was stopped BEFORE this file — a WAF rule, a hit resource
+ *   limit, a suspended account, a foreign-IP block; PHP never executed. When
+ *   the same 403 arrives WITH the header, this script ran and the refusal came
+ *   from upstream (Bale's edge blocking this host's IP, or the API itself).
+ *   Quick manual check from inside Iran: open the bridge URL in a browser. It
+ *   must answer JSON — {"ok":false,"error_code":403,"description":"forbidden"}
+ *   for a keyless GET. An HTML "403 Forbidden" page instead means the host,
+ *   not the script, is refusing, and the cPanel error/ModSecurity logs will
+ *   name the rule.
+ *
  * Setup on the Iran-side host:
  *   1) Set BRIDGE_KEY below to a long random string (e.g. `openssl rand -hex 32`).
  *   2) Upload to a private-looking path, e.g. /fp9x2/bale_bridge.php.

@@ -35,10 +35,27 @@ BALE_PROXY = os.getenv("BALE_PROXY") or None
 #   BALE_API_BASE=https://YOUR-SITE.ir/path/bale_bridge.php
 #   BALE_BRIDGE_KEY=<same secret as BRIDGE_KEY in the PHP file>
 # Leave both unset to connect directly.
+#
+# If the bridge host refuses a request itself (its web server/WAF answering
+# before the PHP runs — the bot logs it as "the bridge host refused it"), that
+# one request is retried along the other route: through BALE_PROXY when one is
+# configured, otherwise straight to tapi.bale.ai. So a blocked relay does not
+# stop delivery while the bot server can still reach Bale directly, and if the
+# relay is only for safety it needs no manual switch during an outage.
+# Diagnose every route with `python diagnose_bale.py` on the bot server, and
+# see bale_connectivity.md for what each answer means.
 BALE_API_BASE = os.getenv("BALE_API_BASE") or None
 BALE_BRIDGE_KEY = os.getenv("BALE_BRIDGE_KEY") or None
 # How many Bale channels may be uploaded in parallel during one publish.
 BALE_MAX_CONCURRENT = int(os.getenv("BALE_MAX_CONCURRENT", 3))
+
+# How long a route that is refusing requests (a blocked relay host, a refused
+# connection) is skipped before it is tried again, in seconds. The other route
+# carries the calls in the meantime, and when the cooldown is over the paused
+# route gets the next attempt: if it answers, it is back in charge
+# automatically — the relay stays the primary route and needs no manual
+# switch. Set to 0 to disable (a blocked route is then always tried first).
+BALE_ROUTE_COOLDOWN_SECONDS = int(os.getenv("BALE_ROUTE_COOLDOWN_SECONDS", 600))
 # Quiet period (seconds) before an incoming album is treated as complete.
 # Telegram delivers album items as separate updates, so this is the pause
 # after the last one. Too short and a slow connection pushes the siblings past
